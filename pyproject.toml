@@ -4,8 +4,8 @@ requires = [ "hatchling" ]
 
 [project]
 name = "acumen"
-version = "0.0.1"
-description = "A very interesting piece of code"
+version = "0.0.1dev"
+description = "Build, Benchmark, and Optimize Agentic Skills for Python Packages."
 readme = "README.md"
 license = { file = "LICENSE" }
 maintainers = [
@@ -22,7 +22,12 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-  "anndata",
+  "claude-agent-sdk>=0.2.116",
+  "claude-code-log",
+  "matplotlib",
+  "pandas",
+  "pyyaml",
+  "scipy",
   # for debug logging (referenced from the issue template)
   "session-info2",
 ]

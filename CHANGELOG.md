@@ -8,8 +8,4 @@ and this project adheres to [Semantic Versioning][].
 [keep a changelog]: https://keepachangelog.com/
 [semantic versioning]: https://semver.org/
 
-## [Unreleased]
-
-### Added
-
-- Basic tool, preprocessing and plotting functions
+## [0.0.1dev]
