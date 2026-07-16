@@ -1,0 +1,33 @@
+# Ground truth computed against decoupler 2.2.0 (commit 7e8e957) with the bundled
+# pbmc3k dataset and the human CollecTRI network:
+#   dc.mt.ulm(adata, net) -> dc.pp.get_obsm(adata, "score_ulm")
+#   -> dc.tl.rankby_group(acts, groupby="celltype", reference="rest")
+#   -> highest `stat` per group.
+# Both answers are the top hit with a clear margin over the runner-up
+# (B cells: EBF1 46.2 vs RFXANK 41.7; CD14+ Monocytes: ONECUT1 53.6 vs EHF 50.6).
+# ulm and the t-test are deterministic, so these are stable.
+#
+# Note: the target venv has decoupler's own dependencies only — no scanpy — so both
+# splits are solvable with decoupler + anndata. pbmc3k ships log-normalized and is
+# scored directly.
+
+tasks:
+  - id: tf_activity
+    train:
+      prompt: >-
+        Using the decoupler Python package, load the bundled pbmc3k dataset and the
+        human CollecTRI network. Score transcription factor activity for every cell
+        with the ulm method, using decoupler's default settings. Then determine which
+        single transcription factor best distinguishes the "B cells" population from
+        all of the other cell types, using the `celltype` column in the observation
+        metadata. Report only the name of that transcription factor.
+      answer: EBF1
+    test:
+      prompt: >-
+        Using the decoupler Python package, load the bundled pbmc3k dataset and the
+        human CollecTRI network. Score transcription factor activity for every cell
+        with the ulm method, using decoupler's default settings. Then determine which
+        single transcription factor best distinguishes the "CD14+ Monocytes" population
+        from all of the other cell types, using the `celltype` column in the
+        observation metadata. Report only the name of that transcription factor.
+      answer: ONECUT1

@@ -35,6 +35,7 @@ dependencies = [
 urls.Documentation = "https://acumen.readthedocs.io/"
 urls.Homepage = "https://github.com/scverse/acumen"
 urls.Source = "https://github.com/scverse/acumen"
+scripts.acumen = "acumen.cli:main"
 
 [dependency-groups]
 dev = [
