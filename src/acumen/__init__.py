@@ -4,16 +4,29 @@ from importlib.metadata import version
 
 from acumen.bench import PlannedRun, build_matrix, pending, run_matrix, summarize
 from acumen.config import Config, ConfigError, load_config, parse_config
+from acumen.draft import DraftError, DraftResult, draft_skill
 from acumen.env import EnvError, Target, prepare_target, scrubbed_env
 from acumen.grade import Grade, Reason, grade_answer, grade_run
 from acumen.paths import RunKey, Split, arm_name, is_complete, parse_run_dir, run_dir, skill_from_arm
 from acumen.runner import RunOutcome, run_once
-from acumen.sandbox import Sandbox, sandbox
+from acumen.sandbox import Sandbox, install_skill, sandbox
+from acumen.skills import (
+    Skill,
+    SkillError,
+    SkillMeta,
+    available_versions,
+    latest_version,
+    load_skill,
+    next_version,
+    skill_hash,
+)
 from acumen.tasks import Task, TaskError, TaskSplit, load_tasks, parse_tasks
 
 __all__ = [
     "Config",
     "ConfigError",
+    "DraftError",
+    "DraftResult",
     "EnvError",
     "Grade",
     "PlannedRun",
@@ -21,6 +34,9 @@ __all__ = [
     "RunKey",
     "RunOutcome",
     "Sandbox",
+    "Skill",
+    "SkillError",
+    "SkillMeta",
     "Split",
     "Target",
     "Task",
@@ -28,12 +44,18 @@ __all__ = [
     "TaskSplit",
     "__version__",
     "arm_name",
+    "available_versions",
     "build_matrix",
+    "draft_skill",
     "grade_answer",
     "grade_run",
+    "install_skill",
     "is_complete",
+    "latest_version",
     "load_config",
+    "load_skill",
     "load_tasks",
+    "next_version",
     "parse_config",
     "parse_run_dir",
     "parse_tasks",
@@ -45,6 +67,7 @@ __all__ = [
     "sandbox",
     "scrubbed_env",
     "skill_from_arm",
+    "skill_hash",
     "summarize",
 ]
 

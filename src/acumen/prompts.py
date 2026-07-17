@@ -73,6 +73,96 @@ prose, no formatting, no code fences. `{sandbox}/script.py` must reproduce it.
 """
 
 
+DRAFT_PROMPT = """\
+You are writing a Claude Skill for the Python package `{package}` (version {version}).
+
+A skill is documentation written for an agent, not for a human. Its only purpose is to
+make an agent that has never used `{package}` succeed at real tasks with it on the first
+try. It is not a tutorial, not a README, and not a sales pitch.
+
+# What you can read
+
+- The package's source is at `{src}`. Read it — the source, the docstrings, the examples,
+  the docs directory, the tests. This is the ground truth about how the package behaves.
+- You have web access if the published docs help.
+- `{package}` is also installed; run `{python}` to check anything you are unsure about.
+  Verify claims before you write them down.
+
+# What you must write
+
+Your working directory is `{out}`. Write:
+
+1. `{out}/SKILL.md` — required. It must begin with YAML frontmatter, exactly:
+
+---
+name: {skill_name}
+description: <one sentence: what this skill covers and when to use it>
+---
+
+   The `name` must be exactly `{skill_name}`.
+
+   The `description` is load-bearing and must be HONEST. It is the only part of the skill
+   an agent sees before deciding whether to open it, and it is the only thing that gets
+   the skill loaded at the right moment. State what the skill covers and when it applies.
+   Do not oversell it, and do not claim coverage the body does not deliver.
+
+2. `{out}/references/*.md` — optional. Use these for detail that only some tasks need.
+
+# How to write it
+
+- **Write what is not guessable.** An agent already knows Python and can read a
+  traceback. Spend your words on what it would get WRONG by guessing: non-obvious
+  defaults, required preprocessing, the function that looks right but isn't, where
+  results are written, argument shapes and orientation, footguns the API invites.
+- **Generalize.** Write guidance that holds across tasks. Do not enumerate cases.
+- **Progressive disclosure.** `SKILL.md` should be short and route to `references/` for
+  depth. An agent pays for every token of it on every task, including the tasks where it
+  is irrelevant. If `SKILL.md` is long, you are taxing every run.
+- **Be concrete.** A correct short code example beats a paragraph of prose. Show the real
+  call, with the arguments that matter.
+- **Prefer removing text over adding it.** Anything that merely restates the obvious is
+  worse than nothing: it costs tokens and buries the parts that matter.
+- **No hedging.** Say what to do.
+
+# Verify before you finish
+
+Do not write claims you have not checked. If you assert a default value, a return type,
+or where an output lands, confirm it in the source or by running `{python}`. A skill that
+confidently states something false is worse than no skill at all — it will send an agent
+in the wrong direction with full confidence.
+
+When you are done, `{out}/SKILL.md` must exist and start with the frontmatter above.
+"""
+
+
+def draft_prompt(*, package: str, version: str, src: Path, python: Path, out: Path, skill_name: str) -> str:
+    """Build the prompt for the drafting agent.
+
+    Unlike a benchmark agent, the drafter gets read access to the target's source (§6) —
+    it is writing documentation about the package, so it needs to see it.
+
+    Parameters
+    ----------
+    package
+        The target package name.
+    version
+        The installed version, so the skill describes what is actually installed.
+    src
+        The package checkout, readable by this agent only.
+    python
+        The interpreter with the package installed, for verifying claims.
+    out
+        The staging directory the agent writes the skill into.
+    skill_name
+        The name the frontmatter must declare — ``config.skill_name``.
+
+    Returns
+    -------
+    The draft prompt.
+    """
+    return DRAFT_PROMPT.format(package=package, version=version, src=src, python=python, out=out, skill_name=skill_name)
+
+
 def benchmark_prompt(task_prompt: str, *, sandbox: Path, python: Path, package: str) -> str:
     """Build the full prompt for one benchmark run.
 

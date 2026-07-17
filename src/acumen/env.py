@@ -298,6 +298,13 @@ def scrubbed_env(*, config_dir: Path, home: Path, extra_path: list[Path] | None 
     env["PATH"] = os.pathsep.join(seen)
     env["HOME"] = str(home)
     env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    # Skill discovery needs setting_sources=["project"] (M2-T3), but project discovery
+    # also walks UP from cwd and auto-loads every CLAUDE.md it passes. Verified: an agent
+    # recited a canary planted in its sandbox's parent directory having made zero tool
+    # calls. Sandboxes live under a temp dir whose ancestors we do not control, so a stray
+    # CLAUDE.md anywhere above them would silently enter every run's context and break
+    # §7.2. This disables memory discovery outright; skills still load (verified).
+    env["CLAUDE_CODE_DISABLE_CLAUDE_MDS"] = "1"
     env["TMPDIR"] = str(home / "tmp")
     env["LANG"] = os.environ.get("LANG", "C.UTF-8")
     # Keep pip/uv from reaching into the real user's caches and configs.

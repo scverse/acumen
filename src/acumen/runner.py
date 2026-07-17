@@ -28,6 +28,7 @@ from acumen.paths import (
 )
 from acumen.prompts import benchmark_prompt
 from acumen.sandbox import Sandbox, sandbox
+from acumen.skills import Skill
 from acumen.tasks import Task
 
 #: Result subtypes the CLI reports on a cap breach, mapped to our reason taxonomy.
@@ -76,6 +77,34 @@ def _find_transcript(box: Sandbox, session_id: str) -> Path | None:
     return matches[0] if matches else None
 
 
+def _skill_fired(jsonl: Path) -> bool | None:
+    """Return whether the agent invoked the Skill tool, read from the transcript.
+
+    This is the evidence for M2's done-criterion — the skill arm must show the skill
+    loading and the baseline must not — so it is recorded per run rather than left to
+    hand-inspection. ``None`` means the transcript was unavailable, which is not the same
+    as the skill not firing.
+    """
+    try:
+        lines = jsonl.read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("type") != "assistant":
+            continue
+        content = record.get("message", {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "Skill":
+                return True
+    return False
+
+
 def _claude_code_log() -> str | None:
     """Locate the ``claude-code-log`` CLI.
 
@@ -122,9 +151,21 @@ def _build_options(
 ) -> ClaudeAgentOptions:
     """Assemble the SDK options for one run.
 
-    ``setting_sources=[]`` is set explicitly, never left to default: the default of
-    ``None`` loads user settings *and* ``CLAUDE.md`` memories, which silently breaks the
-    isolation requirement (§3, trap 1).
+    These options are **identical for every arm** — baseline parity (§7.4) means the
+    noskill and skill arms differ only in whether a skill directory exists inside the
+    sandbox, never in how the agent is configured.
+
+    ``setting_sources`` is always set explicitly, never left to default: the default of
+    ``None`` loads user settings *and* memories (§3, trap 1), and leaving it unset while
+    passing ``skills`` silently re-enables the ``"user"`` source (§3, trap 2).
+    ``["project"]`` scopes discovery to ``<sandbox>/.claude/``, which is exactly where
+    the skill is installed — empirically verified in M2-T3, along with the fact that
+    ``[]`` disables skill discovery entirely.
+
+    ``skills`` is deliberately left ``None``: with ``setting_sources=["project"]`` the
+    skill is discovered from the sandbox anyway (verified), whereas naming it here would
+    append ``Skill(<name>)`` to ``allowed_tools`` in the skill arm only — an options-level
+    difference between arms, which is the one thing parity forbids.
     """
     return ClaudeAgentOptions(
         cwd=str(box.root),
@@ -132,7 +173,7 @@ def _build_options(
         model=model,
         max_turns=max_turns,
         max_budget_usd=max_usd,
-        setting_sources=[],
+        setting_sources=["project"],
         permission_mode="bypassPermissions",
         system_prompt={"type": "preset", "preset": "claude_code"},
     )
@@ -147,6 +188,7 @@ async def run_once(
     model: str,
     max_turns: int,
     max_usd: float,
+    skill: Skill | None = None,
     sandbox_base: Path | None = None,
     keep_sandbox: bool = False,
 ) -> RunOutcome:
@@ -164,6 +206,9 @@ async def run_once(
         Where the five run files are written.
     model, max_turns, max_usd
         Already resolved against per-task overrides by the caller.
+    skill
+        The skill to install, or ``None`` for the baseline arm. Must agree with
+        ``key.arm``, else the run would be filed under an arm it doesn't belong to.
     sandbox_base
         Parent directory for the throwaway sandbox.
     keep_sandbox
@@ -173,13 +218,19 @@ async def run_once(
     -------
     The outcome, matching what was written to disk.
     """
+    if (key.skill is None) != (skill is None):
+        # Filing a skill run under noskill/ (or vice versa) would silently corrupt the
+        # comparison the whole benchmark rests on, so refuse rather than record it.
+        raise ValueError(
+            f"arm {key.arm!r} expects skill {key.skill!r} but was given {skill.version if skill else None!r}"
+        )
     run_dir.mkdir(parents=True, exist_ok=True)
     split = task.split(key.split)
 
     result: ResultMessage | None = None
     error: str | None = None
 
-    with sandbox(target, base=sandbox_base, keep=keep_sandbox) as box:
+    with sandbox(target, base=sandbox_base, keep=keep_sandbox, skill=skill) as box:
         prompt = benchmark_prompt(
             split.prompt,
             sandbox=box.root,
@@ -201,8 +252,10 @@ async def run_once(
                 shutil.copyfile(jsonl, run_dir / TRANSCRIPT_JSONL)
 
     rendered = False
+    skill_loaded: bool | None = None
     if (run_dir / TRANSCRIPT_JSONL).is_file():
         rendered = _render_transcript(run_dir / TRANSCRIPT_JSONL, run_dir / TRANSCRIPT_HTML)
+        skill_loaded = _skill_fired(run_dir / TRANSCRIPT_JSONL)
 
     grade: Grade = grade_run(run_dir, split.answer)
     if error is not None or result is None:
@@ -234,7 +287,10 @@ async def run_once(
         "expected": split.answer.strip(),
         "pkg_version": target.fingerprint,
         "commit": target.commit,
-        "skill_hash": None,
+        "skill_hash": skill.hash if skill else None,
+        "skill_name": skill.name if skill else None,
+        # Evidence, not configuration: did the agent actually invoke the Skill tool?
+        "skill_loaded": skill_loaded,
         "sdk_version": sdk_version(),
         "session_id": result.session_id if result else None,
         "stop_reason": result.stop_reason if result else None,

@@ -11,6 +11,7 @@ from acumen.config import Config
 from acumen.env import Target
 from acumen.paths import SPLITS, RunKey, Split, arm_name, is_complete, run_dir
 from acumen.runner import RunOutcome, run_once
+from acumen.skills import Skill
 from acumen.tasks import Task
 
 
@@ -104,6 +105,7 @@ async def run_matrix(
     target: Target,
     runs_root: Path,
     max_concurrency: int,
+    skill: Skill | None = None,
     sandbox_base: Path | None = None,
     keep_sandbox: bool = False,
     on_done: Callable[[RunOutcome], None] | None = None,
@@ -123,6 +125,9 @@ async def run_matrix(
         The ``runs/`` root.
     max_concurrency
         Ceiling on simultaneous agents.
+    skill
+        The skill every run in this matrix installs, or ``None`` for the baseline. One
+        matrix is one arm, so this is a property of the pass rather than of a run.
     sandbox_base
         Parent directory for sandboxes.
     keep_sandbox
@@ -148,6 +153,7 @@ async def run_matrix(
                 model=item.model,
                 max_turns=item.max_turns,
                 max_usd=item.max_usd,
+                skill=skill,
                 sandbox_base=sandbox_base,
                 keep_sandbox=keep_sandbox,
             )
