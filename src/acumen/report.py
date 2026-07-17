@@ -474,6 +474,22 @@ def _integrity_notes(df: pd.DataFrame) -> list[str]:
     return notes
 
 
+def _loaded_cell(row: pd.Series) -> str:
+    """Per-run 'skill loaded' cell: did the Skill tool actually fire in this run?
+
+    ``—`` for a baseline run (no skill to load), ``yes``/``no`` for a skill run, and ``?``
+    when the transcript was unavailable so it could not be determined. A ``no`` is
+    highlighted — that is a skill run not measuring its skill, and the transcript link in
+    the same row is where to see why it did not load.
+    """
+    if row["arm"] == NOSKILL_ARM:
+        return "&mdash;"
+    raw = row.get("skill_loaded")
+    if raw is None or (not isinstance(raw, bool) and pd.isna(raw)):
+        return "?"
+    return "yes" if bool(raw) else '<span class="skill-miss">no</span>'
+
+
 def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
     """Per-run table with resource use and a link to each run's ``transcript.html`` (§ M3-T5)."""
     headers = [
@@ -482,6 +498,7 @@ def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
         "task",
         "model",
         "rep",
+        "skill loaded",
         "reason",
         "answer",
         "expected",
@@ -512,6 +529,7 @@ def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
             html.escape(str(row["task_id"])),
             html.escape(str(row["model"])),
             str(int(row["rep"])),
+            _loaded_cell(row),
             html.escape(str(row["reason"])),
             html.escape(str(row.get("answer", ""))),
             html.escape(str(row.get("expected", ""))),
@@ -559,6 +577,7 @@ th:first-child, td:first-child {{ text-align: left; }}
 thead th {{ background: {BAR}1a; }}
 tbody tr:nth-child(even) td {{ background: {INK}08; }}
 tr.fail td {{ background: {ACCENT}66; }}
+.skill-miss {{ color: #a4432b; font-weight: 700; }}
 .note {{ background: {ACCENT}55; border-left: 3px solid var(--bar); padding: 0.5rem 0.8rem;
         margin: 0.5rem 0; border-radius: 3px; }}
 section {{ margin-top: 2.5rem; scroll-margin-top: 1rem; }}

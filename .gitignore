@@ -24,4 +24,11 @@ __pycache__/
 # skills/ is NOT ignored — a drafted skill is a versioned, immutable artifact.
 runs/
 
+# Worked examples (config, tasks, skills, runs, reports) are kept out of the repo.
+examples/
+
+# Generated reports.
+report.html
+report.csv
+
 *ipynb*
