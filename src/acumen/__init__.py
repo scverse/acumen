@@ -8,6 +8,7 @@ from acumen.draft import DraftError, DraftResult, draft_skill
 from acumen.env import EnvError, Target, prepare_target, scrubbed_env
 from acumen.grade import Grade, Reason, grade_answer, grade_run
 from acumen.paths import RunKey, Split, arm_name, is_complete, parse_run_dir, run_dir, skill_from_arm
+from acumen.report import Report, ReportError, arm_metrics, build_report, load_results
 from acumen.runner import RunOutcome, run_once
 from acumen.sandbox import Sandbox, install_skill, sandbox
 from acumen.skills import (
@@ -31,6 +32,8 @@ __all__ = [
     "Grade",
     "PlannedRun",
     "Reason",
+    "Report",
+    "ReportError",
     "RunKey",
     "RunOutcome",
     "Sandbox",
@@ -43,9 +46,11 @@ __all__ = [
     "TaskError",
     "TaskSplit",
     "__version__",
+    "arm_metrics",
     "arm_name",
     "available_versions",
     "build_matrix",
+    "build_report",
     "draft_skill",
     "grade_answer",
     "grade_run",
@@ -53,6 +58,7 @@ __all__ = [
     "is_complete",
     "latest_version",
     "load_config",
+    "load_results",
     "load_skill",
     "load_tasks",
     "next_version",

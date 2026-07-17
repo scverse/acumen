@@ -1,0 +1,684 @@
+"""Aggregate ``result.json`` files into a self-contained HTML report.
+
+The report reads **only** ``result.json`` — never the transcripts (§4). Each result is
+the unit of record, so aggregation is just a walk of the run tree, a load per leaf, and a
+few group-bys. Figures are matplotlib rendered to PNG and inlined as base64 data URIs, so
+``report.html`` opens standalone with no sidecar files and no new dependencies (§2).
+
+The report is regenerated (overwritten) at each skill version — it always reflects every
+run currently on disk across every arm.
+
+The visualisations show **test-split** performance — the held-out measure of whether a
+skill helps. The full per-run table below them still lists both splits, so train runs
+remain inspectable.
+"""
+
+from __future__ import annotations
+
+import base64
+import html
+import io
+import json
+import math
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")  # headless: we never open a window, we render straight to PNG bytes
+
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import pandas as pd
+from matplotlib.patches import Patch
+
+from acumen.paths import NOSKILL_ARM, RESULT_FILE, TRANSCRIPT_HTML, skill_from_arm
+from acumen.tasks import Task
+
+# ── Palette ──────────────────────────────────────────────────────────────────────────
+# A warm-neutral scheme fixed by the maintainer. The two surfaces are the page and the
+# plot area, one a step lighter than the other, which gives each figure a subtle card
+# inset against the page. Bars are coloured by model (see the sequential ramp below);
+# train/test is a texture, not a colour.
+INK = "#1c1813"  # axes, text, ticks
+PAGE = "#efe7d7"  # page + figure background
+PLOT_BG = "#f7f3ec"  # the plot area itself, a step lighter than the page
+BAR = "#565149"  # a neutral tone, used where model hue does not apply
+ACCENT = "#b2ac9e"  # the light warm tone, for table tints and notes
+
+# The model is the hue: a single-hue sequential ramp keyed to model "potency", with the
+# most capable model (Fable) the lightest/most saturated and each step below it darker.
+# Colour follows the model *tier* (parsed from the model id), so a given tier always reads
+# the same regardless of which models a pass happens to include.
+_MODEL_ORDER = ("fable", "opus", "sonnet", "haiku")
+_MODEL_COLOR = {
+    "fable": "#d86f53",
+    "opus": "#c34c2c",
+    "sonnet": "#993b22",
+    "haiku": "#742d1a",
+}
+_OTHER_MODEL_COLOR = "#8a8378"  # neutral fallback for an unrecognised model id
+
+# Train vs test is a *texture*, not a colour — so it never competes with the model hue.
+_SPLIT_ORDER = ("train", "test")
+_SPLIT_HATCH = {"train": "////", "test": ""}
+
+#: rcParams applied around every figure via :func:`matplotlib.pyplot.rc_context`, so the
+#: report's styling never leaks into a caller's global matplotlib state.
+_RC = {
+    "figure.facecolor": PAGE,
+    "savefig.facecolor": PAGE,
+    "axes.facecolor": PLOT_BG,
+    "axes.edgecolor": INK,
+    "axes.labelcolor": INK,
+    "axes.titlecolor": INK,
+    "axes.titlesize": 11,
+    "axes.titleweight": "bold",
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "text.color": INK,
+    "xtick.color": INK,
+    "ytick.color": INK,
+    "xtick.labelcolor": INK,
+    "ytick.labelcolor": INK,
+    "font.size": 10,
+    "legend.fontsize": 9,
+}
+
+#: The split every figure reports on. Train runs feed the improver; the report measures
+#: held-out (test) performance.
+_REPORTED_SPLIT = "test"
+
+
+class ReportError(ValueError):
+    """Raised when there is nothing to report on, or the run tree is unreadable."""
+
+
+def arm_label(arm: str) -> str:
+    """Human label for an arm — ``"noskill"`` or a skill version like ``"v1"``.
+
+    This is the machine-ish form used in the data table and CSV; the figures use the
+    prettier :func:`_skill_label`.
+    """
+    return NOSKILL_ARM if arm == NOSKILL_ARM else (skill_from_arm(arm) or arm)
+
+
+def _skill_label(arm: str) -> str:
+    """Figure label for an arm — ``"No skill"``, ``"Skill v1"``, ``"Skill v2"``, …"""
+    if arm == NOSKILL_ARM:
+        return "No skill"
+    version = skill_from_arm(arm)
+    return f"Skill {version}" if version else arm
+
+
+def _arm_sort_key(arm: str) -> int:
+    """Order arms as noskill, v1, v2, … — the order a reader expects to compare in."""
+    if arm == NOSKILL_ARM:
+        return -1
+    version = skill_from_arm(arm)
+    return int(version[1:]) if version else 0
+
+
+def _fmt_tokens(value: float) -> str:
+    """Compact human token count, e.g. ``118k`` / ``1.2M``."""
+    if value >= 1e6:
+        return f"{value / 1e6:.1f}M"
+    if value >= 1e3:
+        return f"{value / 1e3:.0f}k"
+    return f"{value:.0f}"
+
+
+def _fmt_seconds(value: float) -> str:
+    """Compact human duration, e.g. ``45s`` / ``2.5m`` / ``1.1h``."""
+    if value >= 3600:
+        return f"{value / 3600:.1f}h"
+    if value >= 60:
+        return f"{value / 60:.1f}m"
+    return f"{value:.0f}s"
+
+
+def load_results(runs_root: Path) -> pd.DataFrame:
+    """Load every ``result.json`` under ``runs_root`` into a DataFrame.
+
+    Parameters
+    ----------
+    runs_root
+        The ``runs/`` root directory.
+
+    Returns
+    -------
+    One row per completed run. In addition to the ``result.json`` fields, each row carries
+    ``total_tokens`` and — for the runs table — ``result_path`` and ``transcript_path``
+    (the sibling ``transcript.html``, whether or not it exists).
+
+    Raises
+    ------
+    ReportError
+        If ``runs_root`` is missing or holds no readable results.
+    """
+    if not runs_root.is_dir():
+        raise ReportError(f"no runs directory: {runs_root}")
+
+    rows: list[dict] = []
+    for result_path in sorted(runs_root.rglob(RESULT_FILE)):
+        try:
+            data = json.loads(result_path.read_text())
+        except (OSError, json.JSONDecodeError) as err:
+            raise ReportError(f"cannot read {result_path}: {err}") from err
+        data["result_path"] = result_path.resolve()
+        data["transcript_path"] = (result_path.parent / TRANSCRIPT_HTML).resolve()
+        rows.append(data)
+
+    if not rows:
+        raise ReportError(f"no {RESULT_FILE} files under {runs_root} — run `acumen bench` first")
+
+    df = pd.DataFrame(rows)
+    df["total_tokens"] = df["input_tokens"] + df["output_tokens"]
+    df["arm_label"] = df["arm"].map(arm_label)
+    df["_arm_order"] = df["arm"].map(_arm_sort_key)
+    df = df.sort_values(["_arm_order", "split", "task_id", "model", "rep"]).reset_index(drop=True)
+    return df
+
+
+def _arms_in_order(df: pd.DataFrame) -> list[str]:
+    """Arms present in ``df``, noskill first then ascending skill versions."""
+    return sorted(df["arm"].unique(), key=_arm_sort_key)
+
+
+def _rate_and_error(successes: pd.Series) -> tuple[float, float]:
+    """Success rate and its binomial standard error for a group of boolean runs."""
+    n = len(successes)
+    if n == 0:
+        return math.nan, 0.0
+    p = float(successes.mean())
+    return p, math.sqrt(p * (1.0 - p) / n)
+
+
+def arm_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-arm success rate and resource totals for the runs in ``df``.
+
+    The caller filters ``df`` first — to the test split, and optionally to one task. Each
+    row is one arm, in report order.
+
+    Returns
+    -------
+    Columns ``arm``, ``arm_label``, ``rate``, ``stderr``, ``tokens``, ``cost``, ``time``,
+    ``n``.
+    """
+    rows = []
+    for arm in _arms_in_order(df):
+        group = df[df["arm"] == arm]
+        rate, stderr = _rate_and_error(group["success"])
+        rows.append(
+            {
+                "arm": arm,
+                "arm_label": arm_label(arm),
+                "rate": rate,
+                "stderr": stderr,
+                "tokens": float(group["total_tokens"].sum()),
+                "cost": float(group["cost_usd"].sum()),
+                "time": float(group["duration_s"].sum()),
+                "n": len(group),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+# ── Figures ──────────────────────────────────────────────────────────────────────────
+
+
+#: The four metric columns: (title, key, x-axis formatter, bar-label fn). The key selects
+#: the value; ``"rate"`` is special-cased for binomial error bars.
+_COLUMNS = [
+    ("Success rate", "rate", mticker.PercentFormatter(1.0), lambda v: f"{v:.0%}"),
+    ("Total tokens", "tokens", mticker.FuncFormatter(lambda v, _p: _fmt_tokens(v)), _fmt_tokens),
+    ("Total cost", "cost", mticker.FuncFormatter(lambda v, _p: f"${v:.2f}"), lambda v: f"${v:.2f}"),
+    ("Total time", "time", mticker.FuncFormatter(lambda v, _p: _fmt_seconds(v)), _fmt_seconds),
+]
+
+#: Metric key → the column that is summed for it (``rate`` is handled separately).
+_SUM_COLUMN = {"tokens": "total_tokens", "cost": "cost_usd", "time": "duration_s"}
+
+
+def _model_tier(model: str) -> str:
+    """Map a model id (e.g. ``claude-opus-4-8``) onto its family, or ``"other"``."""
+    lower = model.lower()
+    for tier in _MODEL_ORDER:
+        if tier in lower:
+            return tier
+    return "other"
+
+
+def _model_color(model: str) -> str:
+    """The sequential ramp colour for a model, by tier."""
+    return _MODEL_COLOR.get(_model_tier(model), _OTHER_MODEL_COLOR)
+
+
+def _models_in_order(df: pd.DataFrame) -> list[str]:
+    """Models present, most-potent first (fable, opus, sonnet, haiku), then any others."""
+
+    def key(model: str) -> tuple[int, str]:
+        tier = _model_tier(model)
+        return (_MODEL_ORDER.index(tier) if tier in _MODEL_ORDER else len(_MODEL_ORDER), model)
+
+    return sorted(df["model"].unique(), key=key)
+
+
+def _cell_value(df: pd.DataFrame, arm: str, model: str, split: str, key: str) -> tuple[float, float]:
+    """One (arm, model, split) cell's metric value and its error bar.
+
+    For ``rate`` it is the success rate and its binomial standard error. For the resource
+    totals it is the sum and the standard deviation of that sum — ``sqrt(n) * std`` over
+    the per-run values, i.e. how much the total would vary run to run (0 with <2 runs).
+    """
+    group = df[(df["arm"] == arm) & (df["model"] == model) & (df["split"] == split)]
+    if group.empty:
+        return 0.0, 0.0
+    if key == "rate":
+        return _rate_and_error(group["success"])
+    values = group[_SUM_COLUMN[key]]
+    total = float(values.sum())
+    error = float(values.std(ddof=1)) * math.sqrt(len(values)) if len(values) > 1 else 0.0
+    return total, error
+
+
+def _draw_cell(
+    ax: plt.Axes,
+    df: pd.DataFrame,
+    arm: str,
+    models: list[str],
+    splits: list[str],
+    key: str,
+    *,
+    value_label,
+) -> None:
+    """Draw one grid cell — bars per model (colour), grouped by split (texture)."""
+    n_models = len(models)
+    n_splits = len(splits)
+    group_h = 0.8
+    bar_h = group_h / n_splits
+    for si, split in enumerate(splits):
+        offset = (si - (n_splits - 1) / 2) * bar_h
+        values, errors = zip(*(_cell_value(df, arm, model, split, key) for model in models), strict=True)
+        bars = ax.barh(
+            [m + offset for m in range(n_models)],
+            values,
+            bar_h * 0.86,
+            color=[_model_color(model) for model in models],
+            hatch=_SPLIT_HATCH[split] if n_splits > 1 else "",
+            edgecolor=PLOT_BG,
+            linewidth=0.6,
+            xerr=list(errors),
+            capsize=2,
+            error_kw={"ecolor": INK, "elinewidth": 1},
+        )
+        ax.bar_label(bars, labels=[value_label(v) for v in values], padding=2, fontsize=6, color=INK)
+    ax.set_yticks([])
+    ax.set_ylim(-0.6, n_models - 0.4)
+    ax.invert_yaxis()  # first model (most potent) on top
+    ax.grid(axis="x", color=INK, alpha=0.14, linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.tick_params(length=0)
+
+
+def metrics_figure(df: pd.DataFrame, *, split_hue: bool) -> plt.Figure:
+    """The metrics grid: one subplot row per skill, one column per metric.
+
+    Columns (success rate with binomial error bars, total tokens, total cost, total time)
+    share an x-axis so skills are comparable within a metric. Inside each cell, bars are
+    coloured by model; when ``split_hue`` is set, train and test are shown as two textures
+    (test solid, train hatched) rather than two colours, leaving the model hue intact.
+
+    Parameters
+    ----------
+    df
+        Results to plot — the full frame, or one task's slice.
+    split_hue
+        ``True`` for the per-task view (train + test as texture); ``False`` for the
+        overview (the reported test split only).
+    """
+    arms = _arms_in_order(df)
+    models = _models_in_order(df)
+    splits = list(_SPLIT_ORDER) if split_hue else [_REPORTED_SPLIT]
+    n_rows = max(1, len(arms))
+    with plt.rc_context(_RC):
+        row_h = 0.42 * max(1, len(models) * len(splits)) + 0.5
+        fig, axes = plt.subplots(n_rows, 4, sharex="col", squeeze=False, figsize=(8.4, n_rows * row_h + 0.6))
+        for c, (title, key, formatter, value_label) in enumerate(_COLUMNS):
+            for r, arm in enumerate(arms):
+                ax = axes[r][c]
+                _draw_cell(ax, df, arm, models, splits, key, value_label=value_label)
+                ax.xaxis.set_major_formatter(formatter)
+                ax.xaxis.set_major_locator(mticker.MaxNLocator(3))
+                if r == 0:
+                    ax.set_title(title, fontsize=10)
+                if c == 0:
+                    ax.set_ylabel(_skill_label(arm), rotation=0, ha="right", va="center", fontweight="bold")
+            # sharex="col" ties the whole column together, so one xlim covers every row.
+            if key == "rate":
+                axes[-1][c].set_xlim(0, 1.28)
+            else:
+                reach = max(
+                    (
+                        v + e
+                        for arm in arms
+                        for m in models
+                        for s in splits
+                        for v, e in [_cell_value(df, arm, m, s, key)]
+                    ),
+                    default=1.0,
+                )
+                axes[-1][c].set_xlim(0, reach * 1.35 if reach else 1)
+
+        model_handles = [Patch(facecolor=_model_color(m), edgecolor=PLOT_BG, label=m) for m in models]
+        fig.legend(model_handles, models, title="model", frameon=False, loc="upper left", bbox_to_anchor=(1.0, 0.98))
+        if split_hue:
+            split_handles = [Patch(facecolor="#d8d2c6", edgecolor=INK, hatch=_SPLIT_HATCH[s], label=s) for s in splits]
+            fig.legend(split_handles, splits, title="split", frameon=False, loc="upper left", bbox_to_anchor=(1.0, 0.5))
+        fig.supylabel("Skills", fontweight="bold")
+        fig.tight_layout()
+    return fig
+
+
+def figure_data_uri(fig: plt.Figure) -> str:
+    """Render a figure to a base64 PNG ``data:`` URI, then close it.
+
+    The figure background is saved **transparent** (``facecolor="none"``) so the margins
+    between subplots pick up the page colour in the HTML but export blank — the axes
+    interiors keep their own opaque fill. ``transparent=True`` is deliberately *not* used:
+    it would also blank the axes patches.
+    """
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=130, bbox_inches="tight", facecolor="none")
+    plt.close(fig)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+@dataclass(frozen=True)
+class Report:
+    """A rendered report and the data behind it."""
+
+    html: str
+    results: pd.DataFrame
+
+    @property
+    def n_runs(self) -> int:
+        """How many runs the report covers."""
+        return len(self.results)
+
+
+def _integrity_notes(df: pd.DataFrame) -> list[str]:
+    """Flag arms whose ``skill_loaded`` disagrees with what the arm name claims (§4).
+
+    A skill arm where the Skill tool never fired is not measuring the skill; a noskill run
+    where it did fire is not a clean baseline. Either makes the comparison a lie, so it is
+    surfaced in the report rather than left in the transcripts.
+    """
+    notes = []
+    if "skill_loaded" not in df.columns:
+        return notes
+    for arm in _arms_in_order(df):
+        group = df[df["arm"] == arm]
+        loaded = int(group["skill_loaded"].fillna(False).sum())
+        if arm == NOSKILL_ARM:
+            if loaded:
+                notes.append(f"baseline arm '{arm}' fired the Skill tool in {loaded}/{len(group)} runs")
+        elif loaded < len(group):
+            notes.append(f"skill arm '{arm_label(arm)}' loaded the skill in only {loaded}/{len(group)} runs")
+    return notes
+
+
+def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
+    """Per-run table with resource use and a link to each run's ``transcript.html`` (§ M3-T5)."""
+    headers = [
+        "arm",
+        "split",
+        "task",
+        "model",
+        "rep",
+        "reason",
+        "answer",
+        "expected",
+        "turns",
+        "in tok",
+        "out tok",
+        "total tok",
+        "cost $",
+        "time",
+        "transcript",
+    ]
+    head = "".join(f"<th>{html.escape(h)}</th>" for h in headers)
+    body = []
+    for _, row in df.iterrows():
+        transcript: Path = row["transcript_path"]
+        if transcript.exists():
+            try:
+                href = transcript.relative_to(out_dir).as_posix()
+            except ValueError:
+                href = transcript.resolve().as_uri()
+            link = f'<a href="{html.escape(href)}">view</a>'
+        else:
+            link = "&mdash;"
+        status = "pass" if row["success"] else "fail"
+        cells = [
+            html.escape(str(row["arm_label"])),
+            html.escape(str(row["split"])),
+            html.escape(str(row["task_id"])),
+            html.escape(str(row["model"])),
+            str(int(row["rep"])),
+            html.escape(str(row["reason"])),
+            html.escape(str(row.get("answer", ""))),
+            html.escape(str(row.get("expected", ""))),
+            str(int(row["turns"])),
+            f"{int(row['input_tokens']):,}",
+            f"{int(row['output_tokens']):,}",
+            f"{int(row['total_tokens']):,}",
+            f"{float(row['cost_usd']):.3f}",
+            _fmt_seconds(float(row["duration_s"])),
+            link,
+        ]
+        body.append(f'<tr class="{status}">' + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+    return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table>"
+
+
+_STYLE = f"""
+:root {{ color-scheme: light; --ink: {INK}; --page: {PAGE}; --plot: {PLOT_BG}; --bar: {BAR}; }}
+* {{ box-sizing: border-box; }}
+html {{ scroll-behavior: smooth; }}
+body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin: 0; line-height: 1.5;
+       background: var(--page); color: var(--ink); display: flex; align-items: flex-start; }}
+nav.toc {{ position: sticky; top: 0; flex: 0 0 210px; height: 100vh; overflow-y: auto;
+       padding: 1.5rem 1rem; border-right: 1px solid {INK}22; font-size: 0.9rem; }}
+nav.toc .toc-title {{ font-weight: 700; margin-bottom: 0.6rem; }}
+nav.toc ul {{ list-style: none; margin: 0; padding: 0; }}
+nav.toc li {{ margin: 0.15rem 0; }}
+nav.toc ul ul {{ padding-left: 0.8rem; }}
+nav.toc a {{ display: block; padding: 0.15rem 0.4rem; border-radius: 3px; text-decoration: none;
+       color: var(--ink); border-left: 2px solid transparent; }}
+nav.toc a:hover {{ background: {INK}0d; }}
+nav.toc a.active {{ background: {BAR}22; border-left-color: var(--bar); font-weight: 600; }}
+main {{ flex: 1 1 auto; min-width: 0; max-width: 960px; margin: 2rem auto; padding: 0 1.5rem; }}
+h1 {{ margin-bottom: 0.2rem; }}
+h2 {{ border-bottom: 2px solid {BAR}33; padding-bottom: 0.2rem; scroll-margin-top: 1rem; }}
+h3 {{ margin: 1.4rem 0 0.2rem; scroll-margin-top: 1rem; }}
+a {{ color: var(--bar); }}
+.meta {{ color: {BAR}; font-size: 0.9rem; margin-bottom: 1.5rem; }}
+.task-desc {{ color: {BAR}; font-size: 0.9rem; margin: 0 0 0.4rem; }}
+figure {{ margin: 0.6rem 0 1.6rem; text-align: center; }}
+img {{ max-width: 100%; height: auto; }}
+table {{ border-collapse: collapse; width: 100%; font-size: 0.88rem; margin: 1rem 0; display: block;
+        overflow-x: auto; }}
+th, td {{ border: 1px solid {INK}22; padding: 0.3rem 0.55rem; text-align: right; white-space: nowrap; }}
+th:first-child, td:first-child {{ text-align: left; }}
+thead th {{ background: {BAR}1a; }}
+tbody tr:nth-child(even) td {{ background: {INK}08; }}
+tr.fail td {{ background: {ACCENT}66; }}
+.note {{ background: {ACCENT}55; border-left: 3px solid var(--bar); padding: 0.5rem 0.8rem;
+        margin: 0.5rem 0; border-radius: 3px; }}
+section {{ margin-top: 2.5rem; scroll-margin-top: 1rem; }}
+@media (max-width: 720px) {{
+  body {{ display: block; }}
+  nav.toc {{ position: static; height: auto; flex-basis: auto; border-right: none;
+       border-bottom: 1px solid {INK}22; }}
+  nav.toc ul {{ columns: 2; }}
+  main {{ margin: 1rem auto; }}
+}}
+"""
+
+#: Highlights the nav link for whichever section is on screen. Progressive enhancement —
+#: the anchor links jump correctly with JS disabled; this only adds the active marker.
+_SCROLLSPY_JS = """
+const links = new Map();
+document.querySelectorAll('nav.toc a').forEach(a => links.set(a.getAttribute('href').slice(1), a));
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      links.forEach(a => a.classList.remove('active'));
+      const a = links.get(e.target.id);
+      if (a) a.classList.add('active');
+    }
+  });
+}, { rootMargin: '0px 0px -75% 0px' });
+document.querySelectorAll('[id]').forEach(el => { if (links.has(el.id)) observer.observe(el); });
+"""
+
+
+def _task_desc_html(task: Task) -> str:
+    """The task's own prompts (train and test) — the actual task, not the runtime prompt.
+
+    This is the text from ``tasks.yaml``, distinct from the full benchmark prompt the
+    agent sees (which prepends the harness preamble in :mod:`acumen.prompts`).
+    """
+    parts = []
+    for split in _SPLIT_ORDER:
+        prompt = " ".join(task.split(split).prompt.split())
+        parts.append(f'<p class="task-desc"><strong>{split}:</strong> {html.escape(prompt)}</p>')
+    return "".join(parts)
+
+
+def render_report(
+    df: pd.DataFrame,
+    out_dir: Path,
+    tasks: Sequence[Task] | None = None,
+    data_href: str | None = None,
+) -> str:
+    """Render the full report HTML for the results in ``df``.
+
+    Parameters
+    ----------
+    df
+        Results from :func:`load_results`.
+    out_dir
+        The directory ``report.html`` will live in — transcript links are made relative
+        to it so the report stays portable alongside the run tree.
+    tasks
+        The loaded tasks, if available — used to print each task's own prompt under its
+        per-task heading. When ``None``, the heading shows the task id alone.
+    data_href
+        Relative link to the aggregated data file (the CSV backing the runs table), shown
+        above it so a reader can grab the numbers. When ``None``, no link is shown.
+    """
+    overview_uri = figure_data_uri(metrics_figure(df, split_hue=False))
+    task_by_id = {t.id: t for t in tasks or []}
+
+    task_blocks = []
+    toc_tasks = []
+    for task_id in sorted(df["task_id"].unique()):
+        subset = df[df["task_id"] == task_id]
+        uri = figure_data_uri(metrics_figure(subset, split_hue=True))
+        task = task_by_id.get(task_id)
+        desc = _task_desc_html(task) if task is not None else ""
+        anchor = f"task-{task_id}"
+        task_blocks.append(
+            f'<h3 id="{html.escape(anchor)}">{html.escape(task_id)}</h3>'
+            f"{desc}"
+            f'<figure><img alt="Metrics for {html.escape(task_id)}" src="{uri}"></figure>'
+        )
+        toc_tasks.append(f'<li><a href="#{html.escape(anchor)}">{html.escape(task_id)}</a></li>')
+
+    toc = f"""<nav class="toc">
+<div class="toc-title">acumen report</div>
+<ul>
+<li><a href="#overview">Overview</a></li>
+<li><a href="#per-task">Per-task breakdown</a><ul>{"".join(toc_tasks)}</ul></li>
+<li><a href="#runs">Runs</a></li>
+</ul>
+</nav>"""
+
+    generated = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    arms = ", ".join(arm_label(a) for a in _arms_in_order(df))
+    tasks = ", ".join(sorted(df["task_id"].unique()))
+    notes = "".join(f'<div class="note">⚠ {html.escape(n)}</div>' for n in _integrity_notes(df))
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>acumen report</title>
+<style>{_STYLE}</style>
+</head>
+<body>
+{toc}
+<main>
+<h1>acumen benchmark report</h1>
+<div class="meta">Generated {generated} &middot; {len(df)} runs &middot; test split shown
+ &middot; arms: {html.escape(arms)} &middot; tasks: {html.escape(tasks)}</div>
+{notes}
+<section id="overview">
+<h2>Overview</h2>
+<p class="task-desc">Values for test runs.</p>
+<figure><img alt="Success rate, tokens, cost and time per skill" src="{overview_uri}"></figure>
+</section>
+<section id="per-task">
+<h2>Per-task breakdown</h2>
+{"".join(task_blocks)}
+</section>
+<section id="runs">
+<h2>Runs</h2>
+{f'<p class="task-desc">Full data: <a href="{html.escape(data_href)}">{html.escape(data_href)}</a></p>' if data_href else ""}
+{_runs_table_html(df, out_dir)}
+</section>
+</main>
+<script>{_SCROLLSPY_JS}</script>
+</body>
+</html>
+"""
+
+
+def build_report(runs_root: Path, out_path: Path, tasks: Sequence[Task] | None = None) -> Report:
+    """Aggregate the run tree and render ``report.html`` (§ M3-T1..T6).
+
+    The report is overwritten in place, so it always reflects every run on disk.
+
+    Parameters
+    ----------
+    runs_root
+        The ``runs/`` root to aggregate.
+    out_path
+        Where to write ``report.html``.
+    tasks
+        The loaded tasks, if available — used to print each task's prompt under its
+        per-task heading.
+
+    Returns
+    -------
+    The rendered :class:`Report` (also written to ``out_path``).
+    """
+    df = load_results(runs_root)
+    out_path = out_path.resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # A sidecar CSV of the aggregated results, for anyone who wants to reanalyse or plot
+    # the numbers themselves. Drop the internal helper columns (Path objects and sort
+    # keys) so it stays a clean, portable table.
+    data_path = out_path.with_suffix(".csv")
+    internal = [c for c in ("result_path", "transcript_path", "_arm_order") if c in df.columns]
+    df.drop(columns=internal).to_csv(data_path, index=False)
+
+    html_text = render_report(df, out_path.parent, tasks, data_href=data_path.name)
+    out_path.write_text(html_text)
+    return Report(html=html_text, results=df)

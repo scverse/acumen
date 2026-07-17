@@ -14,6 +14,7 @@ from acumen.config import ConfigError, load_config
 from acumen.draft import DraftError, draft_skill
 from acumen.env import DEFAULT_CACHE_ROOT, EnvError, prepare_target
 from acumen.paths import SPLITS
+from acumen.report import ReportError, build_report
 from acumen.runner import RunOutcome
 from acumen.skills import SkillError, available_versions, load_skill
 from acumen.tasks import TaskError, load_tasks
@@ -160,6 +161,22 @@ def _cmd_draft(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_report(args: argparse.Namespace) -> int:
+    tasks = load_tasks(args.tasks) if args.tasks.exists() else None
+    if tasks is None:
+        print(f"note: {args.tasks} not found — per-task prompts will be omitted", file=sys.stderr)
+    report = build_report(args.runs, args.out, tasks)
+    df = report.results
+    arms = ", ".join(sorted(df["arm_label"].unique(), key=lambda a: (a != "noskill", a)))
+    print(f"aggregated {report.n_runs} runs across arms: {arms}")
+    for arm in sorted(df["arm_label"].unique(), key=lambda a: (a != "noskill", a)):
+        group = df[df["arm_label"] == arm]
+        print(f"  {arm}: {int(group['success'].sum())}/{len(group)} passed")
+    print(f"wrote {args.out.resolve()}")
+    print(f"wrote {args.out.resolve().with_suffix('.csv')}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the ``acumen`` argument parser."""
     parser = argparse.ArgumentParser(
@@ -180,6 +197,12 @@ def build_parser() -> argparse.ArgumentParser:
     draft.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     draft.add_argument("--force", action="store_true", help="draft another version even if some already exist")
     draft.set_defaults(func=_cmd_draft)
+
+    report = sub.add_parser("report", help="aggregate the run tree into a self-contained report.html")
+    report.add_argument("--runs", type=Path, default=Path("runs"), help="root of the run tree")
+    report.add_argument("--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml (for task text)")
+    report.add_argument("--out", type=Path, default=Path("report.html"), help="output HTML path (overwritten)")
+    report.set_defaults(func=_cmd_report)
     return parser
 
 
@@ -194,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
-    except (ConfigError, TaskError, EnvError, SkillError, DraftError) as err:
+    except (ConfigError, TaskError, EnvError, SkillError, DraftError, ReportError) as err:
         print(f"error: {err}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
