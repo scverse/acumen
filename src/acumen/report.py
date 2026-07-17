@@ -20,6 +20,7 @@ import html
 import io
 import json
 import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -48,16 +49,17 @@ PLOT_BG = "#f7f3ec"  # the plot area itself, a step lighter than the page
 BAR = "#565149"  # a neutral tone, used where model hue does not apply
 ACCENT = "#b2ac9e"  # the light warm tone, for table tints and notes
 
-# The model is the hue: a single-hue sequential ramp keyed to model "potency", with the
-# most capable model (Fable) the lightest/most saturated and each step below it darker.
-# Colour follows the model *tier* (parsed from the model id), so a given tier always reads
-# the same regardless of which models a pass happens to include.
+# The model is the hue: a single-hue ramp keyed to model "potency". The most capable model
+# (Fable) is the DARKEST / most saturated — the Claude orange — and each weaker tier is a
+# lighter tint of that same hue. The mapping is fixed by *tier* (parsed from the model id),
+# so a given tier always reads the same colour regardless of which — or how many — models a
+# pass happens to include.
 _MODEL_ORDER = ("fable", "opus", "sonnet", "haiku")
 _MODEL_COLOR = {
-    "fable": "#d86f53",
-    "opus": "#c34c2c",
-    "sonnet": "#993b22",
-    "haiku": "#742d1a",
+    "fable": "#d86f53",  # Claude orange — most potent, darkest/most saturated
+    "opus": "#e18c74",  # a lighter tint
+    "sonnet": "#e8a794",  # lighter still
+    "haiku": "#eec0b0",  # lightest — least potent
 }
 _OTHER_MODEL_COLOR = "#8a8378"  # neutral fallback for an unrecognised model id
 
@@ -256,6 +258,22 @@ def _model_color(model: str) -> str:
     return _MODEL_COLOR.get(_model_tier(model), _OTHER_MODEL_COLOR)
 
 
+#: A trailing snapshot date on a model id, e.g. the ``-20251001`` on
+#: ``claude-haiku-4-5-20251001``. Some ids pin a dated snapshot and some don't
+#: (``claude-opus-4-8``); we strip it for display so the legend reads consistently.
+_MODEL_DATE_RE = re.compile(r"-\d{6,8}$")
+
+
+def _model_label(model: str) -> str:
+    """Display label for a model id, with any trailing snapshot date removed.
+
+    ``claude-haiku-4-5-20251001`` -> ``claude-haiku-4-5``; ``claude-opus-4-8`` is unchanged.
+    The raw id is kept everywhere it is data (the runs table, the CSV) — this only tidies
+    what the figures show.
+    """
+    return _MODEL_DATE_RE.sub("", model)
+
+
 def _models_in_order(df: pd.DataFrame) -> list[str]:
     """Models present, most-potent first (fable, opus, sonnet, haiku), then any others."""
 
@@ -266,22 +284,26 @@ def _models_in_order(df: pd.DataFrame) -> list[str]:
     return sorted(df["model"].unique(), key=key)
 
 
-def _cell_value(df: pd.DataFrame, arm: str, model: str, split: str, key: str) -> tuple[float, float]:
-    """One (arm, model, split) cell's metric value and its error bar.
+def _cell_value(df: pd.DataFrame, arm: str, model: str, split: str, key: str) -> tuple[float, float, bool]:
+    """One (arm, model, split) cell's metric value, its error bar, and whether it has runs.
 
     For ``rate`` it is the success rate and its binomial standard error. For the resource
     totals it is the sum and the standard deviation of that sum — ``sqrt(n) * std`` over
     the per-run values, i.e. how much the total would vary run to run (0 with <2 runs).
+
+    The third element distinguishes a genuine zero (e.g. a 0% success rate) from a cell with
+    no runs at all: a model not run in this arm reserves its slot but draws no bar.
     """
     group = df[(df["arm"] == arm) & (df["model"] == model) & (df["split"] == split)]
     if group.empty:
-        return 0.0, 0.0
+        return 0.0, 0.0, False
     if key == "rate":
-        return _rate_and_error(group["success"])
+        rate, error = _rate_and_error(group["success"])
+        return rate, error, True
     values = group[_SUM_COLUMN[key]]
     total = float(values.sum())
     error = float(values.std(ddof=1)) * math.sqrt(len(values)) if len(values) > 1 else 0.0
-    return total, error
+    return total, error, True
 
 
 def _draw_cell(
@@ -294,29 +316,38 @@ def _draw_cell(
     *,
     value_label,
 ) -> None:
-    """Draw one grid cell — bars per model (colour), grouped by split (texture)."""
+    """Draw one grid cell — one fixed slot per model (colour), grouped by split (texture).
+
+    Every model in ``models`` gets a slot at the same y-position in every cell, so bars line
+    up across skills. A model with no runs in this arm reserves its slot but draws nothing —
+    no bar, no error bar, no label — so a stretched neighbour can't be mistaken for it.
+    """
     n_models = len(models)
     n_splits = len(splits)
     group_h = 0.8
     bar_h = group_h / n_splits
+    nan = float("nan")
     for si, split in enumerate(splits):
         offset = (si - (n_splits - 1) / 2) * bar_h
-        values, errors = zip(*(_cell_value(df, arm, model, split, key) for model in models), strict=True)
+        cells = [_cell_value(df, arm, model, split, key) for model in models]
+        # A NaN width draws no bar and no error bar; the y-slot is still occupied.
         bars = ax.barh(
             [m + offset for m in range(n_models)],
-            values,
+            [value if present else nan for value, _err, present in cells],
             bar_h * 0.86,
             color=[_model_color(model) for model in models],
             hatch=_SPLIT_HATCH[split] if n_splits > 1 else "",
             edgecolor=PLOT_BG,
             linewidth=0.6,
-            xerr=list(errors),
+            xerr=[err if present else nan for _value, err, present in cells],
             capsize=2,
             error_kw={"ecolor": INK, "elinewidth": 1},
         )
-        ax.bar_label(bars, labels=[value_label(v) for v in values], padding=2, fontsize=6, color=INK)
+        labels = [value_label(value) if present else "" for value, _err, present in cells]
+        ax.bar_label(bars, labels=labels, padding=2, fontsize=6, color=INK)
     ax.set_yticks([])
-    ax.set_ylim(-0.6, n_models - 0.4)
+    # One slot per model, tight even padding — half a slot each side, no wasted band.
+    ax.set_ylim(-0.5, n_models - 0.5)
     ax.invert_yaxis()  # first model (most potent) on top
     ax.grid(axis="x", color=INK, alpha=0.14, linewidth=0.8)
     ax.set_axisbelow(True)
@@ -342,9 +373,14 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool) -> plt.Figure:
     arms = _arms_in_order(df)
     models = _models_in_order(df)
     splits = list(_SPLIT_ORDER) if split_hue else [_REPORTED_SPLIT]
+    # Every model gets a fixed slot in every arm's cell, so bars align across skills and a
+    # model that wasn't run leaves a reserved gap rather than letting its neighbour stretch.
     n_rows = max(1, len(arms))
+    max_bars = max(1, len(models) * len(splits))
     with plt.rc_context(_RC):
-        row_h = 0.42 * max(1, len(models) * len(splits)) + 0.5
+        # Height scales with the number of bars per cell; the small constant covers the
+        # per-row breathing room, not a fixed block, so few-model plots stay compact.
+        row_h = 0.26 * max_bars + 0.22
         fig, axes = plt.subplots(n_rows, 4, sharex="col", squeeze=False, figsize=(8.4, n_rows * row_h + 0.6))
         for c, (title, key, formatter, value_label) in enumerate(_COLUMNS):
             for r, arm in enumerate(arms):
@@ -366,14 +402,21 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool) -> plt.Figure:
                         for arm in arms
                         for m in models
                         for s in splits
-                        for v, e in [_cell_value(df, arm, m, s, key)]
+                        for v, e, present in [_cell_value(df, arm, m, s, key)]
+                        if present
                     ),
                     default=1.0,
                 )
                 axes[-1][c].set_xlim(0, reach * 1.35 if reach else 1)
 
-        model_handles = [Patch(facecolor=_model_color(m), edgecolor=PLOT_BG, label=m) for m in models]
-        fig.legend(model_handles, models, title="model", frameon=False, loc="upper left", bbox_to_anchor=(1.0, 0.98))
+        model_labels = [_model_label(m) for m in models]
+        model_handles = [
+            Patch(facecolor=_model_color(m), edgecolor=PLOT_BG, label=lab)
+            for m, lab in zip(models, model_labels, strict=True)
+        ]
+        fig.legend(
+            model_handles, model_labels, title="model", frameon=False, loc="upper left", bbox_to_anchor=(1.0, 0.98)
+        )
         if split_hue:
             split_handles = [Patch(facecolor="#d8d2c6", edgecolor=INK, hatch=_SPLIT_HATCH[s], label=s) for s in splits]
             fig.legend(split_handles, splits, title="split", frameon=False, loc="upper left", bbox_to_anchor=(1.0, 0.5))

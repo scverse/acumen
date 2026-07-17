@@ -13,10 +13,11 @@ from acumen.bench import build_matrix, pending, run_matrix, summarize
 from acumen.config import ConfigError, load_config
 from acumen.draft import DraftError, draft_skill
 from acumen.env import DEFAULT_CACHE_ROOT, EnvError, prepare_target
+from acumen.improve import ImproveError, improve_skill
 from acumen.paths import SPLITS
 from acumen.report import ReportError, build_report
 from acumen.runner import RunOutcome
-from acumen.skills import SkillError, available_versions, load_skill
+from acumen.skills import SkillError, available_versions, latest_version, load_skill
 from acumen.tasks import TaskError, load_tasks
 
 
@@ -161,6 +162,59 @@ def _cmd_draft(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_improve(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    tasks = load_tasks(args.tasks)
+    if args.model:
+        cfg = replace(cfg, improve_model=args.model)
+
+    versions = available_versions(args.skills)
+    if not versions:
+        print(
+            f"no skill versions under {args.skills} — run `acumen draft` first, then bench it",
+            file=sys.stderr,
+        )
+        return 2
+    parent = args.from_version or latest_version(args.skills)
+    # Immutability guard (§4, T5): the improved version is always the next unused directory,
+    # so an existing version is never in the write path. Say the parent plainly up front.
+    skill = load_skill(args.skills, parent, expect_name=cfg.skill_name)
+    print(f"improving {skill.version} ({skill.name}, {skill.hash[:19]}…) with {cfg.improve_model}")
+
+    print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
+    target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
+    print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
+
+    result = asyncio.run(
+        improve_skill(
+            cfg=cfg,
+            target=target,
+            skills_root=args.skills,
+            runs_root=args.runs,
+            tasks=tasks,
+            parent_version=parent,
+            max_turns=args.max_turns,
+            max_usd=args.max_usd,
+        )
+    )
+    new = result.skill
+    files = sorted(p.relative_to(new.directory).as_posix() for p in new.directory.rglob("*") if p.is_file())
+    print(f"\nwrote {new.directory}  (parent {result.parent})")
+    print(f"  name:        {new.name}")
+    print(f"  description: {new.description}")
+    print(f"  hash:        {new.hash}")
+    print(f"  files:       {', '.join(files)}")
+    print(f"  evidence:    {result.n_train_runs} train runs ({result.n_train_failures} failing)")
+    print(f"  cost:        ${result.cost_usd:.2f} over {result.turns} turns")
+    if new.hash == skill.hash:
+        print(
+            "warning: the new version is byte-identical to its parent — the improver changed nothing",
+            file=sys.stderr,
+        )
+    print(f"\nnext: acumen bench --skill {new.version} && acumen report")
+    return 0
+
+
 def _cmd_report(args: argparse.Namespace) -> int:
     tasks = load_tasks(args.tasks) if args.tasks.exists() else None
     if tasks is None:
@@ -198,6 +252,19 @@ def build_parser() -> argparse.ArgumentParser:
     draft.add_argument("--force", action="store_true", help="draft another version even if some already exist")
     draft.set_defaults(func=_cmd_draft)
 
+    improve = sub.add_parser("improve", help="improve the current skill into a new version from its train results")
+    improve.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
+    improve.add_argument("--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml")
+    improve.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
+    improve.add_argument("--runs", type=Path, default=Path("runs"), help="root of the run tree")
+    improve.add_argument("--from", dest="from_version", metavar="VERSION", help="version to improve (default: latest)")
+    improve.add_argument("--model", help="override config improve_model")
+    improve.add_argument("--max-turns", type=int, help="override config max_turns for the improving agent")
+    improve.add_argument("--max-usd", type=float, help="override config max_usd for the improving agent")
+    improve.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
+    improve.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
+    improve.set_defaults(func=_cmd_improve)
+
     report = sub.add_parser("report", help="aggregate the run tree into a self-contained report.html")
     report.add_argument("--runs", type=Path, default=Path("runs"), help="root of the run tree")
     report.add_argument("--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml (for task text)")
@@ -217,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
-    except (ConfigError, TaskError, EnvError, SkillError, DraftError, ReportError) as err:
+    except (ConfigError, TaskError, EnvError, SkillError, DraftError, ImproveError, ReportError) as err:
         print(f"error: {err}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

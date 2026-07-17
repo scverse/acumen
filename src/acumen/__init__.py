@@ -7,6 +7,15 @@ from acumen.config import Config, ConfigError, load_config, parse_config
 from acumen.draft import DraftError, DraftResult, draft_skill
 from acumen.env import EnvError, Target, prepare_target, scrubbed_env
 from acumen.grade import Grade, Reason, grade_answer, grade_run
+from acumen.improve import (
+    ImproveError,
+    ImproveResult,
+    TrainRun,
+    collect_train_runs,
+    find_test_access,
+    improve_skill,
+    make_test_guard,
+)
 from acumen.paths import RunKey, Split, arm_name, is_complete, parse_run_dir, run_dir, skill_from_arm
 from acumen.report import Report, ReportError, arm_metrics, build_report, load_results
 from acumen.runner import RunOutcome, run_once
@@ -30,6 +39,8 @@ __all__ = [
     "DraftResult",
     "EnvError",
     "Grade",
+    "ImproveError",
+    "ImproveResult",
     "PlannedRun",
     "Reason",
     "Report",
@@ -45,17 +56,22 @@ __all__ = [
     "Task",
     "TaskError",
     "TaskSplit",
+    "TrainRun",
     "__version__",
     "arm_metrics",
     "arm_name",
     "available_versions",
     "build_matrix",
     "build_report",
+    "collect_train_runs",
     "draft_skill",
+    "find_test_access",
     "grade_answer",
     "grade_run",
+    "improve_skill",
     "install_skill",
     "is_complete",
+    "make_test_guard",
     "latest_version",
     "load_config",
     "load_results",

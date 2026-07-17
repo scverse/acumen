@@ -135,6 +135,67 @@ When you are done, `{out}/SKILL.md` must exist and start with the frontmatter ab
 """
 
 
+IMPROVE_PROMPT = """\
+You are improving a Claude Skill for the Python package `{package}` (version {version}).
+
+A skill is documentation written for an agent, not a human. Its only purpose is to make an
+agent that has never used `{package}` succeed at real tasks with it on the first try.
+
+You are producing version {new_version} — an improvement of version {parent_version}.
+
+# What you can read
+
+- `{skill_dir}` — the current skill ({parent_version}). This directory has been pre-filled
+  with a copy of it. EDIT THESE FILES IN PLACE; what they contain when you finish becomes
+  version {new_version}.
+- `{train_dir}` — evidence from benchmarking the current skill on the TRAIN split. Read
+  `{train_dir}/SUMMARY.md` first. For each run you will find the task prompt, the expected
+  answer, the answer the agent actually gave, whether it passed, the `script.py` it wrote,
+  and its full transcript. This is your only signal about what the skill gets right and
+  what it gets wrong.
+- `{package}` is installed; run `{python}` (also `python` on your PATH) to verify any
+  claim about the API before you write it down. Do not install or upgrade packages.
+- You have web access if the published docs help.
+
+# What you are NOT allowed to see
+
+You are optimising against a TRAIN split. A separate, held-out TEST split is what measures
+whether your changes actually generalise rather than memorising these particular tasks. You
+must not see the test split, and any tool call that reaches test results will be BLOCKED.
+Do not attempt it — reaching test data would invalidate the whole benchmark.
+
+# What you must write
+
+1. Edit the skill in place under `{skill_dir}`. When you finish, `{skill_dir}/SKILL.md`
+   must still begin with YAML frontmatter whose `name` is exactly `{skill_name}` and whose
+   `description` is an honest one-sentence statement of what the skill covers and when to
+   use it.
+
+2. `{rationale_path}` — one short paragraph stating WHAT you changed and WHY, grounded in
+   the train evidence. Write it here, OUTSIDE the skill directory. Do not put the rationale
+   inside `{skill_dir}`.
+
+# How to improve it
+
+- **Fix what the evidence shows is broken.** Read the failing runs first. A failure is
+  either the skill steering the agent wrong, or the skill saying nothing where it should
+  have. Address the cause you can see in the transcript, not one you imagine.
+- **Generalise — never overfit.** NEVER name a specific dataset, parameter value, column,
+  expected answer, or task from the train runs in the skill. The skill must help on tasks
+  you have not seen. Guidance that enumerates these particular cases is cheating and will
+  fail the test split.
+- **Prefer removing text over adding it.** A shorter skill that an agent reads and follows
+  beats a longer one it skims. Every token is paid on every task, including the ones where
+  the skill is irrelevant. If a passage did not change any outcome, cut it.
+- **Verify before you write.** Do not assert a default, a return type, or where an output
+  lands without confirming it in the installed package or the docs.
+- **No hedging.** Say what to do.
+
+When you are done, `{skill_dir}/SKILL.md` exists and starts with the frontmatter above, and
+`{rationale_path}` contains your rationale.
+"""
+
+
 def draft_prompt(*, package: str, version: str, src: Path, python: Path, out: Path, skill_name: str) -> str:
     """Build the prompt for the drafting agent.
 
@@ -161,6 +222,63 @@ def draft_prompt(*, package: str, version: str, src: Path, python: Path, out: Pa
     The draft prompt.
     """
     return DRAFT_PROMPT.format(package=package, version=version, src=src, python=python, out=out, skill_name=skill_name)
+
+
+def improve_prompt(
+    *,
+    package: str,
+    version: str,
+    python: Path,
+    skill_dir: Path,
+    train_dir: Path,
+    rationale_path: Path,
+    skill_name: str,
+    parent_version: str,
+    new_version: str,
+) -> str:
+    """Build the prompt for the improving agent.
+
+    Unlike the drafter, the improver never sees the package source (§6) — it works from the
+    current skill and the *train-split* evidence of how that skill performed. The test split
+    is unreachable, enforced structurally (§7.1), not by this prompt.
+
+    Parameters
+    ----------
+    package
+        The target package name.
+    version
+        The installed package version, so any verification runs against what is installed.
+    python
+        The interpreter with the package installed, for checking claims.
+    skill_dir
+        The staging directory, pre-filled with a copy of the parent skill, that the agent
+        edits in place to produce the new version.
+    train_dir
+        The directory of train-split evidence the agent reads (``SUMMARY.md`` + per-run
+        material).
+    rationale_path
+        Where the agent writes its rationale — outside ``skill_dir`` so it never becomes
+        skill content.
+    skill_name
+        The name the frontmatter must keep — ``config.skill_name``.
+    parent_version, new_version
+        The version being improved and the version being produced, e.g. ``v1`` -> ``v2``.
+
+    Returns
+    -------
+    The improve prompt.
+    """
+    return IMPROVE_PROMPT.format(
+        package=package,
+        version=version,
+        python=python,
+        skill_dir=skill_dir,
+        train_dir=train_dir,
+        rationale_path=rationale_path,
+        skill_name=skill_name,
+        parent_version=parent_version,
+        new_version=new_version,
+    )
 
 
 def benchmark_prompt(task_prompt: str, *, sandbox: Path, python: Path, package: str) -> str:
