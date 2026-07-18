@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from collections.abc import Callable
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,7 +17,9 @@ from acumen.improve import ImproveError, improve_skill
 from acumen.paths import SPLITS
 from acumen.report import ReportError, build_report
 from acumen.runner import RunOutcome
+from acumen.scaffold import InitError, scaffold
 from acumen.skills import SkillError, available_versions, latest_version, load_skill
+from acumen.taskgen import TaskGenError, generate_tasks
 from acumen.tasks import TaskError, load_tasks
 
 
@@ -40,20 +42,79 @@ def _add_bench_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true", help="print the matrix and exit without running agents")
 
 
-def _progress(total: int) -> Callable[[RunOutcome], None]:
-    state = {"done": 0}
+def _fmt_secs(seconds: float) -> str:
+    """Compact wall-clock duration, e.g. ``9s`` / ``2m41s`` / ``1h04m``."""
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
 
-    def report(outcome: RunOutcome) -> None:
-        state["done"] += 1
-        mark = "PASS" if outcome.success else "FAIL"
-        key = outcome.key
+
+def _key_label(key) -> str:
+    return f"{key.arm}/{key.split}/{key.model}/{key.task_id}/rep_{key.rep}"
+
+
+class _Progress:
+    """Progress reporter for a concurrent bench pass.
+
+    Prints a line when each run starts and finishes, each stamped with the wall-clock
+    elapsed since the pass began, the number in flight, and a running pass tally — the
+    context a long, interleaved pass needs to be readable as it scrolls by.
+    """
+
+    def __init__(self, total: int) -> None:
+        self.total = total
+        self.started = 0
+        self.done = 0
+        self.passed = 0
+        self.running = 0
+        self._t0 = time.monotonic()
+
+    @property
+    def elapsed(self) -> float:
+        """Seconds since the pass began."""
+        return time.monotonic() - self._t0
+
+    def _stamp(self) -> str:
+        return f"+{_fmt_secs(self.elapsed):>6}"
+
+    def on_start(self, item) -> None:
+        self.started += 1
+        self.running += 1
         print(
-            f"[{state['done']}/{total}] {mark} {key.arm}/{key.split}/{key.model}/{key.task_id}/rep_{key.rep}"
-            f" ({outcome.reason})",
+            f"[{self._stamp()}] ▶ start {_key_label(item.key)}"
+            f"  (running {self.running}, {self.started}/{self.total} started)",
             flush=True,
         )
 
-    return report
+    def on_done(self, outcome: RunOutcome) -> None:
+        self.done += 1
+        self.running -= 1
+        if outcome.success:
+            self.passed += 1
+        mark = "✓ pass" if outcome.success else "✗ FAIL"
+        p = outcome.payload
+        toks = int(p.get("input_tokens", 0)) + int(p.get("output_tokens", 0))
+        cost = float(p.get("cost_usd", 0.0))
+        dur = _fmt_secs(float(p.get("duration_s", 0.0)))
+        stats = f"{_fmt_tokens(toks)}tok ${cost:.2f} {dur}"
+        print(
+            f"[{self._stamp()}] {mark} {_key_label(outcome.key)}"
+            f"  ({outcome.reason})  {stats}"
+            f"  [{self.done}/{self.total} done, {self.passed} passed]",
+            flush=True,
+        )
+
+
+def _fmt_tokens(value: int) -> str:
+    """Compact token count, e.g. ``118k`` / ``1.2M``."""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1000:
+        return f"{value / 1000:.0f}k"
+    return str(value)
 
 
 def _cmd_bench(args: argparse.Namespace) -> int:
@@ -88,6 +149,8 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]} (venv {target.venv_dir})", flush=True)
 
+    print(f"running {len(todo)} runs, up to {cfg.max_concurrency} at a time:", flush=True)
+    progress = _Progress(len(todo))
     outcomes = asyncio.run(
         run_matrix(
             todo,
@@ -96,14 +159,16 @@ def _cmd_bench(args: argparse.Namespace) -> int:
             max_concurrency=cfg.max_concurrency,
             skill=skill,
             keep_sandbox=args.keep_sandboxes,
-            on_done=_progress(len(todo)),
+            on_start=progress.on_start,
+            on_done=progress.on_done,
         )
     )
 
     passed = sum(1 for o in outcomes if o.success)
     counts = summarize(outcomes)
     breakdown = ", ".join(f"{reason}={n}" for reason, n in sorted(counts.items()))
-    print(f"\n{passed}/{len(outcomes)} passed  ({breakdown})")
+    total_cost = sum(float(o.payload.get("cost_usd", 0.0)) for o in outcomes)
+    print(f"\n{passed}/{len(outcomes)} passed in {_fmt_secs(progress.elapsed)}  (${total_cost:.2f}, {breakdown})")
 
     # The comparison is only meaningful if the skill actually reached the agent, so say
     # so rather than leaving it to be discovered later in the transcripts (§7.4).
@@ -215,11 +280,56 @@ def _cmd_improve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_tasks(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    if args.model:
+        cfg = replace(cfg, tasks_model=args.model)
+
+    out = args.out
+    # Fail before the (costly) target prep and agent run if we'd have to clobber.
+    if out.exists() and not args.force and not args.append:
+        print(
+            f"{out} already exists — pass --force to overwrite or --append to add to it",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
+    target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
+    print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
+    print(
+        f"generating tasks with {cfg.tasks_model} (this reads the source and runs package code) ...",
+        flush=True,
+    )
+
+    result = asyncio.run(
+        generate_tasks(
+            cfg=cfg,
+            target=target,
+            out_path=out,
+            max_turns=args.max_turns,
+            max_usd=args.max_usd,
+            append=args.append,
+            force=args.force,
+        )
+    )
+    verb = "appended to" if result.appended else "wrote"
+    print(f"\n{verb} {result.out_path.resolve()}")
+    print(f"  new tasks:   {len(result.new_tasks)} ({', '.join(t.id for t in result.new_tasks)})")
+    print(f"  total tasks: {len(result.tasks)}")
+    print(f"  cost:        ${result.cost_usd:.2f} over {result.turns} turns")
+    print("\nnext: review the tasks, then `acumen draft` and `acumen bench`")
+    return 0
+
+
 def _cmd_report(args: argparse.Namespace) -> int:
     tasks = load_tasks(args.tasks) if args.tasks.exists() else None
     if tasks is None:
         print(f"note: {args.tasks} not found — per-task prompts will be omitted", file=sys.stderr)
-    report = build_report(args.runs, args.out, tasks)
+    skills_root = args.skills if args.skills.is_dir() else None
+    if skills_root is None:
+        print(f"note: {args.skills} not found — skill rationale/diff will be omitted", file=sys.stderr)
+    report = build_report(args.runs, args.out, tasks, skills_root=skills_root)
     df = report.results
     arms = ", ".join(sorted(df["arm_label"].unique(), key=lambda a: (a != "noskill", a)))
     print(f"aggregated {report.n_runs} runs across arms: {arms}")
@@ -228,6 +338,14 @@ def _cmd_report(args: argparse.Namespace) -> int:
         print(f"  {arm}: {int(group['success'].sum())}/{len(group)} passed")
     print(f"wrote {args.out.resolve()}")
     print(f"wrote {args.out.resolve().with_suffix('.csv')}")
+    return 0
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    written = scaffold(args.directory, force=args.force)
+    for path in written:
+        print(f"wrote {path}")
+    print("\nnext: edit config.yaml (repo, skill_name) and tasks.yaml, then `acumen draft`")
     return 0
 
 
@@ -265,11 +383,30 @@ def build_parser() -> argparse.ArgumentParser:
     improve.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     improve.set_defaults(func=_cmd_improve)
 
+    tasks_cmd = sub.add_parser("tasks", help="autonomously generate a tasks.yaml from the target package")
+    tasks_cmd.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
+    tasks_cmd.add_argument("--out", type=Path, default=Path("tasks.yaml"), help="tasks.yaml to write")
+    tasks_cmd.add_argument("--model", help="override config tasks_model")
+    tasks_cmd.add_argument("--max-turns", type=int, help="cap turns for the generation agent (default: unbounded)")
+    tasks_cmd.add_argument("--max-usd", type=float, help="cap spend for the generation agent (default: unbounded)")
+    tasks_cmd.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
+    tasks_cmd.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
+    out_mode = tasks_cmd.add_mutually_exclusive_group()
+    out_mode.add_argument("--force", action="store_true", help="overwrite an existing tasks file")
+    out_mode.add_argument("--append", action="store_true", help="add generated tasks to an existing tasks file")
+    tasks_cmd.set_defaults(func=_cmd_tasks)
+
     report = sub.add_parser("report", help="aggregate the run tree into a self-contained report.html")
     report.add_argument("--runs", type=Path, default=Path("runs"), help="root of the run tree")
     report.add_argument("--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml (for task text)")
+    report.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree (rationale/diff)")
     report.add_argument("--out", type=Path, default=Path("report.html"), help="output HTML path (overwritten)")
     report.set_defaults(func=_cmd_report)
+
+    init = sub.add_parser("init", help="scaffold a starter config.yaml and tasks.yaml")
+    init.add_argument("--dir", type=Path, default=Path("."), dest="directory", help="directory to scaffold into")
+    init.add_argument("--force", action="store_true", help="overwrite existing config.yaml / tasks.yaml")
+    init.set_defaults(func=_cmd_init)
     return parser
 
 
@@ -284,7 +421,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
-    except (ConfigError, TaskError, EnvError, SkillError, DraftError, ImproveError, ReportError) as err:
+    except (
+        ConfigError,
+        TaskError,
+        EnvError,
+        SkillError,
+        DraftError,
+        ImproveError,
+        TaskGenError,
+        ReportError,
+        InitError,
+    ) as err:
         print(f"error: {err}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

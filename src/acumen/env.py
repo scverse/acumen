@@ -89,7 +89,7 @@ class Target:
 
     @property
     def fingerprint(self) -> str:
-        """The ``pkg_version`` string recorded in ``result.json``, e.g. ``decoupler 2.1.0``."""
+        """The ``pkg_version`` string recorded in ``result.json``, e.g. ``numpy 2.1.0``."""
         return f"{self.pkg_name} {self.pkg_version}"
 
 

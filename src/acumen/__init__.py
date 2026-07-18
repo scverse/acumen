@@ -20,6 +20,7 @@ from acumen.paths import RunKey, Split, arm_name, is_complete, parse_run_dir, ru
 from acumen.report import Report, ReportError, arm_metrics, build_report, load_results
 from acumen.runner import RunOutcome, run_once
 from acumen.sandbox import Sandbox, install_skill, sandbox
+from acumen.scaffold import InitError, scaffold
 from acumen.skills import (
     Skill,
     SkillError,
@@ -28,7 +29,17 @@ from acumen.skills import (
     latest_version,
     load_skill,
     next_version,
+    skill_content,
     skill_hash,
+)
+from acumen.taskgen import (
+    TaskGenError,
+    TaskGenResult,
+    build_filtered_source,
+    dump_tasks,
+    find_skill_access,
+    generate_tasks,
+    make_skill_guard,
 )
 from acumen.tasks import Task, TaskError, TaskSplit, load_tasks, parse_tasks
 
@@ -41,6 +52,7 @@ __all__ = [
     "Grade",
     "ImproveError",
     "ImproveResult",
+    "InitError",
     "PlannedRun",
     "Reason",
     "Report",
@@ -55,22 +67,29 @@ __all__ = [
     "Target",
     "Task",
     "TaskError",
+    "TaskGenError",
+    "TaskGenResult",
     "TaskSplit",
     "TrainRun",
     "__version__",
     "arm_metrics",
     "arm_name",
     "available_versions",
+    "build_filtered_source",
     "build_matrix",
     "build_report",
     "collect_train_runs",
     "draft_skill",
+    "dump_tasks",
+    "find_skill_access",
     "find_test_access",
+    "generate_tasks",
     "grade_answer",
     "grade_run",
     "improve_skill",
     "install_skill",
     "is_complete",
+    "make_skill_guard",
     "make_test_guard",
     "latest_version",
     "load_config",
@@ -87,7 +106,9 @@ __all__ = [
     "run_matrix",
     "run_once",
     "sandbox",
+    "scaffold",
     "scrubbed_env",
+    "skill_content",
     "skill_from_arm",
     "skill_hash",
     "summarize",

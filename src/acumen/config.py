@@ -29,6 +29,7 @@ class Config:
     max_usd: float = 5.0
     draft_model: str = "claude-opus-4-8"
     improve_model: str = "claude-opus-4-8"
+    tasks_model: str = "claude-opus-4-8"
 
     @property
     def is_local(self) -> bool:
@@ -50,6 +51,7 @@ _KNOWN = {
     "max_usd",
     "draft_model",
     "improve_model",
+    "tasks_model",
     "skill_name",
 }
 
@@ -139,6 +141,7 @@ def parse_config(raw: Any) -> Config:
         max_usd=_positive_float(raw, "max_usd", 5.0),
         draft_model=_optional_str(raw, "draft_model", default_model),
         improve_model=_optional_str(raw, "improve_model", default_model),
+        tasks_model=_optional_str(raw, "tasks_model", default_model),
     )
 
 

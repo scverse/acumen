@@ -6,7 +6,48 @@
 [badge-tests]: https://img.shields.io/github/actions/workflow/status/scverse/acumen/test.yaml?branch=main
 [badge-docs]: https://app.readthedocs.org/projects/acumen/badge/
 
-A very interesting piece of code
+**Build, benchmark, and optimize Claude skills for your Python package.**
+
+Many good tools are unusable by coding agents today because their maintainers have no way
+to write a skill for them — or, having written one, no way to tell whether it actually
+helps. acumen closes that loop. Point it at a Python package and a handful of tasks and it
+will:
+
+1. **Draft** a skill from the package's own source.
+2. **Benchmark** that skill against a no-skill baseline on your tasks, in a scrubbed sandbox
+   where the only difference between arms is the skill itself.
+3. **Improve** the skill from its results and benchmark again — with a train/test split, so
+   the gains are real generalization and not memorized answers.
+4. **Report** success rate per version, train vs. test, in one self-contained `report.html`.
+
+```
+noskill baseline ──▶ draft v1 ──▶ bench v1 ──▶ report
+                                     │
+                                     ▼
+                        improve (train results only) ──▶ v2 ──▶ bench v2 ──▶ report ──▶ …
+```
+
+You decide when to stop. Every version is benchmarked on both splits; only train results
+are ever shown to the improver, so a widening train/test gap is a visible signal that a
+skill is overfitting rather than genuinely helping.
+
+## Quickstart
+
+```bash
+# 1. Scaffold a starter config.yaml and tasks.yaml
+acumen init
+
+# 2. Fill in config.yaml (repo, skill_name). Write tasks.yaml by hand, or generate it:
+acumen tasks                     # mine the package for real analyses -> tasks.yaml
+
+# 3. Then run the loop:
+acumen bench --no-skill          # the baseline arm
+acumen draft                     # write skills/v1 from the package source
+acumen bench --skill v1          # benchmark the skill against the baseline
+acumen improve                   # write skills/v2 from v1's train results
+acumen bench --skill v2
+acumen report                    # aggregate every run into report.html
+```
 
 ## Getting started
 

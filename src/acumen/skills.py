@@ -104,6 +104,27 @@ def content_files(directory: Path) -> list[Path]:
     return sorted(files, key=lambda p: p.relative_to(directory).as_posix())
 
 
+def skill_content(directory: Path) -> dict[str, str]:
+    """Return the skill's text content as ``{posix-relpath: text}``, excluding bookkeeping.
+
+    Used by the report to diff one version against its parent. Files that do not decode as
+    UTF-8 (there should be none in a skill) are represented by a short placeholder so a diff
+    still lists them without choking on bytes.
+
+    Returns
+    -------
+    A mapping from each content file's POSIX-relative path to its decoded text.
+    """
+    content: dict[str, str] = {}
+    for path in content_files(directory):
+        rel = path.relative_to(directory).as_posix()
+        try:
+            content[rel] = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            content[rel] = "<binary file>\n"
+    return content
+
+
 def skill_hash(directory: Path) -> str:
     """Hash a skill directory's content — the value recorded in every ``result.json``.
 

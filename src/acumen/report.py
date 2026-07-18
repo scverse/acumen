@@ -16,6 +16,7 @@ remain inspectable.
 from __future__ import annotations
 
 import base64
+import difflib
 import html
 import io
 import json
@@ -36,6 +37,7 @@ import pandas as pd
 from matplotlib.patches import Patch
 
 from acumen.paths import NOSKILL_ARM, RESULT_FILE, TRANSCRIPT_HTML, skill_from_arm
+from acumen.skills import SkillError, read_meta, skill_content, skill_dir
 from acumen.tasks import Task
 
 # ── Palette ──────────────────────────────────────────────────────────────────────────
@@ -580,6 +582,16 @@ tr.fail td {{ background: {ACCENT}66; }}
 .skill-miss {{ color: #a4432b; font-weight: 700; }}
 .note {{ background: {ACCENT}55; border-left: 3px solid var(--bar); padding: 0.5rem 0.8rem;
         margin: 0.5rem 0; border-radius: 3px; }}
+.rationale {{ margin: 0.3rem 0 0.8rem; white-space: pre-wrap; }}
+pre.diff {{ background: var(--plot); border: 1px solid {INK}22; border-radius: 4px;
+        padding: 0.6rem 0.8rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.35;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 0.4rem 0 1.4rem; }}
+pre.diff span {{ display: block; white-space: pre; }}
+.diff-add {{ background: #4c7a3322; color: #2f5d1c; }}
+.diff-del {{ background: #a4432b22; color: #8a2f1b; }}
+.diff-hunk {{ color: var(--bar); font-weight: 600; }}
+.diff-file {{ color: {INK}; font-weight: 700; }}
+.diff-ctx {{ color: {INK}bb; }}
 section {{ margin-top: 2.5rem; scroll-margin-top: 1rem; }}
 @media (max-width: 720px) {{
   body {{ display: block; }}
@@ -621,11 +633,107 @@ def _task_desc_html(task: Task) -> str:
     return "".join(parts)
 
 
+def _diff_line_class(line: str) -> str:
+    """CSS class for one line of a unified diff, by its leading marker."""
+    if line.startswith("@@"):
+        return "diff-hunk"
+    if line.startswith(("+++", "---")):
+        return "diff-file"
+    if line.startswith("+"):
+        return "diff-add"
+    if line.startswith("-"):
+        return "diff-del"
+    return "diff-ctx"
+
+
+def _skill_diff_html(parent: dict[str, str] | None, child: dict[str, str]) -> str:
+    """Unified diff of a skill version's content against its parent, as coloured HTML.
+
+    ``parent`` is ``None`` for the first version (nothing to diff against). Files present in
+    only one side diff against an empty file, so added and removed references show up too.
+    """
+    if parent is None:
+        return '<p class="task-desc">Initial version — no parent to diff against.</p>'
+    lines: list[str] = []
+    for rel in sorted(set(parent) | set(child)):
+        before = parent.get(rel, "").splitlines(keepends=True)
+        after = child.get(rel, "").splitlines(keepends=True)
+        if before == after:
+            continue
+        diff = difflib.unified_diff(before, after, fromfile=f"a/{rel}", tofile=f"b/{rel}", n=3)
+        for raw in diff:
+            text = raw.rstrip("\n")
+            lines.append(f'<span class="{_diff_line_class(text)}">{html.escape(text)}</span>')
+    if not lines:
+        return '<p class="task-desc">No content change from the parent version.</p>'
+    return '<pre class="diff">' + "\n".join(lines) + "</pre>"
+
+
+def _skills_section_html(df: pd.DataFrame, skills_root: Path | None) -> tuple[str, str]:
+    """Render the per-version skill provenance section: rationale + diff against parent.
+
+    Returns ``(section_html, toc_html)`` — both empty when there is no skill directory to
+    read, so a noskill-only report simply omits the section.
+    """
+    if skills_root is None or not skills_root.is_dir():
+        return "", ""
+    versions = [v for a in _arms_in_order(df) if (v := skill_from_arm(a)) is not None]
+    if not versions:
+        return "", ""
+
+    blocks: list[str] = []
+    toc: list[str] = []
+    for version in versions:
+        directory = skill_dir(skills_root, version)
+        if not directory.is_dir():
+            continue
+        try:
+            content = skill_content(directory)
+        except SkillError:
+            continue
+        meta = read_meta(directory)
+        parent_version = meta.parent if meta else None
+        rationale = (meta.rationale if meta else "") or "(no rationale recorded)"
+        hash_short = (meta.hash if meta else "")[:19]
+
+        parent_content: dict[str, str] | None = None
+        if parent_version:
+            parent_dir = skill_dir(skills_root, parent_version)
+            if parent_dir.is_dir():
+                try:
+                    parent_content = skill_content(parent_dir)
+                except SkillError:
+                    parent_content = None
+
+        anchor = f"skill-{version}"
+        provenance = f"parent: {html.escape(parent_version)}" if parent_version else "initial draft"
+        blocks.append(
+            f'<h3 id="{html.escape(anchor)}">Skill {html.escape(version)}</h3>'
+            f'<p class="task-desc">{provenance}'
+            f"{f' &middot; {html.escape(hash_short)}…' if hash_short else ''}</p>"
+            f'<p class="rationale">{html.escape(rationale)}</p>'
+            f"{_skill_diff_html(parent_content, content)}"
+        )
+        toc.append(f'<li><a href="#{html.escape(anchor)}">Skill {html.escape(version)}</a></li>')
+
+    if not blocks:
+        return "", ""
+    section = (
+        '<section id="skills">\n<h2>Skill versions</h2>\n'
+        '<p class="task-desc">Why each version was written, and what changed from its parent.</p>\n'
+        + "".join(blocks)
+        + "\n</section>"
+    )
+    toc_html = f'<li><a href="#skills">Skill versions</a><ul>{"".join(toc)}</ul></li>'
+    return section, toc_html
+
+
 def render_report(
     df: pd.DataFrame,
     out_dir: Path,
     tasks: Sequence[Task] | None = None,
     data_href: str | None = None,
+    skills_root: Path | None = None,
 ) -> str:
     """Render the full report HTML for the results in ``df``.
 
@@ -642,9 +750,14 @@ def render_report(
     data_href
         Relative link to the aggregated data file (the CSV backing the runs table), shown
         above it so a reader can grab the numbers. When ``None``, no link is shown.
+    skills_root
+        The ``skills/`` root, if available — used to render the per-version rationale and a
+        diff of each skill against its parent. When ``None`` (or missing), the section is
+        omitted, so a noskill-only report still renders.
     """
     overview_uri = figure_data_uri(metrics_figure(df, split_hue=False))
     task_by_id = {t.id: t for t in tasks or []}
+    skills_section, skills_toc = _skills_section_html(df, skills_root)
 
     task_blocks = []
     toc_tasks = []
@@ -666,6 +779,7 @@ def render_report(
 <ul>
 <li><a href="#overview">Overview</a></li>
 <li><a href="#per-task">Per-task breakdown</a><ul>{"".join(toc_tasks)}</ul></li>
+{skills_toc}
 <li><a href="#runs">Runs</a></li>
 </ul>
 </nav>"""
@@ -699,6 +813,7 @@ def render_report(
 <h2>Per-task breakdown</h2>
 {"".join(task_blocks)}
 </section>
+{skills_section}
 <section id="runs">
 <h2>Runs</h2>
 {f'<p class="task-desc">Full data: <a href="{html.escape(data_href)}">{html.escape(data_href)}</a></p>' if data_href else ""}
@@ -711,7 +826,12 @@ def render_report(
 """
 
 
-def build_report(runs_root: Path, out_path: Path, tasks: Sequence[Task] | None = None) -> Report:
+def build_report(
+    runs_root: Path,
+    out_path: Path,
+    tasks: Sequence[Task] | None = None,
+    skills_root: Path | None = None,
+) -> Report:
     """Aggregate the run tree and render ``report.html`` (§ M3-T1..T6).
 
     The report is overwritten in place, so it always reflects every run on disk.
@@ -725,6 +845,9 @@ def build_report(runs_root: Path, out_path: Path, tasks: Sequence[Task] | None =
     tasks
         The loaded tasks, if available — used to print each task's prompt under its
         per-task heading.
+    skills_root
+        The ``skills/`` root, if available — used to render each skill version's rationale
+        and its diff against the parent version (§ M5). When ``None``, the section is omitted.
 
     Returns
     -------
@@ -741,6 +864,6 @@ def build_report(runs_root: Path, out_path: Path, tasks: Sequence[Task] | None =
     internal = [c for c in ("result_path", "transcript_path", "_arm_order") if c in df.columns]
     df.drop(columns=internal).to_csv(data_path, index=False)
 
-    html_text = render_report(df, out_path.parent, tasks, data_href=data_path.name)
+    html_text = render_report(df, out_path.parent, tasks, data_href=data_path.name, skills_root=skills_root)
     out_path.write_text(html_text)
     return Report(html=html_text, results=df)

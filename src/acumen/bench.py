@@ -108,6 +108,7 @@ async def run_matrix(
     skill: Skill | None = None,
     sandbox_base: Path | None = None,
     keep_sandbox: bool = False,
+    on_start: Callable[[PlannedRun], None] | None = None,
     on_done: Callable[[RunOutcome], None] | None = None,
 ) -> list[RunOutcome]:
     """Run planned runs concurrently, bounded by ``max_concurrency``.
@@ -132,6 +133,9 @@ async def run_matrix(
         Parent directory for sandboxes.
     keep_sandbox
         Leave sandboxes on disk for inspection.
+    on_start
+        Optional callable invoked with each :class:`PlannedRun` as it is admitted through
+        the concurrency gate and begins, for progress output.
     on_done
         Optional callable invoked with each :class:`~acumen.runner.RunOutcome` as it
         lands, for progress output.
@@ -145,6 +149,8 @@ async def run_matrix(
 
     async def one(item: PlannedRun) -> RunOutcome:
         async with semaphore:
+            if on_start is not None:
+                on_start(item)
             outcome = await run_once(
                 key=item.key,
                 task=item.task,

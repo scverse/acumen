@@ -196,6 +196,117 @@ When you are done, `{skill_dir}/SKILL.md` exists and starts with the frontmatter
 """
 
 
+TASKGEN_PROMPT = """\
+You are writing a benchmark of real analysis tasks for a Python package (`{package}`). Each
+task states a GOAL a user has, in plain language, plus the single answer a correct analysis
+produces. The benchmark measures whether an AI agent can reach that goal with the package on
+its own — so a task gives the objective and almost nothing else.
+
+# What you can read
+
+- The package's source is at `{src}`. Read it — the source, docstrings, examples, and above
+  all its docs/tutorials/vignettes. This is the ground truth about what the package does.
+- The package is installed; run `{python}` (also `python` on your PATH) to execute code. Do
+  not create virtualenvs and do not install or upgrade packages — work with what is here.
+- You have web access if the published docs or tutorials help.
+
+# Ignore any existing skills or agent instructions — deliberately hidden
+
+The package may ship skills or agent-instruction files written for it (`SKILL.md`,
+`.claude/skills/`, `CLAUDE.md`, `AGENTS.md`, `.cursor/`, Copilot instructions). These have
+been stripped from the source above, and any attempt to reach them — or the original
+unfiltered checkout — is BLOCKED. This is on purpose: reading pre-written guidance would bias
+which analyses you pick and how you phrase them, and this benchmark must be independent of it.
+
+# Cover every tutorial — enumerate them FIRST
+
+Before writing anything, find EVERY tutorial / vignette / worked example the package publishes:
+its documentation gallery, an `examples/`, `tutorials/`, or `docs/` directory, notebooks,
+README walkthroughs. List them all. You will write AT LEAST ONE task per tutorial — do not stop
+after a handful, and do not cover only the easy ones. A published tutorial is a real analysis
+someone thought worth doing; that is exactly the unit of work this benchmark should measure.
+Only if the package has genuinely no tutorials should you infer analyses from its source.
+
+# How to write a task — like a lazy human, not a manual
+
+Each task's prompt is ONE short paragraph of ordinary English: the GOAL a user wants, and
+nothing about how to reach it. Write it the way a busy analyst types a request into a terminal
+— a sentence or two, a clear objective, minimal detail. The agent is supposed to work out the
+"how" itself; that is what is being tested.
+
+HARD rules for the prompt text:
+- ONE paragraph. NO numbered steps, no procedure — state the goal, not a recipe.
+- NO code: no function or method names as code, no call signatures, no argument names, no
+  names of result containers or output fields.
+- Do NOT name the package, and never mention a version. acumen adds which package to use when
+  it runs the task — naming it here is redundant and repetitive.
+- Do NOT describe the data — not its shape, columns, dtypes, or how it is stored. If the
+  analysis uses a bundled dataset, just NAME it ("using the covid5k data") and stop there.
+- Do NOT name the method/algorithm or give parameters — let the agent choose the approach. ONE
+  exception: if a tutorial is fundamentally about a single named method, you may name that
+  method in plain words; even then name only what is essential, and give a parameter only if
+  that parameter is the whole point of the task.
+- No worked example of the answer, and no hint toward it.
+
+The one thing you MAY state precisely is the OUTPUT. End the paragraph by saying exactly what to
+report and in what form, so the answer is unambiguous and gradeable — e.g. "give the gene
+symbol", "report how many are left", "report the value rounded to two decimals". Keep the answer
+small: a single name, category, count, or number.
+
+Illustration (style only — invent tasks that fit the actual package):
+- BAD (reads like a skill): "Load the toy data with `dc.ds.toy()`. Run `dc.mt.ulm(adata, net,
+  tmin=3)`; scores land in `adata.obsm['score_ulm']`. Take rows where group == 'A', average per
+  source, and report the top column."
+- GOOD (a lazy goal): "Using the pbmc3k data, find which transcription factor is most active in
+  the monocytes. Give only the factor's symbol."
+
+# Train and test variants
+
+Give each task a train and a test variant of the SAME goal, differing only in the input or the
+target it asks about (a different cell type, group, condition, or dataset). Two instances of one
+analysis with two different correct answers — so a skill cannot pass by memorising one answer.
+
+# Ground truth by execution
+
+Get each answer by actually DOING the analysis in the venv with `{python}` and reading the real
+result — never from a tutorial's printed output or the docs. Your scratch scripts stay in this
+working directory and are discarded; only the tasks written to `{out}` are kept, so the
+benchmarked agent must rederive everything from the goal alone. Before recording an answer,
+confirm the goal has exactly ONE defensible answer: if a competent analyst could read the goal
+two ways and get two results, tighten only the OUTPUT sentence (what to report, or its
+precision) until one answer stands — never by adding back instructions.
+
+# What you must write
+
+Your working directory is `{out_dir}`. Write the tasks to `{out}` as YAML with exactly this
+shape (the loader is strict — unknown keys are rejected):
+
+tasks:
+  - id: <short, unique, filesystem-safe: letters, digits, '.', '_', '-'>
+    train:
+      prompt: |
+        <one-paragraph goal for the train variant>
+      answer: "<the exact answer string the real train run produced>"
+    test:
+      prompt: |
+        <one-paragraph goal for the test variant>
+      answer: "<the exact answer string the real test run produced>"
+
+`id` must be unique across all tasks. Both `train` and `test` are required, each with a
+non-empty `prompt` and a non-empty `answer`. Do not add other keys unless you deliberately
+want a per-task override (`max_turns`, `max_usd`, or `model` are the only ones allowed).
+
+# Before you finish
+
+- Every `answer` is the real output of a script you ran in the venv — not a guess, not lifted
+  from docs.
+- Every prompt is ONE paragraph: a goal in plain English, with no steps, no code, no package
+  name, no version, no data description — only the goal and a precise statement of the output.
+- You wrote at least one task per tutorial, and covered all of them.
+- `{out}` exists and parses as the YAML above with at least one task.
+"""
+
+
 def draft_prompt(*, package: str, version: str, src: Path, python: Path, out: Path, skill_name: str) -> str:
     """Build the prompt for the drafting agent.
 
@@ -279,6 +390,35 @@ def improve_prompt(
         parent_version=parent_version,
         new_version=new_version,
     )
+
+
+def taskgen_prompt(*, package: str, src: Path, python: Path, out: Path) -> str:
+    """Build the prompt for the task-generation agent (M6).
+
+    Like the drafter, the generator gets read access to the target's source (§6) — it must
+    understand the API to design real analyses — plus the installed venv, since it obtains
+    every ground-truth answer by *executing* the pipeline, never by reading doc output.
+
+    The package name is passed only to orient the agent; the tasks it writes must NOT name the
+    package or any version (acumen injects the package via the benchmark harness), so each task
+    stays a generic, version-agnostic goal.
+
+    Parameters
+    ----------
+    package
+        The target package name, for the agent's orientation only.
+    src
+        The (filtered) package checkout, readable by this agent only.
+    python
+        The interpreter with the package installed, used to run pipelines for ground truth.
+    out
+        The ``tasks.yaml`` file the agent writes into its working directory.
+
+    Returns
+    -------
+    The task-generation prompt.
+    """
+    return TASKGEN_PROMPT.format(package=package, src=src, python=python, out=out, out_dir=out.parent)
 
 
 def benchmark_prompt(task_prompt: str, *, sandbox: Path, python: Path, package: str) -> str:
