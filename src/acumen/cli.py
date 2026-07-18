@@ -18,6 +18,7 @@ from acumen.paths import SPLITS
 from acumen.report import ReportError, build_report
 from acumen.runner import RunOutcome
 from acumen.scaffold import InitError, scaffold
+from acumen.ship import ShipError, ship_skill
 from acumen.skills import SkillError, available_versions, latest_version, load_skill
 from acumen.taskgen import TaskGenError, generate_tasks
 from acumen.tasks import TaskError, load_tasks
@@ -322,6 +323,49 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_ship(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    if args.model:
+        cfg = replace(cfg, ship_model=args.model)
+
+    # Validate the version exists before the (costly) target prep.
+    load_skill(args.skills, args.version, expect_name=cfg.skill_name)
+
+    where = (
+        "a local path — the change is written to the working tree"
+        if cfg.is_local
+        else ("a GitHub URL — the change is delivered as a pull request")
+    )
+    print(f"shipping {args.version} of {cfg.skill_name} into {cfg.repo} ({where})")
+    print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
+    target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
+    print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
+    print(
+        f"running the ship agent with {cfg.ship_model} (real env: it builds, installs, and "
+        f"{'opens a PR' if not cfg.is_local else 'edits the working tree'}) ...",
+        flush=True,
+    )
+
+    result = asyncio.run(
+        ship_skill(
+            cfg=cfg,
+            target=target,
+            skills_root=args.skills,
+            version=args.version,
+            max_turns=args.max_turns,
+            max_usd=args.max_usd,
+            force=args.force,
+        )
+    )
+    print(f"\nshipped {result.skill.version} of {result.skill.name}")
+    print(f"  mode:  {'pull request' if result.mode == 'github' else 'working tree (local)'}")
+    print(f"  cost:  ${result.cost_usd:.2f} over {result.turns} turns")
+    if result.summary:
+        print("\nagent summary:")
+        print(result.summary)
+    return 0
+
+
 def _cmd_report(args: argparse.Namespace) -> int:
     tasks = load_tasks(args.tasks) if args.tasks.exists() else None
     if tasks is None:
@@ -396,6 +440,20 @@ def build_parser() -> argparse.ArgumentParser:
     out_mode.add_argument("--append", action="store_true", help="add generated tasks to an existing tasks file")
     tasks_cmd.set_defaults(func=_cmd_tasks)
 
+    ship = sub.add_parser("ship", help="make a benchmarked skill installable into the target package")
+    ship.add_argument(
+        "--skill", dest="version", metavar="VERSION", required=True, help="skill version to ship, e.g. v2"
+    )
+    ship.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
+    ship.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
+    ship.add_argument("--model", help="override config ship_model")
+    ship.add_argument("--max-turns", type=int, help="cap turns for the ship agent (default: unbounded)")
+    ship.add_argument("--max-usd", type=float, help="cap spend for the ship agent (default: unbounded)")
+    ship.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
+    ship.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
+    ship.add_argument("--force", action="store_true", help="ship even if the package already has an installer")
+    ship.set_defaults(func=_cmd_ship)
+
     report = sub.add_parser("report", help="aggregate the run tree into a self-contained report.html")
     report.add_argument("--runs", type=Path, default=Path("runs"), help="root of the run tree")
     report.add_argument("--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml (for task text)")
@@ -429,6 +487,7 @@ def main(argv: list[str] | None = None) -> int:
         DraftError,
         ImproveError,
         TaskGenError,
+        ShipError,
         ReportError,
         InitError,
     ) as err:

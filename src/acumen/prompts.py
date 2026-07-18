@@ -307,6 +307,202 @@ want a per-task override (`max_turns`, `max_usd`, or `model` are the only ones a
 """
 
 
+#: Canonical ``install.py`` the shipping agent adapts (M7). The single placeholder is
+#: ``__SKILL_NAME__`` (rendered by :func:`ship_prompt` via ``str.replace`` so the template's
+#: own braces need no escaping). It uses ``__package__`` so the import package name never has
+#: to be edited into it, and ``importlib.resources`` so it reads the skill data from wherever
+#: the wheel installed it — which is exactly what the build-verify gate confirms.
+SHIP_INSTALL_TEMPLATE = '''\
+"""Install the bundled ``__SKILL_NAME__`` Claude skill into a skills directory.
+
+Console script (wired as ``<dist>-install-skills`` in ``pyproject.toml``): copy the skill
+that ships inside this package into ``~/.claude/skills/__SKILL_NAME__/`` so an agent can load
+it. The skill files live in the ``data/`` directory next to this module and are read via
+``importlib.resources``, so this works from an installed wheel, not just an editable checkout.
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+import sys
+from importlib import resources
+from pathlib import Path
+
+#: The skill name; the skill installs to ``~/.claude/skills/<SKILL_NAME>/``.
+SKILL_NAME = "__SKILL_NAME__"
+
+
+def default_dest() -> Path:
+    """Return the default install directory, ``~/.claude/skills/<SKILL_NAME>``."""
+    return Path.home() / ".claude" / "skills" / SKILL_NAME
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Install the bundled skill; entry point for the ``<dist>-install-skills`` script."""
+    parser = argparse.ArgumentParser(
+        description=f"Install the {SKILL_NAME} Claude skill into your skills directory.",
+    )
+    parser.add_argument(
+        "--dest",
+        type=Path,
+        default=None,
+        help="skills directory to install into (default: ~/.claude/skills/<name>)",
+    )
+    parser.add_argument("--force", action="store_true", help="overwrite an existing installation")
+    parser.add_argument(
+        "--print-path",
+        action="store_true",
+        help="print the install destination and exit without installing",
+    )
+    args = parser.parse_args(argv)
+
+    dest = args.dest if args.dest is not None else default_dest()
+    if args.print_path:
+        print(dest)
+        return 0
+
+    if dest.exists():
+        if not args.force:
+            print(f"{dest} already exists; pass --force to overwrite", file=sys.stderr)
+            return 1
+        shutil.rmtree(dest)
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with resources.as_file(resources.files(__package__).joinpath("data")) as data_dir:
+        shutil.copytree(data_dir, dest)
+    print(f"installed the {SKILL_NAME} skill to {dest}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+SHIP_PROMPT = """\
+You are making a benchmarked Claude Skill installable *into* the Python package it documents.
+When you are done, the package will expose a console script `<dist>-install-skills` that drops
+the skill into `~/.claude/skills/{skill_name}/`, so the package's own users get the agent
+guidance with one command.
+
+You work in the package's checkout, and this is the REAL environment — real network, real
+git/`gh` credentials, real `uv`. You may run any command you need.
+
+# The package checkout
+
+- Your working directory is `{checkout}`. This is the package you are modifying.
+- Its declared distribution name is `{package}` (from `pyproject.toml`), but DO NOT assume the
+  import package name or the layout — detect them (see below).
+
+# The skill to ship
+
+- The skill to package is at `{skill_src}` (version {version}). It contains `SKILL.md` and
+  maybe a `references/` tree. Copy its ENTIRE contents VERBATIM into the package — do not author,
+  edit, summarise, or reformat any skill file. `acumen ship` only packages what was already
+  benchmarked.
+
+# Detect — never assume
+
+Read `{checkout}/pyproject.toml` and work out, from the file itself:
+
+1. The **distribution name** (`[project].name`, or the build-backend's equivalent). The console
+   script MUST be named `<dist-name>-install-skills`.
+2. The **import package name** and its **directory on disk**. It may be `src/<pkg>/` (src-layout)
+   or `<pkg>/` (flat-layout) or something else — find the real directory that holds the package's
+   `__init__.py`. The entry point targets the import package, `<pkg>._skills.install:main`.
+3. The **build backend** (`[build-system].build-backend`). You will wire packaging differently
+   for hatchling vs setuptools vs flit/pdm/poetry (see below).
+
+# What to create
+
+Inside the import package directory, create a `_skills/` subpackage:
+
+- `_skills/__init__.py` — may be empty.
+- `_skills/install.py` — use the canonical template shown at the end of this prompt VERBATIM (it
+  already has the right skill name baked in and reads its data via `importlib.resources`, so it
+  needs no per-package editing). Do not rewrite it.
+- `_skills/data/` — a VERBATIM copy of everything under `{skill_src}` (so
+  `_skills/data/SKILL.md`, `_skills/data/references/...`, etc.).
+
+Then wire two things in `pyproject.toml`:
+
+- The entry point, under `[project.scripts]` (or the backend's script table):
+  `<dist-name>-install-skills = "<import-pkg>._skills.install:main"`.
+- **Packaging so the non-`.py` skill files actually ship in the wheel.** This is the step that
+  silently fails and the whole point of the build-verify gate. `SKILL.md` and the `references/*.md`
+  are DATA files, not modules — a naive build drops them. Wire whatever the detected backend needs:
+  - **hatchling** ships everything under the package directory automatically; usually nothing extra
+    is needed, but confirm `_skills/data` is included (a restrictive `[tool.hatch.build.targets.wheel]`
+    `include`/`packages` may need `_skills/data` added, or `force-include`).
+  - **setuptools** needs the data declared: `include-package-data = true` plus a `MANIFEST.in`
+    (`recursive-include <pkg>/_skills/data *`), or an explicit `[tool.setuptools.package-data]`
+    entry for the `_skills.data` files. Also make sure `_skills` (and `_skills.data` if it needs a
+    package) are found by `find`/`packages`.
+  - **flit / pdm / poetry** each have their own include mechanism — use it so `_skills/data/**`
+    is bundled.
+
+# Verify by building — this is the correctness gate, do NOT skip it
+
+A wheel that installs but ships NO skill data is the failure mode this whole task exists to
+prevent, and it fails silently. Before you deliver anything, prove the data ships:
+
+1. Build a wheel from `{checkout}` (e.g. `uv build --wheel`).
+2. Install THAT wheel into a FRESH throwaway venv (`uv venv`, then `uv pip install <the-wheel>`) —
+   a fresh venv, NOT an editable install, because an editable install sees the source tree
+   regardless of packaging and would hide the bug.
+3. From that venv, run `<dist-name>-install-skills --dest <a-scratch-dir>` and confirm
+   `<a-scratch-dir>/SKILL.md` exists and is byte-identical to `{skill_src}/SKILL.md`. Also run
+   `<dist-name>-install-skills --print-path` and confirm it prints a sensible destination.
+4. If `SKILL.md` did not land, your packaging is wrong — FIX IT and rebuild. Do not proceed to
+   delivery until a fresh-venv install ships the skill.
+
+# Scope limits
+
+- Bundle EXACTLY ONE skill — version {version}, copied verbatim. Nothing else.
+- Do NOT write any test file. (Deliberate scope decision.)
+- Update the README / docs to mention the `<dist-name>-install-skills` command ONLY if there is a
+  natural spot for it (e.g. an existing install or usage section). Keep it to a sentence. If there
+  is no natural spot, skip it — do not invent a section.
+
+# Deliver
+
+{delivery}
+
+# The canonical install.py (use verbatim as `_skills/install.py`)
+
+```python
+{install_template}
+```
+
+When you are done, report what you changed: the import package dir you found, the build backend,
+the console-script name, the packaging change you made, the result of the fresh-venv build-verify,
+and {delivery_report}.
+"""
+
+
+SHIP_DELIVERY_GITHUB = """\
+This target is a GitHub repository and `{checkout}` is a git checkout of it with `origin` set to
+the target. Deliver the change as a pull request, running git/`gh` yourself:
+
+- Create a new branch (e.g. `acumen/ship-skill-{version}`).
+- Commit your changes with a clear message.
+- Push the branch to `origin`. This assumes you (the maintainer) have write access. If the push
+  is REJECTED for lack of access, STOP and report that clearly — do not try to fork or find
+  another remote.
+- Open a pull request with `gh pr create`, titled for the skill installer, its body summarising
+  what shipped and the build-verify result.
+
+Do not merge the PR — the maintainer reviews it."""
+
+
+SHIP_DELIVERY_LOCAL = """\
+This target is a LOCAL path, `{checkout}`. Write the change directly into the working tree —
+create the files and edit `pyproject.toml` in place. Do NOT create a branch, commit, or open a
+PR; leave the changes in the working tree for the user to review with `git diff` (or as plain
+edits if it is not a git repo)."""
+
+
 def draft_prompt(*, package: str, version: str, src: Path, python: Path, out: Path, skill_name: str) -> str:
     """Build the prompt for the drafting agent.
 
@@ -419,6 +615,64 @@ def taskgen_prompt(*, package: str, src: Path, python: Path, out: Path) -> str:
     The task-generation prompt.
     """
     return TASKGEN_PROMPT.format(package=package, src=src, python=python, out=out, out_dir=out.parent)
+
+
+def ship_prompt(
+    *,
+    package: str,
+    skill_name: str,
+    version: str,
+    checkout: Path,
+    skill_src: Path,
+    mode: str,
+) -> str:
+    """Build the prompt for the shipping agent (M7).
+
+    Unlike every other agent, the shipper runs UNISOLATED — real network, git/``gh``
+    credentials, and ``uv`` — because it builds, installs, pushes, and opens a PR (§7 note).
+    It reasons about the package (distribution vs import name, src-vs-flat layout, build
+    backend) rather than assuming decoupler's shape, so this is an autonomous agent.
+
+    Parameters
+    ----------
+    package
+        The target's distribution name (``[project].name``), for orientation. The agent still
+        detects the import package name and layout itself.
+    skill_name
+        The skill's frontmatter name — baked into the install script and the
+        ``~/.claude/skills/<name>/`` install path.
+    version
+        The skill version being shipped, e.g. ``v2`` — named in the branch/commit/PR.
+    checkout
+        The package checkout the agent modifies (its ``cwd``): the local path for a local
+        target, or acumen's clone for a GitHub URL.
+    skill_src
+        A staged copy of the skill's content files (``SKILL.md`` + ``references/``, without
+        ``meta.json``), to be copied verbatim into ``_skills/data/``.
+    mode
+        ``"github"`` (deliver as a PR) or ``"local"`` (edit the working tree directly).
+
+    Returns
+    -------
+    The ship prompt.
+    """
+    install_template = SHIP_INSTALL_TEMPLATE.replace("__SKILL_NAME__", skill_name)
+    if mode == "github":
+        delivery = SHIP_DELIVERY_GITHUB.format(checkout=checkout, version=version)
+        delivery_report = "the branch you pushed and the URL of the pull request you opened"
+    else:
+        delivery = SHIP_DELIVERY_LOCAL.format(checkout=checkout)
+        delivery_report = "confirmation that the working tree now carries the change"
+    return SHIP_PROMPT.format(
+        package=package,
+        skill_name=skill_name,
+        version=version,
+        checkout=checkout,
+        skill_src=skill_src,
+        delivery=delivery,
+        delivery_report=delivery_report,
+        install_template=install_template,
+    )
 
 
 def benchmark_prompt(task_prompt: str, *, sandbox: Path, python: Path, package: str) -> str:

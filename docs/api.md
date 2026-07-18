@@ -1,7 +1,7 @@
 # API
 
-acumen is a CLI (`acumen init/tasks/draft/bench/improve/report`) that is a thin shell over an
-importable Python API. Everything below is re-exported from the top-level `acumen` package,
+acumen is a CLI (`acumen init/tasks/draft/bench/improve/report/ship`) that is a thin shell over
+an importable Python API. Everything below is re-exported from the top-level `acumen` package,
 so `from acumen import build_report` works.
 
 ## Configuration and tasks
@@ -106,6 +106,17 @@ so `from acumen import build_report` works.
     TrainRun
     find_test_access
     make_test_guard
+```
+
+## Shipping
+
+```{eval-rst}
+.. autosummary::
+    :toctree: generated
+
+    ship_skill
+    ShipResult
+    installer_exists
 ```
 
 ## Reporting

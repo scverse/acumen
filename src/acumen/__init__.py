@@ -21,6 +21,7 @@ from acumen.report import Report, ReportError, arm_metrics, build_report, load_r
 from acumen.runner import RunOutcome, run_once
 from acumen.sandbox import Sandbox, install_skill, sandbox
 from acumen.scaffold import InitError, scaffold
+from acumen.ship import ShipError, ShipResult, installer_exists, ship_skill
 from acumen.skills import (
     Skill,
     SkillError,
@@ -60,6 +61,8 @@ __all__ = [
     "RunKey",
     "RunOutcome",
     "Sandbox",
+    "ShipError",
+    "ShipResult",
     "Skill",
     "SkillError",
     "SkillMeta",
@@ -88,6 +91,7 @@ __all__ = [
     "grade_run",
     "improve_skill",
     "install_skill",
+    "installer_exists",
     "is_complete",
     "make_skill_guard",
     "make_test_guard",
@@ -108,6 +112,7 @@ __all__ = [
     "sandbox",
     "scaffold",
     "scrubbed_env",
+    "ship_skill",
     "skill_content",
     "skill_from_arm",
     "skill_hash",

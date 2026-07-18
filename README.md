@@ -49,7 +49,15 @@ acumen bench --skill v1          # benchmark the skill against the baseline
 acumen improve                   # write skills/v2 from v1's train results
 acumen bench --skill v2
 acumen report                    # aggregate every run into report.html
+
+# 4. Once a version proves out, ship it into the package itself:
+acumen ship --skill v2           # add a <dist>-install-skills console script (PR, or local edit)
 ```
+
+`acumen ship` packages the chosen skill version into the target: the package gains a
+`<dist>-install-skills` command that installs the skill into `~/.claude/skills/`, so the
+package's own users get the guidance with one command. For a GitHub target the change arrives
+as a pull request; for a local path it is written straight into the working tree.
 
 ## Getting started
 

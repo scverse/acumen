@@ -33,6 +33,7 @@ max_usd: 5.0                          # per-agent budget cap (USD)
 draft_model: claude-opus-4-8          # model that writes the first skill (reads the source)
 improve_model: claude-opus-4-8        # model that improves a skill from its train results
 tasks_model: claude-opus-4-8          # model for `acumen tasks` (generates this file); runs code
+ship_model: claude-opus-4-8           # model for `acumen ship` (packages a skill into the target)
 
 skill_name: your_package              # the skill's directory + frontmatter name; must match SKILL.md
 """
