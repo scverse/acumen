@@ -96,6 +96,18 @@ _RC = {
 _REPORTED_SPLIT = "test"
 
 
+#: Brand assets bundled with the package (see ``src/acumen/assets``). Inlined as ``data:``
+#: URIs so ``report.html`` stays self-contained (§2) — the favicon and the sidebar banner
+#: travel inside the HTML, with no sidecar image files.
+_ASSETS = Path(__file__).parent / "assets"
+
+
+def _asset_data_uri(name: str) -> str:
+    """Base64 ``data:`` URI for a bundled SVG asset, for inline ``src``/``href`` use."""
+    encoded = base64.b64encode((_ASSETS / name).read_bytes()).decode("ascii")
+    return f"data:image/svg+xml;base64,{encoded}"
+
+
 class ReportError(ValueError):
     """Raised when there is nothing to report on, or the run tree is unreadable."""
 
@@ -555,6 +567,7 @@ body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin: 0; 
        background: var(--page); color: var(--ink); display: flex; align-items: flex-start; }}
 nav.toc {{ position: sticky; top: 0; flex: 0 0 210px; height: 100vh; overflow-y: auto;
        padding: 1.5rem 1rem; border-right: 1px solid {INK}22; font-size: 0.9rem; }}
+nav.toc .toc-banner {{ display: block; width: 100%; max-width: 170px; height: auto; margin: 0 0 0.9rem; }}
 nav.toc .toc-title {{ font-weight: 700; margin-bottom: 0.6rem; }}
 nav.toc ul {{ list-style: none; margin: 0; padding: 0; }}
 nav.toc li {{ margin: 0.15rem 0; }}
@@ -775,6 +788,7 @@ def render_report(
         toc_tasks.append(f'<li><a href="#{html.escape(anchor)}">{html.escape(task_id)}</a></li>')
 
     toc = f"""<nav class="toc">
+<img class="toc-banner" src="{_asset_data_uri("banner.svg")}" alt="acumen">
 <div class="toc-title">acumen report</div>
 <ul>
 <li><a href="#overview">Overview</a></li>
@@ -794,6 +808,7 @@ def render_report(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="{_asset_data_uri("logo.svg")}">
 <title>acumen report</title>
 <style>{_STYLE}</style>
 </head>

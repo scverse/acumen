@@ -1,4 +1,6 @@
-# acumen
+<p align="center">
+  <img src="docs/_static/images/banner_plate.svg" alt="acumen" width="340">
+</p>
 
 [![Tests][badge-tests]][tests]
 [![Documentation][badge-docs]][documentation]
