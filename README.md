@@ -1,5 +1,8 @@
-# acumen — build, benchmark, and optimize Claude skills for your Python package
-<img src="docs/_static/images/banner.svg" align="right" width="280" class="no-scaled-link" />
+<p align="center">
+  <img src="docs/_static/images/banner.svg" alt="acumen" width="360">
+</p>
+
+<p align="center"><b>Build, benchmark, and optimize Claude skills for your Python package.</b></p>
 
 [![Tests][badge-tests]][tests]
 [![Documentation][badge-docs]][documentation]
