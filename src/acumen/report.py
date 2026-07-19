@@ -505,7 +505,12 @@ def _loaded_cell(row: pd.Series) -> str:
 
 
 def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
-    """Per-run table with resource use and a link to each run's ``transcript.html`` (§ M3-T5)."""
+    """Per-run table with resource use and a link to each run's ``transcript.html`` (§ M3-T5).
+
+    ``answer`` and ``expected`` are deliberately **not** shown here — they can be long free
+    text that would blow out the table width — but they remain columns in the sidecar CSV
+    for anyone inspecting individual runs.
+    """
     headers = [
         "arm",
         "split",
@@ -514,8 +519,6 @@ def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
         "rep",
         "skill loaded",
         "reason",
-        "answer",
-        "expected",
         "turns",
         "in tok",
         "out tok",
@@ -545,8 +548,6 @@ def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
             str(int(row["rep"])),
             _loaded_cell(row),
             html.escape(str(row["reason"])),
-            html.escape(str(row.get("answer", ""))),
-            html.escape(str(row.get("expected", ""))),
             str(int(row["turns"])),
             f"{int(row['input_tokens']):,}",
             f"{int(row['output_tokens']):,}",
