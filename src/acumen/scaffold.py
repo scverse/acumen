@@ -2,8 +2,8 @@
 
 The templates are package-agnostic placeholders, kept heavily commented so a new user can
 read what each field does and fill in the blanks rather than starting from an empty file.
-The placeholders (``OWNER/REPO``, ``your_package``, the ``REPLACE_ME`` answers) are meant
-to be edited before the first run.
+The placeholders (``OWNER/REPO``, the ``REPLACE_ME`` answers) are meant to be edited before
+the first run.
 """
 
 from __future__ import annotations
@@ -16,14 +16,14 @@ TASKS_FILENAME = "tasks.yaml"
 #: An annotated config with placeholder target/skill fields for the user to fill in.
 CONFIG_TEMPLATE = """\
 # acumen config — the target package and how to benchmark against it.
-# Every field below except `repo` and `skill_name` has a default; delete a line to take it.
+# Every field below except `repo` has a default; delete a line to take it.
 
 repo: https://github.com/OWNER/REPO   # GitHub URL, or a local path to an installable package
 ref: main                             # branch, tag, or commit (ignored for local paths)
 extras: []                            # optional pip extras, e.g. [dev, test]
 python: "3.12"                        # interpreter for the target's throwaway venv
 
-models: [claude-opus-4-8]             # benchmark models; a pass is models x tasks x reps x splits
+models: [claude-opus-4-8, claude-sonnet-5, claude-haiku-4-5-20251001]   # benchmark models; a pass is models x tasks x reps x splits
 n_replicates: 3                       # runs per (model, task, split) cell
 max_concurrency: 4                    # simultaneous agents
 
@@ -35,7 +35,7 @@ improve_model: claude-opus-4-8        # model that improves a skill from its tra
 tasks_model: claude-opus-4-8          # model for `acumen tasks` (generates this file); runs code
 ship_model: claude-opus-4-8           # model for `acumen ship` (packages a skill into the target)
 
-skill_name: your_package              # the skill's directory + frontmatter name; must match SKILL.md
+# skill_name: your_skill              # name for the built skill; defaults to the repo's name
 """
 
 #: A tasks file with one placeholder task, showing the required shape. Each task needs a

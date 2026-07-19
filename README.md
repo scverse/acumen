@@ -33,7 +33,7 @@ rather than genuinely helping.
 # 1. Scaffold a starter config.yaml and tasks.yaml
 acumen init
 
-# 2. Fill in config.yaml (repo, skill_name). Write tasks.yaml by hand, or generate it:
+# 2. Fill in config.yaml (repo). Write tasks.yaml by hand, or generate it:
 acumen tasks                     # mine the package for real analyses -> tasks.yaml
 
 # 3. Then run the loop:

@@ -8,6 +8,8 @@ from typing import Any
 
 import yaml
 
+from .paths import PathError, slugify
+
 
 class ConfigError(ValueError):
     """Raised when ``config.yaml`` is malformed."""
@@ -60,6 +62,21 @@ _KNOWN = {
 
 def _looks_remote(repo: str) -> bool:
     return repo.startswith(_REMOTE_PREFIXES)
+
+
+def derive_skill_name(repo: str) -> str:
+    """Derive a default skill name from a ``repo`` URL or local path.
+
+    Takes the last path component (``.../scanpy`` or ``git@…:owner/scanpy.git`` ->
+    ``scanpy``), drops a trailing ``.git``, and slugifies it to a lowercase, filesystem-safe
+    token. This is the fallback when ``config.yaml`` omits ``skill_name``, so the name is one
+    fewer field a user can get wrong.
+    """
+    stem = Path(repo.rstrip("/")).name.removesuffix(".git")
+    try:
+        return slugify(stem).lower()
+    except PathError as err:
+        raise ConfigError(f"cannot derive a skill name from repo {repo!r}; set 'skill_name' explicitly") from err
 
 
 def _require_str(raw: dict[str, Any], key: str) -> str:
@@ -119,9 +136,11 @@ def parse_config(raw: Any) -> Config:
     unknown = set(raw) - _KNOWN
     if unknown:
         raise ConfigError(f"unknown keys: {sorted(unknown)} (known keys: {sorted(_KNOWN)})")
-    for required in ("repo", "skill_name"):
-        if required not in raw:
-            raise ConfigError(f"missing required key '{required}'")
+    if "repo" not in raw:
+        raise ConfigError("missing required key 'repo'")
+
+    repo = _require_str(raw, "repo")
+    skill_name = _require_str(raw, "skill_name") if "skill_name" in raw else derive_skill_name(repo)
 
     models = _str_list(raw, "models", ["claude-opus-4-8"])
     if not models:
@@ -131,8 +150,8 @@ def parse_config(raw: Any) -> Config:
 
     default_model = models[0]
     return Config(
-        repo=_require_str(raw, "repo"),
-        skill_name=_require_str(raw, "skill_name"),
+        repo=repo,
+        skill_name=skill_name,
         ref=_optional_str(raw, "ref", "main"),
         extras=_str_list(raw, "extras", []),
         python=_optional_str(raw, "python", "3.12"),

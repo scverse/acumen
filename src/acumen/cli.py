@@ -423,7 +423,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
     written = scaffold(args.directory, force=args.force)
     for path in written:
         print(f"wrote {path}")
-    print("\nnext: edit config.yaml (repo, skill_name) and tasks.yaml, then `acumen draft`")
+    print("\nnext: edit config.yaml (repo) and tasks.yaml, then `acumen draft`")
     return 0
 
 
