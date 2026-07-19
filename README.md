@@ -1,6 +1,5 @@
-<p align="center">
-  <img src="docs/_static/images/banner_plate.svg" alt="acumen" width="340">
-</p>
+# acumen — build, benchmark, and optimize Claude skills for your Python package
+<img src="https://raw.githubusercontent.com/scverse/acumen/refs/heads/main/docs/_static/images/banner.svg" align="right" width="280" class="no-scaled-link" />
 
 [![Tests][badge-tests]][tests]
 [![Documentation][badge-docs]][documentation]
@@ -8,30 +7,22 @@
 [badge-tests]: https://img.shields.io/github/actions/workflow/status/scverse/acumen/test.yaml?branch=main
 [badge-docs]: https://app.readthedocs.org/projects/acumen/badge/
 
-**Build, benchmark, and optimize Claude skills for your Python package.**
+Many good tools are unusable by coding agents because their maintainers have no way to write
+a skill for them — or, having written one, no way to tell whether it helps. acumen closes
+that loop: point it at a Python package and a few tasks, and it drafts a skill, benchmarks it
+against a no-skill baseline, and improves it across a train/test split so the gains are real
+generalization, not memorized answers.
 
-Many good tools are unusable by coding agents today because their maintainers have no way
-to write a skill for them — or, having written one, no way to tell whether it actually
-helps. acumen closes that loop. Point it at a Python package and a handful of tasks and it
-will:
+- **`acumen draft`** — write `skills/v1` from the package's own source.
+- **`acumen bench`** — score a skill against a no-skill baseline, in a scrubbed sandbox where
+  the skill is the only difference between arms.
+- **`acumen improve`** — refine the skill from its train results, then benchmark again.
+- **`acumen report`** — aggregate every run into one self-contained `report.html`: success
+  rate per version, train vs. test.
 
-1. **Draft** a skill from the package's own source.
-2. **Benchmark** that skill against a no-skill baseline on your tasks, in a scrubbed sandbox
-   where the only difference between arms is the skill itself.
-3. **Improve** the skill from its results and benchmark again — with a train/test split, so
-   the gains are real generalization and not memorized answers.
-4. **Report** success rate per version, train vs. test, in one self-contained `report.html`.
-
-```
-noskill baseline ──▶ draft v1 ──▶ bench v1 ──▶ report
-                                     │
-                                     ▼
-                        improve (train results only) ──▶ v2 ──▶ bench v2 ──▶ report ──▶ …
-```
-
-You decide when to stop. Every version is benchmarked on both splits; only train results
-are ever shown to the improver, so a widening train/test gap is a visible signal that a
-skill is overfitting rather than genuinely helping.
+You decide when to stop. Every version is benchmarked on both splits, and only train results
+reach the improver — so a widening train/test gap is a visible sign a skill is overfitting
+rather than genuinely helping.
 
 ## Quickstart
 
