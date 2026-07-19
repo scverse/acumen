@@ -49,6 +49,11 @@ TASKS_TEMPLATE = """\
 # of whether a skill actually helps. Answers are compared by EXACT string match after
 # strip(), so keep them to a single unambiguous token.
 #
+# Do NOT name the target package in a prompt. The agent is already told, before every task,
+# that your package (from `config.yaml`) is installed and is the one to use — so "using
+# <package>, ..." is redundant. Describe only the analysis: the goal, the input, and exactly
+# what to report. (`acumen tasks` follows the same rule when it generates this file.)
+#
 # A good task is one your target package solves and the baseline gets wrong — that is where
 # a skill has room to help. Replace the placeholders below with your own, or run
 # `acumen tasks` to generate this file automatically from the target package.
@@ -59,13 +64,13 @@ tasks:
   - id: example_task
     train:
       prompt: >-
-        Describe, concretely, a task the agent should solve with your package on the
-        training input — the data, the method, and exactly what to report. End by asking
-        for only the final answer, so it grades as a single token.
+        Describe, concretely, the analysis the agent should carry out on the training input
+        — the data, the goal, and exactly what to report. Do not name the package (it is
+        provided). End by asking for only the final answer, so it grades as a single token.
       answer: REPLACE_ME_TRAIN
     test:
       prompt: >-
-        The same kind of task on a different, held-out input. This split is what measures
+        The same kind of analysis on a different, held-out input. This split is what measures
         whether the skill generalizes; the improver never sees its results.
       answer: REPLACE_ME_TEST
 """
