@@ -1,5 +1,5 @@
 # acumen — build, benchmark, and optimize Claude skills for your Python package
-<img src="https://raw.githubusercontent.com/scverse/acumen/refs/heads/main/docs/_static/images/banner.svg" align="right" width="280" class="no-scaled-link" />
+<img src="docs/_static/images/banner.svg" align="right" width="280" class="no-scaled-link" />
 
 [![Tests][badge-tests]][tests]
 [![Documentation][badge-docs]][documentation]
