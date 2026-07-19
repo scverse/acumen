@@ -315,9 +315,9 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
 
     out = args.out
     # Fail before the (costly) target prep and agent run if we'd have to clobber.
-    if out.exists() and not args.force and not args.append:
+    if out.exists() and not args.force:
         print(
-            f"{out} already exists — pass --force to overwrite or --append to add to it",
+            f"{out} already exists — pass --force to overwrite it (e.g. the placeholder from `acumen init`)",
             file=sys.stderr,
         )
         return 2
@@ -340,16 +340,13 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
                 out_path=out,
                 max_turns=args.max_turns,
                 max_usd=args.max_usd,
-                append=args.append,
                 force=args.force,
                 log=log,
             )
         )
-    verb = "appended to" if result.appended else "wrote"
-    print(f"\n{verb} {result.out_path.resolve()}")
-    print(f"  new tasks:   {len(result.new_tasks)} ({', '.join(t.id for t in result.new_tasks)})")
-    print(f"  total tasks: {len(result.tasks)}")
-    print(f"  cost:        ${result.cost_usd:.2f} over {result.turns} turns")
+    print(f"\nwrote {result.out_path.resolve()}")
+    print(f"  tasks: {len(result.tasks)} ({', '.join(t.id for t in result.tasks)})")
+    print(f"  cost:  ${result.cost_usd:.2f} over {result.turns} turns")
     _print_log_result(log)
     print("\nnext: review the tasks, then `acumen draft` and `acumen bench`")
     return 0
@@ -474,9 +471,7 @@ def build_parser() -> argparse.ArgumentParser:
     tasks_cmd.add_argument("--max-usd", type=float, help="cap spend for the generation agent (default: unbounded)")
     tasks_cmd.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     tasks_cmd.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
-    out_mode = tasks_cmd.add_mutually_exclusive_group()
-    out_mode.add_argument("--force", action="store_true", help="overwrite an existing tasks file")
-    out_mode.add_argument("--append", action="store_true", help="add generated tasks to an existing tasks file")
+    tasks_cmd.add_argument("--force", action="store_true", help="overwrite an existing tasks file")
     _add_log_args(tasks_cmd)
     tasks_cmd.set_defaults(func=_cmd_tasks)
 

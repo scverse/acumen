@@ -43,7 +43,7 @@ from acumen.config import Config
 from acumen.env import Target, scrubbed_env, seed_credentials
 from acumen.logs import LiveLog
 from acumen.prompts import taskgen_prompt
-from acumen.tasks import Task, TaskError, load_tasks, parse_tasks
+from acumen.tasks import Task, TaskError, load_tasks
 
 #: The filename the generation agent writes and we harvest from its work dir.
 TASKS_FILE = "tasks.yaml"
@@ -73,9 +73,7 @@ class TaskGenResult:
     """The outcome of a generation run: the tasks written and what it cost."""
 
     tasks: list[Task]
-    new_tasks: list[Task]
     out_path: Path
-    appended: bool
     cost_usd: float
     turns: int
     #: Live log paths for this run, when a :class:`LiveLog` was attached (M8).
@@ -276,22 +274,6 @@ def _validate_generated(staged: Path) -> list[Task]:
         raise TaskGenError(f"the generated {TASKS_FILE} is not valid: {err}") from err
 
 
-def _combine(existing: list[Task], generated: list[Task]) -> list[Task]:
-    """Append generated tasks to existing ones, validating the merged set through the loader.
-
-    Round-trips the combination through :func:`parse_tasks` so an id collision between the
-    existing file and the new tasks surfaces as a clear error rather than a silent clobber.
-    """
-    combined = existing + generated
-    try:
-        return parse_tasks(yaml.safe_load(dump_tasks(combined)))
-    except TaskError as err:
-        raise TaskGenError(
-            f"cannot merge generated tasks with the existing {TASKS_FILE}: {err} "
-            "(a generated task id likely collides with an existing one)"
-        ) from err
-
-
 async def generate_tasks(
     *,
     cfg: Config,
@@ -300,7 +282,6 @@ async def generate_tasks(
     model: str | None = None,
     max_turns: int | None = None,
     max_usd: float | None = None,
-    append: bool = False,
     force: bool = False,
     log: LiveLog | None = None,
 ) -> TaskGenResult:
@@ -315,30 +296,28 @@ async def generate_tasks(
         pipelines against for ground truth.
     out_path
         Where the tasks are written. Refuses to overwrite an existing file unless ``force``
-        (replace) or ``append`` (add to it) is set.
+        is set. There is deliberately no "append" mode: the agent generates blind to the
+        existing file (it never reads it — see the module docstring on isolation), so it cannot
+        avoid re-covering functionality already present, and appending would silently grow the
+        set with semantic duplicates. To combine generated tasks with a curated file, write to a
+        separate ``out_path`` and merge by hand, where the overlap can actually be judged.
     model
         Override for the generation model; defaults to ``cfg.tasks_model``.
     max_turns, max_usd
         Caps for the generation agent. **Unbounded by default** (§5): generating tasks means
         running package code iteratively, so no default budget is imposed — pass explicit caps
         to bound it.
-    append
-        Add the generated tasks to an existing ``out_path`` instead of replacing it.
     force
-        Overwrite an existing ``out_path``. Ignored when ``append`` is set.
+        Overwrite an existing ``out_path`` (e.g. the placeholder from ``acumen init``).
     log
         A :class:`LiveLog` to stream the agent's messages to and render an HTML log from (M8).
 
     Returns
     -------
-    The generation result: the full task set written, the newly generated tasks, and cost.
+    The generation result: the task set written and what it cost.
     """
-    existing: list[Task] = []
-    if out_path.exists():
-        if append:
-            existing = load_tasks(out_path)
-        elif not force:
-            raise TaskGenError(f"{out_path} already exists — pass force=True to overwrite or append=True to add to it")
+    if out_path.exists() and not force:
+        raise TaskGenError(f"{out_path} already exists — pass force=True to overwrite it")
 
     holder = Path(tempfile.mkdtemp(prefix="acumen-tasks-"))
     try:
@@ -408,15 +387,12 @@ async def generate_tasks(
             raise TaskGenError(f"the task-generation agent errored: {result.subtype} {result.errors or ''}".strip())
 
         generated = _validate_generated(staged)
-        final = _combine(existing, generated) if existing else generated
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(dump_tasks(final))
+        out_path.write_text(dump_tasks(generated))
         return TaskGenResult(
-            tasks=final,
-            new_tasks=generated,
+            tasks=generated,
             out_path=out_path,
-            appended=bool(existing),
             cost_usd=result.total_cost_usd or 0.0,
             turns=result.num_turns,
             log_jsonl=log.jsonl_path if log is not None else None,
