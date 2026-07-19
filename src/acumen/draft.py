@@ -21,6 +21,7 @@ from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
 from acumen.config import Config
 from acumen.env import Target, scrubbed_env, seed_credentials
+from acumen.logs import LiveLog
 from acumen.prompts import draft_prompt
 from acumen.skills import (
     SKILL_FILE,
@@ -44,6 +45,9 @@ class DraftResult:
     skill: Skill
     cost_usd: float
     turns: int
+    #: Live log paths for this run, when a :class:`LiveLog` was attached (M8).
+    log_jsonl: Path | None = None
+    log_html: Path | None = None
 
 
 def _validate_staged(staging: Path, skill_name: str) -> None:
@@ -69,6 +73,7 @@ async def draft_skill(
     max_turns: int | None = None,
     max_usd: float | None = None,
     rationale: str = "initial draft",
+    log: LiveLog | None = None,
 ) -> DraftResult:
     """Draft a new skill version from the target package's source.
 
@@ -84,6 +89,8 @@ async def draft_skill(
         Overrides for the drafting agent; default to the config's.
     rationale
         Recorded in ``meta.json`` as why this version exists.
+    log
+        A :class:`LiveLog` to stream the agent's messages to and render an HTML log from (M8).
 
     Returns
     -------
@@ -129,13 +136,24 @@ async def draft_skill(
         )
 
         result: ResultMessage | None = None
+        agent_error: Exception | None = None
         try:
             async for message in query(prompt=prompt, options=options):
+                if log is not None:
+                    log.append(message)
                 if isinstance(message, ResultMessage):
                     result = message
-        except Exception as err:  # a failed draft is an error to report, not a traceback to dump
-            raise DraftError(f"the drafting agent failed: {type(err).__name__}: {err}") from err
+        except Exception as err:  # noqa: BLE001 - a failed draft is an error to report, re-raised below
+            agent_error = err
+        finally:
+            # Render the HTML log while the throwaway config dir still holds the native
+            # transcript — in a finally so an aborted run (the SDK raises on a cap breach,
+            # after yielding the result) is still inspectable (M8, §8-T5d).
+            if log is not None:
+                log.finalize(config_dir=config_dir, work_dir=work, result=result)
 
+        if agent_error is not None:
+            raise DraftError(f"the drafting agent failed: {type(agent_error).__name__}: {agent_error}") from agent_error
         if result is None:
             raise DraftError("the drafting agent produced no result message")
         if result.is_error:
@@ -151,6 +169,8 @@ async def draft_skill(
             skill=skill,
             cost_usd=result.total_cost_usd or 0.0,
             turns=result.num_turns,
+            log_jsonl=log.jsonl_path if log is not None else None,
+            log_html=log.html_path if log is not None and log.html_rendered else None,
         )
     finally:
         shutil.rmtree(holder, ignore_errors=True)

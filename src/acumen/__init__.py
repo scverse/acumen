@@ -16,6 +16,7 @@ from acumen.improve import (
     improve_skill,
     make_test_guard,
 )
+from acumen.logs import LiveLog
 from acumen.paths import RunKey, Split, arm_name, is_complete, parse_run_dir, run_dir, skill_from_arm
 from acumen.report import Report, ReportError, arm_metrics, build_report, load_results
 from acumen.runner import RunOutcome, run_once
@@ -43,6 +44,7 @@ from acumen.taskgen import (
     make_skill_guard,
 )
 from acumen.tasks import Task, TaskError, TaskSplit, load_tasks, parse_tasks
+from acumen.transcript import locate_transcript, render_transcript
 
 __all__ = [
     "Config",
@@ -54,6 +56,7 @@ __all__ = [
     "ImproveError",
     "ImproveResult",
     "InitError",
+    "LiveLog",
     "PlannedRun",
     "Reason",
     "Report",
@@ -97,6 +100,7 @@ __all__ = [
     "make_test_guard",
     "latest_version",
     "load_config",
+    "locate_transcript",
     "load_results",
     "load_skill",
     "load_tasks",
@@ -106,6 +110,7 @@ __all__ = [
     "parse_tasks",
     "pending",
     "prepare_target",
+    "render_transcript",
     "run_dir",
     "run_matrix",
     "run_once",

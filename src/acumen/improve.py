@@ -31,6 +31,7 @@ from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, ResultMessage, que
 
 from acumen.config import Config
 from acumen.env import Target, scrubbed_env, seed_credentials
+from acumen.logs import LiveLog
 from acumen.paths import (
     ANSWER_FILE,
     RESULT_FILE,
@@ -95,6 +96,9 @@ class ImproveResult:
     turns: int
     n_train_runs: int
     n_train_failures: int
+    #: Live log paths for this run, when a :class:`LiveLog` was attached (M8).
+    log_jsonl: Path | None = None
+    log_html: Path | None = None
 
 
 # ── Train evidence ─────────────────────────────────────────────────────────────────────
@@ -321,6 +325,7 @@ async def improve_skill(
     model: str | None = None,
     max_turns: int | None = None,
     max_usd: float | None = None,
+    log: LiveLog | None = None,
 ) -> ImproveResult:
     """Improve the current skill into the next version from its train-split evidence.
 
@@ -341,6 +346,8 @@ async def improve_skill(
         The version to improve; defaults to the latest present.
     model, max_turns, max_usd
         Overrides for the improving agent; default to the config's.
+    log
+        A :class:`LiveLog` to stream the agent's messages to and render an HTML log from (M8).
 
     Returns
     -------
@@ -404,13 +411,26 @@ async def improve_skill(
         )
 
         result: ResultMessage | None = None
+        agent_error: Exception | None = None
         try:
             async for message in query(prompt=prompt, options=options):
+                if log is not None:
+                    log.append(message)
                 if isinstance(message, ResultMessage):
                     result = message
-        except Exception as err:  # a failed improve is an error to report, not a traceback
-            raise ImproveError(f"the improving agent failed: {type(err).__name__}: {err}") from err
+        except Exception as err:  # noqa: BLE001 - a failed improve is an error to report, re-raised below
+            agent_error = err
+        finally:
+            # Render the HTML log while the throwaway config dir still holds the native
+            # transcript — in a finally so an aborted run (the SDK raises on a cap breach,
+            # after yielding the result) is still inspectable (M8, §8-T5d).
+            if log is not None:
+                log.finalize(config_dir=config_dir, work_dir=work, result=result)
 
+        if agent_error is not None:
+            raise ImproveError(
+                f"the improving agent failed: {type(agent_error).__name__}: {agent_error}"
+            ) from agent_error
         if result is None:
             raise ImproveError("the improving agent produced no result message")
         if result.is_error:
@@ -430,6 +450,8 @@ async def improve_skill(
             turns=result.num_turns,
             n_train_runs=len(train_runs),
             n_train_failures=n_failures,
+            log_jsonl=log.jsonl_path if log is not None else None,
+            log_html=log.html_path if log is not None and log.html_rendered else None,
         )
     finally:
         shutil.rmtree(holder, ignore_errors=True)

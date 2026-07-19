@@ -9,12 +9,10 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, project_key_for_directory, query
+from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
 from acumen.env import Target, sdk_version
 from acumen.grade import Grade, Reason, grade_run
@@ -30,6 +28,7 @@ from acumen.prompts import benchmark_prompt
 from acumen.sandbox import Sandbox, sandbox
 from acumen.skills import Skill
 from acumen.tasks import Task
+from acumen.transcript import locate_transcript, render_transcript
 
 #: Result subtypes the CLI reports on a cap breach, mapped to our reason taxonomy.
 _SUBTYPE_REASONS: dict[str, Reason] = {
@@ -67,14 +66,7 @@ def _terminal_reason(message: ResultMessage) -> Reason | None:
 
 
 def _find_transcript(box: Sandbox, session_id: str) -> Path | None:
-    key = project_key_for_directory(str(box.root))
-    direct = box.transcript_root / key / f"{session_id}.jsonl"
-    if direct.is_file():
-        return direct
-    # The encoding is deterministic, but fall back to a search rather than lose the
-    # transcript if the CLI ever keys the directory differently.
-    matches = sorted(box.transcript_root.glob(f"**/{session_id}.jsonl"))
-    return matches[0] if matches else None
+    return locate_transcript(box.config_dir, box.root, session_id)
 
 
 def _skill_fired(jsonl: Path) -> bool | None:
@@ -103,27 +95,6 @@ def _skill_fired(jsonl: Path) -> bool | None:
             if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "Skill":
                 return True
     return False
-
-
-def _claude_code_log() -> str | None:
-    """Locate the ``claude-code-log`` CLI.
-
-    It is a dependency of acumen, so it lives next to the interpreter running us — look
-    there before PATH, which won't contain the venv's ``bin`` when acumen is invoked by
-    absolute path rather than through an activated venv.
-    """
-    local = Path(sys.executable).parent / "claude-code-log"
-    if local.is_file():
-        return str(local)
-    return shutil.which("claude-code-log")
-
-
-def _render_transcript(jsonl: Path, html: Path) -> bool:
-    cli = _claude_code_log()
-    if cli is None:
-        return False
-    proc = subprocess.run([cli, str(jsonl), "-o", str(html)], capture_output=True, text=True)
-    return proc.returncode == 0 and html.is_file()
 
 
 def _collect_artifacts(box: Sandbox, run_dir: Path) -> None:
@@ -254,7 +225,7 @@ async def run_once(
     rendered = False
     skill_loaded: bool | None = None
     if (run_dir / TRANSCRIPT_JSONL).is_file():
-        rendered = _render_transcript(run_dir / TRANSCRIPT_JSONL, run_dir / TRANSCRIPT_HTML)
+        rendered = render_transcript(run_dir / TRANSCRIPT_JSONL, run_dir / TRANSCRIPT_HTML)
         skill_loaded = _skill_fired(run_dir / TRANSCRIPT_JSONL)
 
     grade: Grade = grade_run(run_dir, split.answer)

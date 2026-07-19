@@ -14,6 +14,7 @@ from acumen.config import ConfigError, load_config
 from acumen.draft import DraftError, draft_skill
 from acumen.env import DEFAULT_CACHE_ROOT, EnvError, prepare_target
 from acumen.improve import ImproveError, improve_skill
+from acumen.logs import LiveLog
 from acumen.paths import SPLITS
 from acumen.report import ReportError, build_report
 from acumen.runner import RunOutcome
@@ -41,6 +42,22 @@ def _add_bench_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     parser.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
     parser.add_argument("--dry-run", action="store_true", help="print the matrix and exit without running agents")
+
+
+def _add_log_args(parser: argparse.ArgumentParser) -> None:
+    """Add the shared live-log flags to a meta-agent subcommand (M8)."""
+    parser.add_argument("--stream", action="store_true", help="mirror the agent's conversation to the terminal live")
+    parser.add_argument(
+        "--log-dir", type=Path, default=Path("logs"), dest="log_dir", help="directory for the run log (default: logs/)"
+    )
+
+
+def _print_log_result(log: LiveLog) -> None:
+    """Print where the rendered HTML log landed, once a run has finalized."""
+    if log.html_rendered:
+        print(f"log → {log.html_path}")
+    else:
+        print("note: HTML log not rendered (claude-code-log missing?) — the jsonl log is complete", file=sys.stderr)
 
 
 def _fmt_secs(seconds: float) -> str:
@@ -207,15 +224,19 @@ def _cmd_draft(args: argparse.Namespace) -> int:
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
     print(f"drafting with {cfg.draft_model} (this reads the package source) ...", flush=True)
 
-    result = asyncio.run(
-        draft_skill(
-            cfg=cfg,
-            target=target,
-            skills_root=args.skills,
-            max_turns=args.max_turns,
-            max_usd=args.max_usd,
+    log = LiveLog.open(args.log_dir, "draft", stream=args.stream)
+    print(f"log → {log.jsonl_path}", flush=True)
+    with log:
+        result = asyncio.run(
+            draft_skill(
+                cfg=cfg,
+                target=target,
+                skills_root=args.skills,
+                max_turns=args.max_turns,
+                max_usd=args.max_usd,
+                log=log,
+            )
         )
-    )
     skill = result.skill
     files = sorted(p.relative_to(skill.directory).as_posix() for p in skill.directory.rglob("*") if p.is_file())
     print(f"\nwrote {skill.directory}")
@@ -224,6 +245,7 @@ def _cmd_draft(args: argparse.Namespace) -> int:
     print(f"  hash:        {skill.hash}")
     print(f"  files:       {', '.join(files)}")
     print(f"  cost:        ${result.cost_usd:.2f} over {result.turns} turns")
+    _print_log_result(log)
     print(f"\nnext: acumen bench --skill {skill.version}")
     return 0
 
@@ -251,18 +273,22 @@ def _cmd_improve(args: argparse.Namespace) -> int:
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
 
-    result = asyncio.run(
-        improve_skill(
-            cfg=cfg,
-            target=target,
-            skills_root=args.skills,
-            runs_root=args.runs,
-            tasks=tasks,
-            parent_version=parent,
-            max_turns=args.max_turns,
-            max_usd=args.max_usd,
+    log = LiveLog.open(args.log_dir, "improve", stream=args.stream)
+    print(f"log → {log.jsonl_path}", flush=True)
+    with log:
+        result = asyncio.run(
+            improve_skill(
+                cfg=cfg,
+                target=target,
+                skills_root=args.skills,
+                runs_root=args.runs,
+                tasks=tasks,
+                parent_version=parent,
+                max_turns=args.max_turns,
+                max_usd=args.max_usd,
+                log=log,
+            )
         )
-    )
     new = result.skill
     files = sorted(p.relative_to(new.directory).as_posix() for p in new.directory.rglob("*") if p.is_file())
     print(f"\nwrote {new.directory}  (parent {result.parent})")
@@ -277,6 +303,7 @@ def _cmd_improve(args: argparse.Namespace) -> int:
             "warning: the new version is byte-identical to its parent — the improver changed nothing",
             file=sys.stderr,
         )
+    _print_log_result(log)
     print(f"\nnext: acumen bench --skill {new.version} && acumen report")
     return 0
 
@@ -303,22 +330,27 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
         flush=True,
     )
 
-    result = asyncio.run(
-        generate_tasks(
-            cfg=cfg,
-            target=target,
-            out_path=out,
-            max_turns=args.max_turns,
-            max_usd=args.max_usd,
-            append=args.append,
-            force=args.force,
+    log = LiveLog.open(args.log_dir, "tasks", stream=args.stream)
+    print(f"log → {log.jsonl_path}", flush=True)
+    with log:
+        result = asyncio.run(
+            generate_tasks(
+                cfg=cfg,
+                target=target,
+                out_path=out,
+                max_turns=args.max_turns,
+                max_usd=args.max_usd,
+                append=args.append,
+                force=args.force,
+                log=log,
+            )
         )
-    )
     verb = "appended to" if result.appended else "wrote"
     print(f"\n{verb} {result.out_path.resolve()}")
     print(f"  new tasks:   {len(result.new_tasks)} ({', '.join(t.id for t in result.new_tasks)})")
     print(f"  total tasks: {len(result.tasks)}")
     print(f"  cost:        ${result.cost_usd:.2f} over {result.turns} turns")
+    _print_log_result(log)
     print("\nnext: review the tasks, then `acumen draft` and `acumen bench`")
     return 0
 
@@ -346,20 +378,25 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         flush=True,
     )
 
-    result = asyncio.run(
-        ship_skill(
-            cfg=cfg,
-            target=target,
-            skills_root=args.skills,
-            version=args.version,
-            max_turns=args.max_turns,
-            max_usd=args.max_usd,
-            force=args.force,
+    log = LiveLog.open(args.log_dir, "ship", stream=args.stream)
+    print(f"log → {log.jsonl_path}", flush=True)
+    with log:
+        result = asyncio.run(
+            ship_skill(
+                cfg=cfg,
+                target=target,
+                skills_root=args.skills,
+                version=args.version,
+                max_turns=args.max_turns,
+                max_usd=args.max_usd,
+                force=args.force,
+                log=log,
+            )
         )
-    )
     print(f"\nshipped {result.skill.version} of {result.skill.name}")
     print(f"  mode:  {'pull request' if result.mode == 'github' else 'working tree (local)'}")
     print(f"  cost:  ${result.cost_usd:.2f} over {result.turns} turns")
+    _print_log_result(log)
     if result.summary:
         print("\nagent summary:")
         print(result.summary)
@@ -412,6 +449,7 @@ def build_parser() -> argparse.ArgumentParser:
     draft.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     draft.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     draft.add_argument("--force", action="store_true", help="draft another version even if some already exist")
+    _add_log_args(draft)
     draft.set_defaults(func=_cmd_draft)
 
     improve = sub.add_parser("improve", help="improve the current skill into a new version from its train results")
@@ -425,6 +463,7 @@ def build_parser() -> argparse.ArgumentParser:
     improve.add_argument("--max-usd", type=float, help="override config max_usd for the improving agent")
     improve.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     improve.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
+    _add_log_args(improve)
     improve.set_defaults(func=_cmd_improve)
 
     tasks_cmd = sub.add_parser("tasks", help="autonomously generate a tasks.yaml from the target package")
@@ -438,6 +477,7 @@ def build_parser() -> argparse.ArgumentParser:
     out_mode = tasks_cmd.add_mutually_exclusive_group()
     out_mode.add_argument("--force", action="store_true", help="overwrite an existing tasks file")
     out_mode.add_argument("--append", action="store_true", help="add generated tasks to an existing tasks file")
+    _add_log_args(tasks_cmd)
     tasks_cmd.set_defaults(func=_cmd_tasks)
 
     ship = sub.add_parser("ship", help="make a benchmarked skill installable into the target package")
@@ -452,6 +492,7 @@ def build_parser() -> argparse.ArgumentParser:
     ship.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     ship.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     ship.add_argument("--force", action="store_true", help="ship even if the package already has an installer")
+    _add_log_args(ship)
     ship.set_defaults(func=_cmd_ship)
 
     report = sub.add_parser("report", help="aggregate the run tree into a self-contained report.html")

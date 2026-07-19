@@ -35,6 +35,7 @@ from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
 from acumen.config import Config
 from acumen.env import Target, claude_cli_dir
+from acumen.logs import LiveLog
 from acumen.prompts import ship_prompt
 from acumen.skills import Skill, content_files, load_skill
 
@@ -57,6 +58,9 @@ class ShipResult:
     summary: str
     cost_usd: float
     turns: int
+    #: Live log paths for this run, when a :class:`LiveLog` was attached (M8).
+    log_jsonl: Path | None = None
+    log_html: Path | None = None
 
 
 def _script_tables(pyproject: dict) -> list[dict]:
@@ -138,6 +142,19 @@ def _ship_env(target: Target) -> dict[str, str]:
     return env
 
 
+def _config_dir(env: dict[str, str]) -> Path:
+    """The ``CLAUDE_CONFIG_DIR`` the ship agent's transcript lands under.
+
+    The ship agent is unisolated, so it uses the user's real config dir — ``CLAUDE_CONFIG_DIR``
+    if set, else ``$HOME/.claude`` — never a throwaway.
+    """
+    explicit = env.get("CLAUDE_CONFIG_DIR")
+    if explicit:
+        return Path(explicit)
+    home = env.get("HOME") or str(Path.home())
+    return Path(home) / ".claude"
+
+
 async def ship_skill(
     *,
     cfg: Config,
@@ -148,6 +165,7 @@ async def ship_skill(
     max_turns: int | None = None,
     max_usd: float | None = None,
     force: bool = False,
+    log: LiveLog | None = None,
 ) -> ShipResult:
     """Make skill ``version`` installable into the target package.
 
@@ -170,6 +188,8 @@ async def ship_skill(
         package iteratively and runs git/``gh``, so no default budget is imposed.
     force
         Proceed even if the target already ships a skills installer (otherwise refused).
+    log
+        A :class:`LiveLog` to stream the agent's messages to and render an HTML log from (M8).
 
     Returns
     -------
@@ -216,13 +236,24 @@ async def ship_skill(
         )
 
         result: ResultMessage | None = None
+        agent_error: Exception | None = None
         try:
             async for message in query(prompt=prompt, options=options):
+                if log is not None:
+                    log.append(message)
                 if isinstance(message, ResultMessage):
                     result = message
-        except Exception as err:  # a failed ship is an error to report, not a traceback to dump
-            raise ShipError(f"the shipping agent failed: {type(err).__name__}: {err}") from err
+        except Exception as err:  # noqa: BLE001 - a failed ship is an error to report, re-raised below
+            agent_error = err
+        finally:
+            # The ship agent is unisolated, so its transcript lands under the user's real config
+            # dir (not a throwaway). Render the HTML log in a finally so an aborted run (the SDK
+            # raises on a cap breach, after yielding the result) is still inspectable (M8, §8-T5d).
+            if log is not None:
+                log.finalize(config_dir=_config_dir(options.env), work_dir=target.src_dir, result=result)
 
+        if agent_error is not None:
+            raise ShipError(f"the shipping agent failed: {type(agent_error).__name__}: {agent_error}") from agent_error
         if result is None:
             raise ShipError("the shipping agent produced no result message")
         if result.is_error:
@@ -234,6 +265,8 @@ async def ship_skill(
             summary=result.result or "",
             cost_usd=result.total_cost_usd or 0.0,
             turns=result.num_turns,
+            log_jsonl=log.jsonl_path if log is not None else None,
+            log_html=log.html_path if log is not None and log.html_rendered else None,
         )
     finally:
         shutil.rmtree(holder, ignore_errors=True)

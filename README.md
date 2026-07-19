@@ -59,6 +59,11 @@ acumen ship --skill v2           # add a <dist>-install-skills console script (P
 package's own users get the guidance with one command. For a GitHub target the change arrives
 as a pull request; for a local path it is written straight into the working tree.
 
+`draft`, `improve`, `tasks`, and `ship` each drive a long autonomous agent. Every run writes a
+live `logs/acumen-<command>-<datetime>.jsonl` (one event per step, flushed as it goes — so you
+can watch progress by reading the file) and a rendered `.html` transcript. Add `--stream` to
+mirror the conversation to the terminal, or `--log-dir` to change where the logs land.
+
 ## Getting started
 
 Please refer to the [documentation][],

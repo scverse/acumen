@@ -119,6 +119,17 @@ so `from acumen import build_report` works.
     installer_exists
 ```
 
+## Agent run logs
+
+```{eval-rst}
+.. autosummary::
+    :toctree: generated
+
+    LiveLog
+    locate_transcript
+    render_transcript
+```
+
 ## Reporting
 
 ```{eval-rst}
