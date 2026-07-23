@@ -28,7 +28,7 @@ class Config:
     n_replicates: int = 3
     max_concurrency: int = 4
     max_turns: int = 40
-    max_usd: float = 5.0
+    max_usd: float = 3.0
     draft_model: str = "claude-opus-4-8"
     improve_model: str = "claude-opus-4-8"
     tasks_model: str = "claude-opus-4-8"
@@ -159,7 +159,7 @@ def parse_config(raw: Any) -> Config:
         n_replicates=_positive_int(raw, "n_replicates", 3),
         max_concurrency=_positive_int(raw, "max_concurrency", 4),
         max_turns=_positive_int(raw, "max_turns", 40),
-        max_usd=_positive_float(raw, "max_usd", 5.0),
+        max_usd=_positive_float(raw, "max_usd", 3.0),
         draft_model=_optional_str(raw, "draft_model", default_model),
         improve_model=_optional_str(raw, "improve_model", default_model),
         tasks_model=_optional_str(raw, "tasks_model", default_model),
