@@ -109,11 +109,15 @@ A skill is documentation written for an agent, not for a human. Its only purpose
 make an agent that has never used `{package}` succeed at real tasks with it on the first
 try. It is not a tutorial, not a README, and not a sales pitch.
 
+The agent arrives with a goal stated in plain English — what a user wants done, not which
+function to call. The skill's job is to get it from that goal to a working result: route it
+to the right entry point and the right sequence of steps, so it never has to reverse-engineer
+that from the module layout.
+
 # What you can read
 
 - The package's source is at `{src}`. Read it — the source, the docstrings, the examples,
-  the docs directory, the tests. This is the ground truth about how the package behaves.
-- You have web access if the published docs help.
+  the docs directory. This is the ground truth about how the package behaves.
 - `{package}` is also installed; run `{python}` to check anything you are unsure about.
   Verify claims before you write them down.
 
@@ -132,18 +136,28 @@ description: <one sentence: what this skill covers and when to use it>
 
    The `description` is load-bearing and must be HONEST. It is the only part of the skill
    an agent sees before deciding whether to open it, and it is the only thing that gets
-   the skill loaded at the right moment. State what the skill covers and when it applies.
-   Do not oversell it, and do not claim coverage the body does not deliver.
+   the skill loaded at the right moment.
+   State what the skill covers and the goals it applies to — name the outcomes a user would
+   actually phrase, so the skill loads when one of them comes up. Do not oversell it, and do
+   not claim coverage the body does not deliver. Use this format:
+   [What it does] + [When to use it: the goals/triggers it fires on] + [Key capabilities]
 
 2. `{out}/references/*.md` — optional. Use these for detail that only some tasks need.
 
 # How to write it
 
+- **Organize around goals, not modules.** Work out what people actually use `{package}` to
+  accomplish — read its examples, tutorials, and docs, not just its API — and structure the
+  skill so a stated goal maps to the right entry point and the right sequence of steps. Do not
+  just mirror the package's module layout.
 - **Write what is not guessable.** An agent already knows Python and can read a
   traceback. Spend your words on what it would get WRONG by guessing: non-obvious
   defaults, required preprocessing, the function that looks right but isn't, where
-  results are written, argument shapes and orientation, footguns the API invites.
-- **Generalize.** Write guidance that holds across tasks. Do not enumerate cases.
+  results are written, argument shapes and orientation, footguns the API invites, right order
+  of steps to follow.
+- **Generalize within each goal.** Organize around categories of goal, but keep the guidance
+  under each one general enough to cover any task in that category. Don't enumerate one-off
+  recipes — that's the failure mode on the other side of module-mirroring.
 - **Progressive disclosure.** `SKILL.md` should be short and route to `references/` for
   depth. An agent pays for every token of it on every task, including the tasks where it
   is irrelevant. If `SKILL.md` is long, you are taxing every run.
