@@ -65,10 +65,13 @@ not read by a human.
 
 # What you must leave behind
 
-Exactly two files in `{sandbox}`:
+- `answer.md` — your final answer, and NOTHING else. This file is REQUIRED. It is
+  the only thing that is graded.
+- `script.py` — a runnable Python script that reproduces how you got your answer.
+  Write this ONLY if you ran code or tools to reach the answer. If the task is pure
+  reasoning with a fixed solution and you ran nothing, do not write a `script.py`.
 
-1. `script.py` — a runnable Python script that reproduces how you got your answer.
-2. `answer.md` — your final answer, and NOTHING else.
+Do not leave behind any other files.
 
 # The format of answer.md — read this twice
 
@@ -109,7 +112,8 @@ order exactly.
 # Reminder
 
 When you are done, `{sandbox}/answer.md` must contain your answer and nothing else — no
-prose, no formatting, no code fences. `{sandbox}/script.py` must reproduce it.
+prose, no formatting, no code fences. If you ran code or tools to get there,
+`{sandbox}/script.py` must reproduce it; if you did not, there is no `script.py`.
 """
 
 
