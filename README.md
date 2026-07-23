@@ -2,13 +2,18 @@
   <img src="docs/_static/images/banner.svg" alt="acumen" width="360">
 </p>
 
-<p align="center"><b>Build, benchmark, and optimize Claude skills for your Python package.</b></p>
+<p align="center"><b>Build, benchmark, and optimize agentic skills for your Python package.</b></p>
 
 [![Tests][badge-tests]][tests]
 [![Documentation][badge-docs]][documentation]
 
 [badge-tests]: https://img.shields.io/github/actions/workflow/status/scverse/acumen/test.yaml?branch=main
 [badge-docs]: https://app.readthedocs.org/projects/acumen/badge/
+
+Agentic skills, tool instructions writen in plain text, allow agents to use tools more succesfuly and efficient.
+However most python packages do not ship skills with them because developers have no easy way to build and benchmark skills for their tools.
+Acumen closes this gap. Point it at a Python package and a few evaluation tasks, and it drafts a skill, benchmarks it and improves it across a train/test split so the gains are generalizable.
+
 
 Many good tools are unusable by coding agents because their maintainers have no way to write
 a skill for them — or, having written one, no way to tell whether it helps. acumen closes
@@ -38,9 +43,9 @@ acumen tasks                     # mine the package for real analyses -> tasks.y
 
 # 3. Then run the loop:
 acumen bench --no-skill          # the baseline arm
-acumen draft                     # write skills/v1 from the package source
+acumen draft                     # generate skills/v1 from the package source, or write by hand
 acumen bench --skill v1          # benchmark the skill against the baseline
-acumen improve                   # write skills/v2 from v1's train results
+acumen improve                   # generate skills/v2 from v1's train results, or write by hand
 acumen bench --skill v2
 acumen report                    # aggregate every run into report.html
 
@@ -50,8 +55,7 @@ acumen ship --skill v2           # add a <dist>-install-skills console script (P
 
 `acumen ship` packages the chosen skill version into the target: the package gains a
 `<dist>-install-skills` command that installs the skill into `~/.claude/skills/`, so the
-package's own users get the guidance with one command. For a GitHub target the change arrives
-as a pull request; for a local path it is written straight into the working tree.
+package's own users get the guidance with one command.
 
 `draft`, `improve`, `tasks`, and `ship` each drive a long autonomous agent. Every run writes a
 live `logs/acumen-<command>-<datetime>.jsonl` (one event per step, flushed as it goes — so you
@@ -68,8 +72,6 @@ in particular, the [API documentation][].
 You need to have Python 3.12 or newer installed on your system.
 If you don't have Python installed, we recommend installing [uv][].
 
-There are several alternative options to install acumen:
-
 <!--
 1) Install the latest release of `acumen` from [PyPI][]:
 
@@ -78,10 +80,10 @@ pip install acumen
 ```
 -->
 
-1. Install the latest development version:
+And to install the acumen skills needed to run acumen:
 
 ```bash
-pip install git+https://github.com/scverse/acumen.git@main
+pip install acumen
 ```
 
 ## Release notes
