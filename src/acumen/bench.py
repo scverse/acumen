@@ -108,6 +108,7 @@ async def run_matrix(
     skill: Skill | None = None,
     sandbox_base: Path | None = None,
     keep_sandbox: bool = False,
+    stderr: Callable[[str], None] | None = None,
     on_start: Callable[[PlannedRun], None] | None = None,
     on_done: Callable[[RunOutcome], None] | None = None,
 ) -> list[RunOutcome]:
@@ -133,6 +134,10 @@ async def run_matrix(
         Parent directory for sandboxes.
     keep_sandbox
         Leave sandboxes on disk for inspection.
+    stderr
+        Callback for each run's CLI subprocess stderr. Pass one shared
+        :class:`~acumen.runner.StderrFilter` so the per-spawn startup warnings are
+        printed once for the whole pass instead of once per run.
     on_start
         Optional callable invoked with each :class:`PlannedRun` as it is admitted through
         the concurrency gate and begins, for progress output.
@@ -162,6 +167,7 @@ async def run_matrix(
                 skill=skill,
                 sandbox_base=sandbox_base,
                 keep_sandbox=keep_sandbox,
+                stderr=stderr,
             )
             if on_done is not None:
                 on_done(outcome)

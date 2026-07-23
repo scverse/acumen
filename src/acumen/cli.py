@@ -17,7 +17,7 @@ from acumen.improve import ImproveError, improve_skill
 from acumen.logs import LiveLog
 from acumen.paths import SPLITS
 from acumen.report import ReportError, build_report
-from acumen.runner import RunOutcome
+from acumen.runner import RunOutcome, StderrFilter
 from acumen.scaffold import InitError, scaffold
 from acumen.ship import ShipError, ship_skill
 from acumen.skills import SkillError, available_versions, latest_version, load_skill
@@ -189,6 +189,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
             max_concurrency=cfg.max_concurrency,
             skill=skill,
             keep_sandbox=args.keep_sandboxes,
+            stderr=StderrFilter(),
             on_start=progress.on_start,
             on_done=progress.on_done,
         )

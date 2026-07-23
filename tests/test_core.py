@@ -16,6 +16,7 @@ from acumen.env import AUTH_ENV_VARS, EnvError, auth_available, check_auth
 from acumen.grade import grade_answer, grade_run
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
 from acumen.prompts import draft_prompt, feedback_block
+from acumen.runner import StderrFilter
 from acumen.skills import SkillError, load_skill, read_meta, skill_hash, write_meta
 from acumen.tasks import TaskError, load_tasks, parse_tasks
 
@@ -121,6 +122,21 @@ def test_build_matrix_and_resume(project: Path, model: str, make_result) -> None
     make_result(runs, RunKey(arm="skill_v1", split="train", model=model, task_id="example_task", rep=1))
     assert [p.key.split for p in pending(planned, runs)] == ["test"]
     assert len(pending(planned, runs, resume=False)) == 2
+
+
+def test_stderr_filter_keeps_first_of_each_line() -> None:
+    import io
+
+    sink = io.StringIO()
+    emit = StderrFilter(sink=sink)
+    warn = "⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY is set"
+
+    for _ in range(4):  # the same per-spawn warning fires once per run in a real pass
+        emit(warn)
+    emit("a distinct line")
+    emit(warn)  # a later repeat is still dropped
+
+    assert sink.getvalue() == f"{warn}\na distinct line\n"
 
 
 # --- skills ----------------------------------------------------------------------------

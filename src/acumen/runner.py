@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
 
 from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
@@ -113,12 +116,42 @@ def _usage_tokens(usage: dict | None) -> tuple[int, int]:
     return inp, int(usage.get("output_tokens", 0) or 0)
 
 
+class StderrFilter:
+    """Dedupe the CLI subprocess stderr the SDK forwards, keeping the first of each line.
+
+    A benchmark pass spawns one CLI subprocess per run, and each reprints the same
+    startup diagnostics — most visibly the ``claude.ai connectors are disabled`` notice,
+    which fires on every spawn because an auth source is present in the agents' env. Left
+    alone that is one identical warning per run.
+
+    Share a single instance across a whole pass and hand it to :func:`run_matrix` as its
+    ``stderr`` callback. The SDK pipes subprocess stderr only when a callback is set and
+    then invokes it one line at a time on the event loop, so this becomes the sole sink:
+    the first time a given line is seen it is forwarded to our own stderr, and every later
+    repeat is dropped. Distinct lines still all pass through; only exact repeats are cut.
+
+    Called on a single-threaded event loop, so the seen-set needs no locking.
+    """
+
+    def __init__(self, sink: TextIO | None = None) -> None:
+        self._seen: set[str] = set()
+        self._sink = sink if sink is not None else sys.stderr
+
+    def __call__(self, line: str) -> None:
+        """Forward ``line`` the first time it is seen; drop it on every later repeat."""
+        if line in self._seen:
+            return
+        self._seen.add(line)
+        print(line, file=self._sink, flush=True)
+
+
 def _build_options(
     *,
     box: Sandbox,
     model: str,
     max_turns: int,
     max_usd: float,
+    stderr: Callable[[str], None] | None = None,
 ) -> ClaudeAgentOptions:
     """Assemble the SDK options for one run.
 
@@ -147,6 +180,7 @@ def _build_options(
         setting_sources=["project"],
         permission_mode="bypassPermissions",
         system_prompt={"type": "preset", "preset": "claude_code"},
+        stderr=stderr,
     )
 
 
@@ -162,6 +196,7 @@ async def run_once(
     skill: Skill | None = None,
     sandbox_base: Path | None = None,
     keep_sandbox: bool = False,
+    stderr: Callable[[str], None] | None = None,
 ) -> RunOutcome:
     """Execute one benchmark run end to end and write its ``result.json``.
 
@@ -184,6 +219,10 @@ async def run_once(
         Parent directory for the throwaway sandbox.
     keep_sandbox
         Leave the sandbox on disk — useful when hand-checking a failure.
+    stderr
+        Callback for the CLI subprocess's stderr, one line at a time. Pass a shared
+        :class:`StderrFilter` across a pass to collapse the per-spawn startup warnings;
+        ``None`` (the default) lets the subprocess stderr inherit the terminal unfiltered.
 
     Returns
     -------
@@ -208,7 +247,7 @@ async def run_once(
             python=target.python,
             package=target.pkg_name,
         )
-        options = _build_options(box=box, model=model, max_turns=max_turns, max_usd=max_usd)
+        options = _build_options(box=box, model=model, max_turns=max_turns, max_usd=max_usd, stderr=stderr)
         try:
             async for message in query(prompt=prompt, options=options):
                 if isinstance(message, ResultMessage):
