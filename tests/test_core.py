@@ -14,7 +14,8 @@ from acumen.bench import build_matrix, pending
 from acumen.config import ConfigError, derive_skill_name, load_config, parse_config
 from acumen.grade import grade_answer, grade_run
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
-from acumen.skills import SkillError, load_skill, skill_hash
+from acumen.prompts import draft_prompt, feedback_block
+from acumen.skills import SkillError, load_skill, read_meta, skill_hash, write_meta
 from acumen.tasks import TaskError, load_tasks, parse_tasks
 
 # --- grading ---------------------------------------------------------------------------
@@ -146,3 +147,38 @@ def test_skill_hash_ignores_meta_json(skills_root: Path) -> None:
 
     (directory / "SKILL.md").write_text("---\nname: target\ndescription: d\n---\nnew body\n")
     assert skill_hash(directory) != before
+
+
+def test_feedback_block_absent_is_empty_and_present_is_subordinated() -> None:
+    """No ``--feedback`` must leave the prompt byte-identical; present text is subordinated."""
+    assert feedback_block(None) == ""
+    assert feedback_block("   ") == ""
+
+    base_kwargs = {
+        "package": "p",
+        "version": "1",
+        "src": Path("/s"),
+        "python": Path("/py"),
+        "out": Path("/o"),
+        "skill_name": "p",
+    }
+    assert draft_prompt(**base_kwargs) == draft_prompt(**base_kwargs, feedback=None)
+
+    steered = draft_prompt(**base_kwargs, feedback="skip the plotting API")
+    assert "skip the plotting API" in steered
+    assert "does NOT override" in steered
+    # Guidance sits after the how-to rules but before the closing deliverable reminder.
+    assert steered.index("skip the plotting API") < steered.index("When you are done")
+
+
+def test_write_meta_persists_feedback_but_omits_it_when_absent(tmp_path: Path) -> None:
+    directory = tmp_path / "v1"
+    directory.mkdir()
+    (directory / "SKILL.md").write_text("---\nname: target\ndescription: d\n---\nbody\n")
+
+    write_meta(directory, parent=None, rationale="initial draft")
+    assert "feedback" not in (directory / "meta.json").read_text()
+    assert read_meta(directory).feedback is None
+
+    write_meta(directory, parent="v1", rationale="fixed", feedback="  emphasise pseudobulk  ")
+    assert read_meta(directory).feedback == "emphasise pseudobulk"

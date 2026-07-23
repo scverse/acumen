@@ -325,6 +325,7 @@ async def improve_skill(
     model: str | None = None,
     max_turns: int | None = None,
     max_usd: float | None = None,
+    feedback: str | None = None,
     log: LiveLog | None = None,
 ) -> ImproveResult:
     """Improve the current skill into the next version from its train-split evidence.
@@ -346,6 +347,10 @@ async def improve_skill(
         The version to improve; defaults to the latest present.
     model, max_turns, max_usd
         Overrides for the improving agent; default to the config's.
+    feedback
+        Optional maintainer guidance, injected into the improve prompt as a subordinated block
+        and recorded in ``meta.json`` as provenance. It is prompt text only — it cannot reach
+        the held-out test split, which stays blocked structurally and by the guard hook.
     log
         A :class:`LiveLog` to stream the agent's messages to and render an HTML log from (M8).
 
@@ -395,6 +400,7 @@ async def improve_skill(
             skill_name=cfg.skill_name,
             parent_version=parent.version,
             new_version=new_version,
+            feedback=feedback,
         )
         options = ClaudeAgentOptions(
             cwd=str(work),
@@ -441,7 +447,7 @@ async def improve_skill(
         rationale = _read_rationale(rationale_path, result, parent.version, new_version)
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(staging, dest)
-        write_meta(dest, parent=parent.version, rationale=rationale)
+        write_meta(dest, parent=parent.version, rationale=rationale, feedback=feedback)
         skill = load_skill(skills_root, new_version, expect_name=cfg.skill_name)
         return ImproveResult(
             skill=skill,

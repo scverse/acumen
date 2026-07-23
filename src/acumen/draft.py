@@ -73,6 +73,7 @@ async def draft_skill(
     max_turns: int | None = None,
     max_usd: float | None = None,
     rationale: str = "initial draft",
+    feedback: str | None = None,
     log: LiveLog | None = None,
 ) -> DraftResult:
     """Draft a new skill version from the target package's source.
@@ -89,6 +90,9 @@ async def draft_skill(
         Overrides for the drafting agent; default to the config's.
     rationale
         Recorded in ``meta.json`` as why this version exists.
+    feedback
+        Optional maintainer guidance, injected into the draft prompt as a subordinated block
+        and recorded in ``meta.json`` as provenance.
     log
         A :class:`LiveLog` to stream the agent's messages to and render an HTML log from (M8).
 
@@ -121,6 +125,7 @@ async def draft_skill(
             python=target.python,
             out=staging,
             skill_name=cfg.skill_name,
+            feedback=feedback,
         )
         options = ClaudeAgentOptions(
             cwd=str(work),
@@ -163,7 +168,7 @@ async def draft_skill(
 
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(staging, dest)
-        write_meta(dest, parent=None, rationale=rationale)
+        write_meta(dest, parent=None, rationale=rationale, feedback=feedback)
         skill = load_skill(skills_root, version, expect_name=cfg.skill_name)
         return DraftResult(
             skill=skill,

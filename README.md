@@ -57,6 +57,13 @@ acumen ship --skill v2           # add a <dist>-install-skills console script (P
 `<dist>-install-skills` command that installs the skill into `~/.claude/skills/`, so the
 package's own users get the guidance with one command.
 
+`acumen tasks`, `acumen draft`, and `acumen improve` each accept `--feedback "…"` to steer the
+agent with context it can't infer — which functionality to skip when generating tasks, what a
+skill should emphasise or fix. The guidance is added to the prompt without overriding the
+train/test isolation, and for `draft`/`improve` it is recorded in the version's `meta.json` and
+shown in the report. (Don't paste held-out test answers into `improve` feedback — that would
+defeat the split.)
+
 `draft`, `improve`, `tasks`, and `ship` each drive a long autonomous agent. Every run writes a
 live `logs/acumen-<command>-<datetime>.jsonl` (one event per step, flushed as it goes — so you
 can watch progress by reading the file) and a rendered `.html` transcript. Add `--stream` to

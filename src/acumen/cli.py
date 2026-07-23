@@ -52,6 +52,17 @@ def _add_log_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_feedback_arg(parser: argparse.ArgumentParser, *, extra: str = "") -> None:
+    """Add the optional ``--feedback`` flag to an authoring subcommand.
+
+    The text is injected into the agent's prompt as a subordinated guidance block; it never
+    overrides the isolation or anti-overfit rules. ``extra`` appends a per-command note to the
+    help text.
+    """
+    help_text = "extra guidance for the agent, injected into its prompt as subordinate guidance"
+    parser.add_argument("--feedback", help=(help_text + extra) or None)
+
+
 def _print_log_result(log: LiveLog) -> None:
     """Print where the rendered HTML log landed, once a run has finalized."""
     if log.html_rendered:
@@ -234,6 +245,7 @@ def _cmd_draft(args: argparse.Namespace) -> int:
                 skills_root=args.skills,
                 max_turns=args.max_turns,
                 max_usd=args.max_usd,
+                feedback=args.feedback,
                 log=log,
             )
         )
@@ -286,6 +298,7 @@ def _cmd_improve(args: argparse.Namespace) -> int:
                 parent_version=parent,
                 max_turns=args.max_turns,
                 max_usd=args.max_usd,
+                feedback=args.feedback,
                 log=log,
             )
         )
@@ -341,6 +354,7 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
                 max_turns=args.max_turns,
                 max_usd=args.max_usd,
                 force=args.force,
+                feedback=args.feedback,
                 log=log,
             )
         )
@@ -446,6 +460,7 @@ def build_parser() -> argparse.ArgumentParser:
     draft.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     draft.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     draft.add_argument("--force", action="store_true", help="draft another version even if some already exist")
+    _add_feedback_arg(draft, extra=" (e.g. package context, what the skill should emphasise)")
     _add_log_args(draft)
     draft.set_defaults(func=_cmd_draft)
 
@@ -460,6 +475,10 @@ def build_parser() -> argparse.ArgumentParser:
     improve.add_argument("--max-usd", type=float, help="override config max_usd for the improving agent")
     improve.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     improve.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
+    _add_feedback_arg(
+        improve,
+        extra=" (e.g. what to fix or emphasise; do NOT paste test-split answers — that defeats the held-out split)",
+    )
     _add_log_args(improve)
     improve.set_defaults(func=_cmd_improve)
 
@@ -472,6 +491,7 @@ def build_parser() -> argparse.ArgumentParser:
     tasks_cmd.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     tasks_cmd.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     tasks_cmd.add_argument("--force", action="store_true", help="overwrite an existing tasks file")
+    _add_feedback_arg(tasks_cmd, extra=" (e.g. which functionality to skip or focus on)")
     _add_log_args(tasks_cmd)
     tasks_cmd.set_defaults(func=_cmd_tasks)
 

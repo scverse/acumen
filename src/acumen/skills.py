@@ -43,10 +43,24 @@ class SkillMeta:
     parent: str | None
     rationale: str
     hash: str
+    #: Maintainer ``--feedback`` that shaped this version, or ``None`` if none was given.
+    feedback: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """Return the ``meta.json`` payload."""
-        return {"version": self.version, "parent": self.parent, "rationale": self.rationale, "hash": self.hash}
+        """Return the ``meta.json`` payload.
+
+        ``feedback`` is omitted when absent, so a version drafted/improved without ``--feedback``
+        writes the same ``meta.json`` it did without the field.
+        """
+        payload: dict[str, Any] = {
+            "version": self.version,
+            "parent": self.parent,
+            "rationale": self.rationale,
+            "hash": self.hash,
+        }
+        if self.feedback:
+            payload["feedback"] = self.feedback
+        return payload
 
 
 @dataclass(frozen=True)
@@ -254,24 +268,31 @@ def read_meta(directory: Path) -> SkillMeta | None:
         raw = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as err:
         raise SkillError(f"cannot read {path}: {err}") from err
+    feedback = raw.get("feedback")
     return SkillMeta(
         version=int(raw.get("version", 0)),
         parent=raw.get("parent"),
         rationale=str(raw.get("rationale", "")),
         hash=str(raw.get("hash", "")),
+        feedback=str(feedback) if feedback else None,
     )
 
 
-def write_meta(directory: Path, *, parent: str | None, rationale: str) -> SkillMeta:
+def write_meta(directory: Path, *, parent: str | None, rationale: str, feedback: str | None = None) -> SkillMeta:
     """Write ``meta.json`` for a skill version, hashing its content as it stands.
 
     Call this only once the skill's content files are final — the hash is computed here.
+
+    ``feedback`` records the maintainer ``--feedback`` that shaped this version, for the
+    report's skill-versions provenance; it is omitted from ``meta.json`` when empty.
     """
+    text = (feedback or "").strip()
     meta = SkillMeta(
         version=version_number(directory.name),
         parent=parent,
         rationale=rationale.strip(),
         hash=skill_hash(directory),
+        feedback=text or None,
     )
     (directory / META_FILE).write_text(json.dumps(meta.to_dict(), indent=2) + "\n")
     return meta

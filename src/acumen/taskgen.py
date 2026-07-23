@@ -283,6 +283,7 @@ async def generate_tasks(
     max_turns: int | None = None,
     max_usd: float | None = None,
     force: bool = False,
+    feedback: str | None = None,
     log: LiveLog | None = None,
 ) -> TaskGenResult:
     """Generate a ``tasks.yaml`` for the target package by mining and executing its analyses.
@@ -309,6 +310,10 @@ async def generate_tasks(
         to bound it.
     force
         Overwrite an existing ``out_path`` (e.g. the placeholder from ``acumen init``).
+    feedback
+        Optional maintainer guidance, injected into the generation prompt as a subordinated
+        block — e.g. which functionality to skip. Nothing but ``tasks.yaml`` is persisted (task
+        generation writes no meta), so the feedback is not recorded on disk.
     log
         A :class:`LiveLog` to stream the agent's messages to and render an HTML log from (M8).
 
@@ -340,6 +345,7 @@ async def generate_tasks(
             src=source_copy,
             python=target.python,
             out=staged,
+            feedback=feedback,
         )
         options = ClaudeAgentOptions(
             cwd=str(work),

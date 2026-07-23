@@ -709,6 +709,7 @@ def _skills_section_html(df: pd.DataFrame, skills_root: Path | None) -> tuple[st
         parent_version = meta.parent if meta else None
         rationale = (meta.rationale if meta else "") or "(no rationale recorded)"
         hash_short = (meta.hash if meta else "")[:19]
+        feedback = meta.feedback if meta else None
 
         parent_content: dict[str, str] | None = None
         if parent_version:
@@ -726,6 +727,7 @@ def _skills_section_html(df: pd.DataFrame, skills_root: Path | None) -> tuple[st
             f'<p class="task-desc">{provenance}'
             f"{f' &middot; {html.escape(hash_short)}…' if hash_short else ''}</p>"
             f'<p class="rationale">{html.escape(rationale)}</p>'
+            f"{f'<p class="rationale"><em>Maintainer feedback:</em> {html.escape(feedback)}</p>' if feedback else ''}"
             f"{_skill_diff_html(parent_content, content)}"
         )
         toc.append(f'<li><a href="#{html.escape(anchor)}">Skill {html.escape(version)}</a></li>')
