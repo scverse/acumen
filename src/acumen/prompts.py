@@ -22,6 +22,10 @@ def feedback_block(feedback: str | None) -> str:
     able to talk an agent out of the isolation rules (test-split, skill-bias) or the anti-overfit
     rules — those are enforced structurally regardless, and the prompt says so.
 
+    Note: feedback steers *within* each command's methodology; it cannot redefine it. It won't,
+    for instance, stop ``tasks`` from running the package to verify answers, nor let ``improve``
+    reach the test split to cheat.
+
     Parameters
     ----------
     feedback
