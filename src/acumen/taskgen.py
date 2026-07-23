@@ -1,10 +1,10 @@
 """The task-generation agent: mine the target package for real analyses and write ``tasks.yaml``.
 
 ``acumen tasks`` autonomously benchmarks the target's *functionalities* — the analyses a user
-would actually run — and writes a benchmark-ready ``tasks.yaml`` (§6, M6). Like the drafter it
+would actually run — and writes a benchmark-ready ``tasks.yaml``. Like the drafter it
 reads the package **source** (it has to understand the API to design a real pipeline) and, like
 no benchmark agent, it also **runs code in the venv**: every ground-truth answer is obtained by
-executing the pipeline and reading the real output, never by copying doc output (§7 risk 8).
+executing the pipeline and reading the real output, never by copying doc output.
 
 There is no test-split guard here (unlike the improver) — no runs exist yet, so there is nothing
 to leak. Isolation is otherwise the same as the other meta-agents: scrubbed env, throwaway
@@ -76,7 +76,7 @@ class TaskGenResult:
     out_path: Path
     cost_usd: float
     turns: int
-    #: Live log paths for this run, when a :class:`LiveLog` was attached (M8).
+    #: Live log paths for this run, when a :class:`LiveLog` was attached.
     log_jsonl: Path | None = None
     log_html: Path | None = None
 
@@ -255,7 +255,7 @@ def dump_tasks(tasks: list[Task]) -> str:
 
     The inverse of :func:`acumen.tasks.load_tasks`. Round-tripping through this is how the
     combined (existing + generated) task set is validated before anything is written to disk.
-    Multi-line prompts are emitted as ``|`` literal blocks so a reviewer can read them (T6).
+    Multi-line prompts are emitted as ``|`` literal blocks so a reviewer can read them.
     """
     doc = {"tasks": [_task_to_dict(task) for task in tasks]}
     return yaml.dump(doc, Dumper=_TaskDumper, sort_keys=False, default_flow_style=False, allow_unicode=True, width=100)
@@ -305,7 +305,7 @@ async def generate_tasks(
     model
         Override for the generation model; defaults to ``cfg.tasks_model``.
     max_turns, max_usd
-        Caps for the generation agent. **Unbounded by default** (§5): generating tasks means
+        Caps for the generation agent. **Unbounded by default**: generating tasks means
         running package code iteratively, so no default budget is imposed — pass explicit caps
         to bound it.
     force
@@ -315,7 +315,7 @@ async def generate_tasks(
         block — e.g. which functionality to skip. Nothing but ``tasks.yaml`` is persisted (task
         generation writes no meta), so the feedback is not recorded on disk.
     log
-        A :class:`LiveLog` to stream the agent's messages to and render an HTML log from (M8).
+        A :class:`LiveLog` to stream the agent's messages to and render an HTML log from.
 
     Returns
     -------
@@ -351,11 +351,11 @@ async def generate_tasks(
             cwd=str(work),
             env=env,
             model=model or cfg.tasks_model,
-            # No default budget cap (§2/§5): only bound the agent if the caller asked.
+            # No default budget cap: only bound the agent if the caller asked.
             max_turns=max_turns,
             max_budget_usd=max_usd,
-            # The generator reads the target source, like the drafter (§6); benchmark agents
-            # never do (§7.3). It points at the *filtered* copy, not the real checkout.
+            # The generator reads the target source, like the drafter; benchmark agents
+            # never do. It points at the *filtered* copy, not the real checkout.
             add_dirs=[str(source_copy)],
             # No skill discovery at all — the generator must not load a skill that would bias it.
             setting_sources=[],
@@ -379,7 +379,7 @@ async def generate_tasks(
         finally:
             # Render the HTML log while the throwaway config dir still holds the native
             # transcript — in a finally so an aborted run (the SDK raises on a cap breach,
-            # after yielding the result) is still inspectable (M8, §8-T5d).
+            # after yielding the result) is still inspectable.
             if log is not None:
                 log.finalize(config_dir=config_dir, work_dir=work, result=result)
 

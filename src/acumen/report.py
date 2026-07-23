@@ -1,9 +1,9 @@
 """Aggregate ``result.json`` files into a self-contained HTML report.
 
-The report reads **only** ``result.json`` — never the transcripts (§4). Each result is
+The report reads **only** ``result.json`` — never the transcripts. Each result is
 the unit of record, so aggregation is just a walk of the run tree, a load per leaf, and a
 few group-bys. Figures are matplotlib rendered to PNG and inlined as base64 data URIs, so
-``report.html`` opens standalone with no sidecar files and no new dependencies (§2).
+``report.html`` opens standalone with no sidecar files and no new dependencies.
 
 The report is regenerated (overwritten) at each skill version — it always reflects every
 run currently on disk across every arm.
@@ -97,7 +97,7 @@ _REPORTED_SPLIT = "test"
 
 
 #: Brand assets bundled with the package (see ``src/acumen/assets``). Inlined as ``data:``
-#: URIs so ``report.html`` stays self-contained (§2) — the favicon and the sidebar banner
+#: URIs so ``report.html`` stays self-contained — the favicon and the sidebar banner
 #: travel inside the HTML, with no sidecar image files.
 _ASSETS = Path(__file__).parent / "assets"
 
@@ -468,7 +468,7 @@ class Report:
 
 
 def _integrity_notes(df: pd.DataFrame) -> list[str]:
-    """Flag arms whose ``skill_loaded`` disagrees with what the arm name claims (§4).
+    """Flag arms whose ``skill_loaded`` disagrees with what the arm name claims.
 
     A skill arm where the Skill tool never fired is not measuring the skill; a noskill run
     where it did fire is not a clean baseline. Either makes the comparison a lie, so it is
@@ -505,7 +505,7 @@ def _loaded_cell(row: pd.Series) -> str:
 
 
 def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
-    """Per-run table with resource use and a link to each run's ``transcript.html`` (§ M3-T5).
+    """Per-run table with resource use and a link to each run's ``transcript.html``.
 
     ``answer`` and ``expected`` are deliberately **not** shown here — they can be long free
     text that would blow out the table width — but they remain columns in the sidecar CSV
@@ -850,7 +850,7 @@ def build_report(
     tasks: Sequence[Task] | None = None,
     skills_root: Path | None = None,
 ) -> Report:
-    """Aggregate the run tree and render ``report.html`` (§ M3-T1..T6).
+    """Aggregate the run tree and render ``report.html``.
 
     The report is overwritten in place, so it always reflects every run on disk.
 
@@ -865,7 +865,7 @@ def build_report(
         per-task heading.
     skills_root
         The ``skills/`` root, if available — used to render each skill version's rationale
-        and its diff against the parent version (§ M5). When ``None``, the section is omitted.
+        and its diff against the parent version. When ``None``, the section is omitted.
 
     Returns
     -------

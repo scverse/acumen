@@ -45,7 +45,7 @@ def _add_bench_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_log_args(parser: argparse.ArgumentParser) -> None:
-    """Add the shared live-log flags to a meta-agent subcommand (M8)."""
+    """Add the shared live-log flags to a meta-agent subcommand."""
     parser.add_argument("--stream", action="store_true", help="mirror the agent's conversation to the terminal live")
     parser.add_argument(
         "--log-dir", type=Path, default=Path("logs"), dest="log_dir", help="directory for the run log (default: logs/)"
@@ -200,7 +200,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     print(f"\n{passed}/{len(outcomes)} passed in {_fmt_secs(progress.elapsed)}  (${total_cost:.2f}, {breakdown})")
 
     # The comparison is only meaningful if the skill actually reached the agent, so say
-    # so rather than leaving it to be discovered later in the transcripts (§7.4).
+    # so rather than leaving it to be discovered later in the transcripts.
     loaded = sum(1 for o in outcomes if o.payload.get("skill_loaded"))
     if skill is not None:
         print(f"skill loaded in {loaded}/{len(outcomes)} runs")
@@ -276,7 +276,7 @@ def _cmd_improve(args: argparse.Namespace) -> int:
         )
         return 2
     parent = args.from_version or latest_version(args.skills)
-    # Immutability guard (§4, T5): the improved version is always the next unused directory,
+    # Immutability guard: the improved version is always the next unused directory,
     # so an existing version is never in the write path. Say the parent plainly up front.
     skill = load_skill(args.skills, parent, expect_name=cfg.skill_name)
     print(f"improving {skill.version} ({skill.name}, {skill.hash[:19]}…) with {cfg.improve_model}")

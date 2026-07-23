@@ -1,4 +1,4 @@
-"""Live agent logs for the meta-agents (M8).
+"""Live agent logs for the meta-agents.
 
 ``draft``/``improve``/``tasks``/``ship`` each spin up one long, autonomous agent whose transcript
 today is written into a throwaway ``CLAUDE_CONFIG_DIR`` and ``rmtree``'d on return — a black box.

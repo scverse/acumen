@@ -72,7 +72,7 @@ def _find_transcript(box: Sandbox, session_id: str) -> Path | None:
 def _skill_fired(jsonl: Path) -> bool | None:
     """Return whether the agent invoked the Skill tool, read from the transcript.
 
-    This is the evidence for M2's done-criterion — the skill arm must show the skill
+    This is the evidence the skill arm actually used the skill — the skill arm must show it
     loading and the baseline must not — so it is recorded per run rather than left to
     hand-inspection. ``None`` means the transcript was unavailable, which is not the same
     as the skill not firing.
@@ -122,15 +122,15 @@ def _build_options(
 ) -> ClaudeAgentOptions:
     """Assemble the SDK options for one run.
 
-    These options are **identical for every arm** — baseline parity (§7.4) means the
+    These options are **identical for every arm** — baseline parity means the
     noskill and skill arms differ only in whether a skill directory exists inside the
     sandbox, never in how the agent is configured.
 
     ``setting_sources`` is always set explicitly, never left to default: the default of
-    ``None`` loads user settings *and* memories (§3, trap 1), and leaving it unset while
-    passing ``skills`` silently re-enables the ``"user"`` source (§3, trap 2).
+    ``None`` loads user settings *and* memories, and leaving it unset while
+    passing ``skills`` silently re-enables the ``"user"`` source.
     ``["project"]`` scopes discovery to ``<sandbox>/.claude/``, which is exactly where
-    the skill is installed — empirically verified in M2-T3, along with the fact that
+    the skill is installed — empirically verified, along with the fact that
     ``[]`` disables skill discovery entirely.
 
     ``skills`` is deliberately left ``None``: with ``setting_sources=["project"]`` the
@@ -234,7 +234,7 @@ async def run_once(
     else:
         terminal = _terminal_reason(result)
         if terminal is not None:
-            # A cap breach is a failure regardless of what landed in answer.md (§2).
+            # A cap breach is a failure regardless of what landed in answer.md.
             success, reason = False, terminal
         else:
             success, reason = grade.success, grade.reason

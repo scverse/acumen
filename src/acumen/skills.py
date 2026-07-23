@@ -1,6 +1,6 @@
 """Skill directories: loading, validation, and a stable content hash.
 
-A skill is a directory — ``SKILL.md`` plus an optional ``references/`` tree (§2) — and
+A skill is a directory — ``SKILL.md`` plus an optional ``references/`` tree — and
 versions are immutable: ``improve`` writes ``skills/v{n+1}/``, never mutates ``v{n}``.
 
 ``meta.json`` is acumen's own bookkeeping (version, parent, rationale, hash), not part of

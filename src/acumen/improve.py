@@ -1,10 +1,10 @@
 """The improving agent: read train evidence, write ``skills/v{n+1}/``.
 
-Where the drafter reads the package *source* to write the first skill (§6), the improver
+Where the drafter reads the package *source* to write the first skill, the improver
 reads how the current skill *performed* — on the TRAIN split only — and edits it. Versions
-are immutable (§4): ``improve`` always writes a new directory, never mutates an existing one.
+are immutable: ``improve`` always writes a new directory, never mutates an existing one.
 
-The load-bearing constraint is §7.1: the improver must never see test results, or the whole
+The load-bearing constraint is that the improver must never see test results, or the whole
 benchmark is worthless. This is enforced two ways, not one:
 
 1. **Structurally.** The agent's ``cwd`` is a throwaway work dir and its readable material
@@ -15,7 +15,7 @@ benchmark is worthless. This is enforced two ways, not one:
    a ``runs/*/test/`` subtree, so even a call that names an absolute path back into the
    project runs tree is refused. See :func:`find_test_access`.
 
-Prompt-level instruction alone is explicitly *not* sufficient (§7.1).
+Prompt-level instruction alone is explicitly *not* sufficient.
 """
 
 from __future__ import annotations
@@ -96,7 +96,7 @@ class ImproveResult:
     turns: int
     n_train_runs: int
     n_train_failures: int
-    #: Live log paths for this run, when a :class:`LiveLog` was attached (M8).
+    #: Live log paths for this run, when a :class:`LiveLog` was attached.
     log_jsonl: Path | None = None
     log_html: Path | None = None
 
@@ -105,7 +105,7 @@ class ImproveResult:
 
 
 def collect_train_runs(runs_root: Path, arm: str, tasks: list[Task]) -> list[TrainRun]:
-    """Collect the parent arm's train-split runs into evidence for the improver (T1).
+    """Collect the parent arm's train-split runs into evidence for the improver.
 
     Walks ``runs_root/<arm>/train`` for ``result.json`` files and pairs each with its task's
     train prompt and ground-truth answer. Only train runs are ever collected — the test
@@ -203,7 +203,7 @@ def _write_material(train_dir: Path, runs: list[TrainRun]) -> None:
     (train_dir / "SUMMARY.md").write_text("\n".join(lines) + "\n")
 
 
-# ── Test-access guard (§7.1) ───────────────────────────────────────────────────────────
+# ── Test-access guard ──────────────────────────────────────────────────────────────────
 
 
 def _blocks(candidate: str, runs_root: Path) -> bool:
@@ -224,7 +224,7 @@ def _blocks(candidate: str, runs_root: Path) -> bool:
 def find_test_access(tool_name: str, tool_input: dict[str, Any], runs_root: Path) -> str | None:
     """Return the first path in a tool call that reaches held-out test results, else ``None``.
 
-    Pure and side-effect free, so the enforcement can be exercised directly (M4-T3) without
+    Pure and side-effect free, so the enforcement can be exercised directly without
     standing up an agent. Checks the path-bearing tool_input keys, and — for shell tools —
     the whitespace/metacharacter-split tokens of the command, since a Bash call can name a
     path no structured field would.
@@ -256,7 +256,7 @@ def find_test_access(tool_name: str, tool_input: dict[str, Any], runs_root: Path
 
 
 def make_test_guard(runs_root: Path) -> HookMatcher:
-    """Build the ``PreToolUse`` hook that denies any access to held-out test results (§7.1).
+    """Build the ``PreToolUse`` hook that denies any access to held-out test results.
 
     ``matcher=None`` fires the hook for every tool. The hook resolves paths against the real
     project ``runs/`` root, so it holds regardless of the agent's ``cwd``.
@@ -291,7 +291,7 @@ def make_test_guard(runs_root: Path) -> HookMatcher:
 def _seed_staging(staging: Path, parent: Skill) -> None:
     """Pre-fill the staging dir with the parent skill's content, so the agent edits in place.
 
-    Only content files are copied — ``meta.json`` is acumen bookkeeping (§4) and is written
+    Only content files are copied — ``meta.json`` is acumen bookkeeping and is written
     fresh once the new version is promoted.
     """
     staging.mkdir(parents=True, exist_ok=True)
@@ -352,7 +352,7 @@ async def improve_skill(
         and recorded in ``meta.json`` as provenance. It is prompt text only — it cannot reach
         the held-out test split, which stays blocked structurally and by the guard hook.
     log
-        A :class:`LiveLog` to stream the agent's messages to and render an HTML log from (M8).
+        A :class:`LiveLog` to stream the agent's messages to and render an HTML log from.
 
     Returns
     -------
@@ -412,7 +412,7 @@ async def improve_skill(
             permission_mode="bypassPermissions",
             system_prompt={"type": "preset", "preset": "claude_code"},
             # Belt-and-braces over the structural isolation: refuse any call that reaches a
-            # held-out test result, wherever the agent points it (§7.1).
+            # held-out test result, wherever the agent points it.
             hooks={"PreToolUse": [make_test_guard(runs_root)]},
         )
 
@@ -429,7 +429,7 @@ async def improve_skill(
         finally:
             # Render the HTML log while the throwaway config dir still holds the native
             # transcript — in a finally so an aborted run (the SDK raises on a cap breach,
-            # after yielding the result) is still inspectable (M8, §8-T5d).
+            # after yielding the result) is still inspectable.
             if log is not None:
                 log.finalize(config_dir=config_dir, work_dir=work, result=result)
 
@@ -473,7 +473,7 @@ def _latest_or_error(skills_root: Path) -> str:
 
 
 def _read_rationale(path: Path, result: ResultMessage, parent: str, new_version: str) -> str:
-    """Recover the agent's rationale for ``meta.json`` (§4).
+    """Recover the agent's rationale for ``meta.json``.
 
     Prefers the ``rationale.md`` the prompt asks for; falls back to the agent's final
     message, then to a plain provenance note, so a version always records why it exists.

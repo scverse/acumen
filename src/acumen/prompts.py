@@ -1,9 +1,9 @@
 """Hardcoded prompts.
 
 The harness preamble carries the entire grading scheme: grading is exact string match on
-``answer.md`` (§2), so any stray word, header or code fence turns a correct run into a
+``answer.md``, so any stray word, header or code fence turns a correct run into a
 recorded failure. It is therefore blunt, repeated, and shows worked good/bad examples —
-see §10.1, which flags format noise as the highest risk in the project.
+answer-format noise is the highest risk in the project.
 """
 
 from __future__ import annotations
@@ -343,7 +343,7 @@ want a per-task override (`max_turns`, `max_usd`, or `model` are the only ones a
 """
 
 
-#: Canonical ``install.py`` the shipping agent adapts (M7). The single placeholder is
+#: Canonical ``install.py`` the shipping agent adapts. The single placeholder is
 #: ``__SKILL_NAME__`` (rendered by :func:`ship_prompt` via ``str.replace`` so the template's
 #: own braces need no escaping). It uses ``__package__`` so the import package name never has
 #: to be edited into it, and ``importlib.resources`` so it reads the skill data from wherever
@@ -551,7 +551,7 @@ def draft_prompt(
 ) -> str:
     """Build the prompt for the drafting agent.
 
-    Unlike a benchmark agent, the drafter gets read access to the target's source (§6) —
+    Unlike a benchmark agent, the drafter gets read access to the target's source —
     it is writing documentation about the package, so it needs to see it.
 
     Parameters
@@ -602,9 +602,9 @@ def improve_prompt(
 ) -> str:
     """Build the prompt for the improving agent.
 
-    Unlike the drafter, the improver never sees the package source (§6) — it works from the
+    Unlike the drafter, the improver never sees the package source — it works from the
     current skill and the *train-split* evidence of how that skill performed. The test split
-    is unreachable, enforced structurally (§7.1), not by this prompt.
+    is unreachable, enforced structurally, not by this prompt.
 
     Parameters
     ----------
@@ -650,9 +650,9 @@ def improve_prompt(
 
 
 def taskgen_prompt(*, package: str, src: Path, python: Path, out: Path, feedback: str | None = None) -> str:
-    """Build the prompt for the task-generation agent (M6).
+    """Build the prompt for the task-generation agent.
 
-    Like the drafter, the generator gets read access to the target's source (§6) — it must
+    Like the drafter, the generator gets read access to the target's source — it must
     understand the API to design real analyses — plus the installed venv, since it obtains
     every ground-truth answer by *executing* the pipeline, never by reading doc output.
 
@@ -697,10 +697,10 @@ def ship_prompt(
     skill_src: Path,
     mode: str,
 ) -> str:
-    """Build the prompt for the shipping agent (M7).
+    """Build the prompt for the shipping agent.
 
     Unlike every other agent, the shipper runs UNISOLATED — real network, git/``gh``
-    credentials, and ``uv`` — because it builds, installs, pushes, and opens a PR (§7 note).
+    credentials, and ``uv`` — because it builds, installs, pushes, and opens a PR.
     It reasons about the package (distribution vs import name, src-vs-flat layout, build
     backend) rather than assuming decoupler's shape, so this is an autonomous agent.
 

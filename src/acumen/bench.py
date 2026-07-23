@@ -41,7 +41,7 @@ def build_matrix(
 ) -> list[PlannedRun]:
     """Expand config and tasks into the full list of runs for one arm.
 
-    A pass is models x tasks x replicates x splits (§2). Both splits always run; only
+    A pass is models x tasks x replicates x splits. Both splits always run; only
     train results are ever shown to the improver, and that is enforced downstream.
 
     Parameters

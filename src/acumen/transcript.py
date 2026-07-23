@@ -2,13 +2,13 @@
 
 The benchmark runner has always done this per run: after an agent finishes, find the
 transcript the ``claude`` CLI wrote (under ``<CLAUDE_CONFIG_DIR>/projects/<key>/<session>.jsonl``),
-copy it into the run dir, and render it to HTML with ``claude-code-log``. M8 factors that
-machinery out here so the four single-agent commands (``draft``/``improve``/``tasks``/``ship``)
+copy it into the run dir, and render it to HTML with ``claude-code-log``. This module factors
+that machinery out here so the four single-agent commands (``draft``/``improve``/``tasks``/``ship``)
 can render an HTML log of their own agent the same way, instead of losing the transcript to the
 ``rmtree`` of a throwaway config dir.
 
 The transcript path is fully determined by the throwaway ``CLAUDE_CONFIG_DIR`` and the agent's
-``cwd`` (both of which acumen sets) plus the ``session_id`` on the ``ResultMessage`` — see §3.
+``cwd`` (both of which acumen sets) plus the ``session_id`` on the ``ResultMessage``.
 """
 
 from __future__ import annotations

@@ -3,7 +3,7 @@
 Once a maintainer has benchmarked a skill and knows which version is best, ``acumen ship
 --skill vN`` packages that version into the target so the package gains a ``<dist>-install-skills``
 console script — one command drops the skill into ``~/.claude/skills/<name>/`` for the package's
-users (§6, M7). For a GitHub URL the change arrives as a pull request the agent opens itself; for
+users. For a GitHub URL the change arrives as a pull request the agent opens itself; for
 a local path it is written straight into the working tree.
 
 The whole point is **generalization**: the agent reasons about the repo — distribution vs import
@@ -12,11 +12,11 @@ draft/improve/taskgen, this is an autonomous agent, not a template stamper. The 
 stages for it is a clean copy of the skill content (``SKILL.md`` + ``references/``, with acumen's
 ``meta.json`` bookkeeping stripped) to be copied verbatim into the wheel.
 
-**Deliberately NOT isolated (§7 note).** Unlike every other agent, the shipper runs in the user's
+**Deliberately NOT isolated.** Unlike every other agent, the shipper runs in the user's
 real environment — real network, real git/``gh`` credentials, real ``uv`` — because it builds,
 installs, pushes, and opens a PR. There is nothing to keep honest here: its output is a PR the
 maintainer reviews (or a working-tree diff), so isolation would only stop it doing its job. The
-correctness gate is therefore not env scrubbing but the **build-verify** the agent performs (§10.11):
+correctness gate is therefore not env scrubbing but the **build-verify** the agent performs:
 build the wheel in a fresh venv, install it, run the entry point, confirm ``SKILL.md`` ships from
 the installed location — the only thing that catches a mis-wired backend shipping a wheel with no
 skill data. That gate lives in the agent's own turns; acumen trusts the agent's report.
@@ -58,7 +58,7 @@ class ShipResult:
     summary: str
     cost_usd: float
     turns: int
-    #: Live log paths for this run, when a :class:`LiveLog` was attached (M8).
+    #: Live log paths for this run, when a :class:`LiveLog` was attached.
     log_jsonl: Path | None = None
     log_html: Path | None = None
 
@@ -125,7 +125,7 @@ def _stage_skill_payload(skill: Skill, dest: Path) -> Path:
 def _ship_env(target: Target) -> dict[str, str]:
     """The environment for the (unisolated) ship agent: the real env, target venv on PATH.
 
-    Unlike the benchmark and meta-agents this is NOT scrubbed (§7 note) — the agent needs real
+    Unlike the benchmark and meta-agents this is NOT scrubbed — the agent needs real
     git/``gh`` credentials, network, and ``uv``. The target venv's ``bin`` is prepended so
     ``python`` resolves to the interpreter with the package installed, matching the other agents;
     everything else the user has (PATH, HOME, credentials, tokens) is carried through untouched.
@@ -184,12 +184,12 @@ async def ship_skill(
     model
         Override for the ship model; defaults to ``cfg.ship_model``.
     max_turns, max_usd
-        Caps for the agent. **Unbounded by default** (§5): shipping builds and installs the
+        Caps for the agent. **Unbounded by default**: shipping builds and installs the
         package iteratively and runs git/``gh``, so no default budget is imposed.
     force
         Proceed even if the target already ships a skills installer (otherwise refused).
     log
-        A :class:`LiveLog` to stream the agent's messages to and render an HTML log from (M8).
+        A :class:`LiveLog` to stream the agent's messages to and render an HTML log from.
 
     Returns
     -------
@@ -221,10 +221,10 @@ async def ship_skill(
         options = ClaudeAgentOptions(
             # The agent edits the checkout in place, so its cwd IS the checkout.
             cwd=str(target.src_dir),
-            # Real environment — NOT scrubbed (§7 note): git/gh creds + network + uv.
+            # Real environment — NOT scrubbed: git/gh creds + network + uv.
             env=_ship_env(target),
             model=model or cfg.ship_model,
-            # No default budget cap (§2/§5): only bound the agent if the caller asked.
+            # No default budget cap: only bound the agent if the caller asked.
             max_turns=max_turns,
             max_budget_usd=max_usd,
             # It reads the staged skill payload to copy into the wheel.
@@ -248,7 +248,7 @@ async def ship_skill(
         finally:
             # The ship agent is unisolated, so its transcript lands under the user's real config
             # dir (not a throwaway). Render the HTML log in a finally so an aborted run (the SDK
-            # raises on a cap breach, after yielding the result) is still inspectable (M8, §8-T5d).
+            # raises on a cap breach, after yielding the result) is still inspectable.
             if log is not None:
                 log.finalize(config_dir=_config_dir(options.env), work_dir=target.src_dir, result=result)
 

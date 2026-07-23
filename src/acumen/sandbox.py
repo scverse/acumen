@@ -1,10 +1,10 @@
 """Per-run sandbox: a fresh empty directory with the target venv on PATH.
 
-The agent sees an installed package and nothing else — no repo source (§7.3), no user
+The agent sees an installed package and nothing else — no repo source, no user
 settings, no memories. Each run gets its own sandbox, throwaway ``HOME`` and throwaway
 ``CLAUDE_CONFIG_DIR``, so runs cannot see each other either.
 
-A skill arm differs from the baseline in exactly one way (§7.4): ``skills/v{n}/`` is
+A skill arm differs from the baseline in exactly one way: ``skills/v{n}/`` is
 copied into ``<sandbox>/.claude/skills/<name>/``, where the agent's own project settings
 discovery finds it. Same prompt, same tools, same caps, same env otherwise.
 """

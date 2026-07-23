@@ -1,12 +1,12 @@
 """The drafting agent: write ``skills/v1/`` from the target package's source.
 
-Unlike a benchmark agent, the drafter reads the target's source (§6) — it is documenting
+Unlike a benchmark agent, the drafter reads the target's source — it is documenting
 the package, so it needs to see it. It is otherwise held to the same isolation: scrubbed
 env, throwaway config dir, no user settings or memories.
 
 The agent writes into a staging directory, not into ``skills/`` directly. Only a skill
 that loads and validates is promoted to a version, so a failed or half-finished draft
-never leaves a broken ``skills/vN/`` behind — versions are immutable (§4), which means
+never leaves a broken ``skills/vN/`` behind — versions are immutable, which means
 they must be right the moment they appear.
 """
 
@@ -45,7 +45,7 @@ class DraftResult:
     skill: Skill
     cost_usd: float
     turns: int
-    #: Live log paths for this run, when a :class:`LiveLog` was attached (M8).
+    #: Live log paths for this run, when a :class:`LiveLog` was attached.
     log_jsonl: Path | None = None
     log_html: Path | None = None
 
@@ -94,7 +94,7 @@ async def draft_skill(
         Optional maintainer guidance, injected into the draft prompt as a subordinated block
         and recorded in ``meta.json`` as provenance.
     log
-        A :class:`LiveLog` to stream the agent's messages to and render an HTML log from (M8).
+        A :class:`LiveLog` to stream the agent's messages to and render an HTML log from.
 
     Returns
     -------
@@ -133,7 +133,7 @@ async def draft_skill(
             model=model or cfg.draft_model,
             max_turns=max_turns or cfg.max_turns,
             max_budget_usd=max_usd or cfg.max_usd,
-            # The drafter reads the target source; benchmark agents never do (§7.3).
+            # The drafter reads the target source; benchmark agents never do.
             add_dirs=[str(target.src_dir)],
             setting_sources=["project"],
             permission_mode="bypassPermissions",
@@ -153,7 +153,7 @@ async def draft_skill(
         finally:
             # Render the HTML log while the throwaway config dir still holds the native
             # transcript — in a finally so an aborted run (the SDK raises on a cap breach,
-            # after yielding the result) is still inspectable (M8, §8-T5d).
+            # after yielding the result) is still inspectable.
             if log is not None:
                 log.finalize(config_dir=config_dir, work_dir=work, result=result)
 
