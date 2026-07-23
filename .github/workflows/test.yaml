@@ -88,7 +88,8 @@ jobs:
       - name: Upload coverage
         uses: codecov/codecov-action@v6
         with:
-          fail_ci_if_error: true
+          # TODO: set back to true once scverse/acumen is onboarded on Codecov
+          fail_ci_if_error: false
           use_oidc: true
 
   # Check that all tests defined above pass. This makes it easy to set a single "required" test in branch
