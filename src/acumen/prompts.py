@@ -76,34 +76,19 @@ Do not leave behind any other files.
 # The format of answer.md — read this twice
 
 `answer.md` is compared to the expected answer by EXACT STRING MATCH, after stripping
-leading and trailing whitespace. The comparison is case-sensitive. There is no human and
-no judge: a single extra word, character, or line makes a correct answer score as WRONG.
+leading and trailing whitespace, case-sensitive. A single extra word, character, or line
+makes a correct answer score as WRONG. Write ONLY the answer — no explanation, no label
+("Answer:"), no quotes, no markdown (headers, bold, bullets, code fences), no trailing
+punctuation.
 
-`answer.md` must contain ONLY the answer itself:
+Worked example. If the answer is `Paris`, the ENTIRE contents of `answer.md` is:
 
-- NO explanation, reasoning, or commentary.
-- NO markdown headers (`#`), bold (`**`), bullets, or code fences (```).
-- NO quotes around the answer.
-- NO label such as "Answer:" or "The answer is".
-- NO trailing period, and no trailing notes.
+Paris
 
-Worked example. If the task were "Which transcription factor is most active?" and the
-correct answer were SPI1, then the ENTIRE contents of `answer.md` must be:
+Not `**Paris**`, not `"Paris"`, not `The answer is Paris.`, not a fenced block.
 
-SPI1
-
-Every one of these is scored as WRONG, even though each contains the right answer:
-
-- `The most active TF is SPI1.`
-- `**SPI1**`
-- `# Answer\\nSPI1`
-- `"SPI1"`
-- ```` ```\\nSPI1\\n``` ````
-- `SPI1 (adjusted p = 0.001)`
-
-If the task asks for a number, write only the number, with exactly the precision the
-task asks for. If it asks for several items, follow the task's stated separator and
-order exactly.
+If the task asks for a number, write only the number at the requested precision. If it
+asks for several items, follow the task's stated separator and order exactly.
 
 # Task
 
