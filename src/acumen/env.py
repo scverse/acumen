@@ -236,6 +236,57 @@ def claude_cli_dir() -> Path | None:
     return Path(found).parent if found else None
 
 
+#: Allowlisted variables that, present and non-empty, let a run authenticate on their own:
+#: a direct Anthropic key/token, or a flag routing to a cloud provider whose own (AWS/GCP)
+#: credentials then apply. A subset of :data:`ENV_ALLOWLIST` — the entries that carry or
+#: enable authentication, as opposed to proxy/TLS routing.
+AUTH_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+)
+
+
+def _credentials_path() -> Path:
+    """The user's Claude OAuth credentials file — what :func:`seed_credentials` copies."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"
+    return Path(base) / ".credentials.json"
+
+
+def auth_available() -> bool:
+    """Whether an agent run could authenticate to the Claude API.
+
+    A run gets its credential one of two ways: an allowlisted auth variable in the
+    environment (a direct Anthropic key/token, or a Bedrock/Vertex routing flag whose own
+    cloud credentials then apply), or a Claude credentials file that
+    :func:`seed_credentials` copies into the throwaway config dir (an OAuth login). An
+    empty variable does not count.
+    """
+    if any(os.environ.get(var) for var in AUTH_ENV_VARS):
+        return True
+    return _credentials_path().is_file()
+
+
+def check_auth() -> None:
+    """Raise :class:`EnvError` if no credential is reachable for an agent run.
+
+    A preflight guard for the agentic commands. Without it an unauthenticated ``bench``
+    would run the whole matrix, record every run as an ``error``, and still exit 0, while
+    the meta-agents (``draft``/``improve``/``tasks``/``ship``) would fail deep in the SDK
+    with a raw message — so fail early, before the costly target prep, with a clear fix.
+    """
+    if auth_available():
+        return
+    raise EnvError(
+        "no Claude credentials found — an agent run cannot authenticate. Set "
+        "ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_OAUTH_TOKEN), enable a "
+        "provider with CLAUDE_CODE_USE_BEDROCK / CLAUDE_CODE_USE_VERTEX, or log in with "
+        "`claude` so ~/.claude/.credentials.json exists."
+    )
+
+
 def seed_credentials(config_dir: Path) -> bool:
     """Copy the user's Claude credentials into a throwaway config dir.
 
@@ -248,7 +299,7 @@ def seed_credentials(config_dir: Path) -> bool:
     -------
     Whether a credentials file was found and copied.
     """
-    real = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / ".credentials.json"
+    real = _credentials_path()
     if not real.is_file():
         return False
     config_dir.mkdir(parents=True, exist_ok=True)

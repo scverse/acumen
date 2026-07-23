@@ -12,6 +12,7 @@ import pytest
 
 from acumen.bench import build_matrix, pending
 from acumen.config import ConfigError, derive_skill_name, load_config, parse_config
+from acumen.env import AUTH_ENV_VARS, EnvError, auth_available, check_auth
 from acumen.grade import grade_answer, grade_run
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
 from acumen.prompts import draft_prompt, feedback_block
@@ -182,3 +183,34 @@ def test_write_meta_persists_feedback_but_omits_it_when_absent(tmp_path: Path) -
 
     write_meta(directory, parent="v1", rationale="fixed", feedback="  emphasise pseudobulk  ")
     assert read_meta(directory).feedback == "emphasise pseudobulk"
+
+
+# --- auth preflight --------------------------------------------------------------------
+
+
+def test_auth_preflight(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Point credential discovery at an empty throwaway dir and strip every auth variable,
+    # so the only auth in play is what the test sets.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    for var in AUTH_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+    # No variable and no credentials file → unauthenticated, and check_auth fails loudly.
+    assert auth_available() is False
+    with pytest.raises(EnvError, match="no Claude credentials"):
+        check_auth()
+
+    # An empty variable does not count.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+    assert auth_available() is False
+
+    # A non-empty auth variable authenticates.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    assert auth_available() is True
+    check_auth()  # does not raise
+
+    # So does a seeded credentials file, even with no auth variable set.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    (tmp_path / ".credentials.json").write_text("{}")
+    assert auth_available() is True
+    check_auth()

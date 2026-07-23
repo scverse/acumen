@@ -5,7 +5,7 @@ from importlib.metadata import version
 from acumen.bench import PlannedRun, build_matrix, pending, run_matrix, summarize
 from acumen.config import Config, ConfigError, load_config, parse_config
 from acumen.draft import DraftError, DraftResult, draft_skill
-from acumen.env import EnvError, Target, prepare_target, scrubbed_env
+from acumen.env import EnvError, Target, auth_available, check_auth, prepare_target, scrubbed_env
 from acumen.grade import Grade, Reason, grade_answer, grade_run
 from acumen.improve import (
     ImproveError,
@@ -80,7 +80,9 @@ __all__ = [
     "__version__",
     "arm_metrics",
     "arm_name",
+    "auth_available",
     "available_versions",
+    "check_auth",
     "build_filtered_source",
     "build_matrix",
     "build_report",

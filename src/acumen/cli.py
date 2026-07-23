@@ -12,7 +12,7 @@ from pathlib import Path
 from acumen.bench import build_matrix, pending, run_matrix, summarize
 from acumen.config import ConfigError, load_config
 from acumen.draft import DraftError, draft_skill
-from acumen.env import DEFAULT_CACHE_ROOT, EnvError, prepare_target
+from acumen.env import DEFAULT_CACHE_ROOT, EnvError, check_auth, prepare_target
 from acumen.improve import ImproveError, improve_skill
 from acumen.logs import LiveLog
 from acumen.paths import SPLITS
@@ -174,6 +174,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     if not todo:
         return 0
 
+    check_auth()
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]} (venv {target.venv_dir})", flush=True)
@@ -230,6 +231,7 @@ def _cmd_draft(args: argparse.Namespace) -> int:
         )
         return 2
 
+    check_auth()
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
@@ -281,6 +283,7 @@ def _cmd_improve(args: argparse.Namespace) -> int:
     skill = load_skill(args.skills, parent, expect_name=cfg.skill_name)
     print(f"improving {skill.version} ({skill.name}, {skill.hash[:19]}…) with {cfg.improve_model}")
 
+    check_auth()
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
@@ -335,6 +338,7 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
         )
         return 2
 
+    check_auth()
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
@@ -380,6 +384,7 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         else ("a GitHub URL — the change is delivered as a pull request")
     )
     print(f"shipping {args.version} of {cfg.skill_name} into {cfg.repo} ({where})")
+    check_auth()
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
