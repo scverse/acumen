@@ -40,7 +40,7 @@ import yaml
 from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, ResultMessage, query
 
 from acumen.config import Config
-from acumen.env import Target, scrubbed_env, seed_credentials
+from acumen.env import AuthMode, Target, build_agent_env
 from acumen.logs import LiveLog
 from acumen.prompts import taskgen_prompt
 from acumen.tasks import Task, TaskError, load_tasks
@@ -279,6 +279,7 @@ async def generate_tasks(
     cfg: Config,
     target: Target,
     out_path: Path,
+    auth_mode: AuthMode = "session",
     model: str | None = None,
     max_turns: int | None = None,
     max_usd: float | None = None,
@@ -295,6 +296,9 @@ async def generate_tasks(
     target
         The prepared target, supplying the source checkout and the interpreter to run
         pipelines against for ground truth.
+    auth_mode
+        Which credential the generation agent authenticates with — ``"session"`` (the Claude
+        subscription) or ``"api"`` (see :func:`acumen.env.build_agent_env`).
     out_path
         Where the tasks are written. Refuses to overwrite an existing file unless ``force``
         is set. There is deliberately no "append" mode: the agent generates blind to the
@@ -337,8 +341,7 @@ async def generate_tasks(
         # real checkout — so existing skills cannot bias the tasks it generates.
         source_copy = build_filtered_source(target.src_dir, holder / "source")
 
-        seed_credentials(config_dir)
-        env = scrubbed_env(config_dir=config_dir, home=home, extra_path=[target.bin_dir])
+        env = build_agent_env(config_dir=config_dir, home=home, extra_path=[target.bin_dir], auth_mode=auth_mode)
 
         prompt = taskgen_prompt(
             package=target.pkg_name,

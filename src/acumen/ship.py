@@ -34,7 +34,7 @@ from pathlib import Path
 from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
 from acumen.config import Config
-from acumen.env import Target, claude_cli_dir
+from acumen.env import API_AUTH_ENV_VARS, SESSION_AUTH_ENV_VAR, AuthMode, Target, claude_cli_dir
 from acumen.logs import LiveLog
 from acumen.prompts import ship_prompt
 from acumen.skills import Skill, content_files, load_skill
@@ -122,15 +122,23 @@ def _stage_skill_payload(skill: Skill, dest: Path) -> Path:
     return dest
 
 
-def _ship_env(target: Target) -> dict[str, str]:
+def _ship_env(target: Target, auth_mode: AuthMode) -> dict[str, str]:
     """The environment for the (unisolated) ship agent: the real env, target venv on PATH.
 
     Unlike the benchmark and meta-agents this is NOT scrubbed — the agent needs real
     git/``gh`` credentials, network, and ``uv``. The target venv's ``bin`` is prepended so
     ``python`` resolves to the interpreter with the package installed, matching the other agents;
     everything else the user has (PATH, HOME, credentials, tokens) is carried through untouched.
+
+    The one exception is the model credential: to bill the chosen ``auth_mode`` deterministically
+    we drop the *other* mode's variables — ``"session"`` removes the metered API/cloud keys (the
+    user's real ``~/.claude`` OAuth login then authenticates), ``"api"`` removes the subscription
+    OAuth token (the API key then wins). Everything non-credential is still carried through.
     """
     env = dict(os.environ)
+    drop = API_AUTH_ENV_VARS if auth_mode == "session" else (SESSION_AUTH_ENV_VAR,)
+    for var in drop:
+        env.pop(var, None)
     parts = [str(target.bin_dir)]
     cli_dir = claude_cli_dir()
     if cli_dir is not None:
@@ -161,6 +169,7 @@ async def ship_skill(
     target: Target,
     skills_root: Path,
     version: str,
+    auth_mode: AuthMode = "session",
     model: str | None = None,
     max_turns: int | None = None,
     max_usd: float | None = None,
@@ -181,6 +190,10 @@ async def ship_skill(
         The ``skills/`` root; ``version`` is loaded and validated from it.
     version
         The skill version to ship, e.g. ``v2``. Required — there is no implicit "latest"/"best".
+    auth_mode
+        Which credential the ship agent authenticates with — ``"session"`` (the Claude
+        subscription) or ``"api"``. Only the model credential is affected; the agent still runs
+        in the user's real environment with real git/``gh``/network access.
     model
         Override for the ship model; defaults to ``cfg.ship_model``.
     max_turns, max_usd
@@ -222,7 +235,7 @@ async def ship_skill(
             # The agent edits the checkout in place, so its cwd IS the checkout.
             cwd=str(target.src_dir),
             # Real environment — NOT scrubbed: git/gh creds + network + uv.
-            env=_ship_env(target),
+            env=_ship_env(target, auth_mode),
             model=model or cfg.ship_model,
             # No default budget cap: only bound the agent if the caller asked.
             max_turns=max_turns,

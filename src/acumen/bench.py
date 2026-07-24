@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from acumen.config import Config
-from acumen.env import Target
+from acumen.env import AuthMode, Target
 from acumen.paths import SPLITS, RunKey, Split, arm_name, is_complete, run_dir
 from acumen.runner import RunOutcome, run_once
 from acumen.skills import Skill
@@ -105,6 +105,7 @@ async def run_matrix(
     target: Target,
     runs_root: Path,
     max_concurrency: int,
+    auth_mode: AuthMode = "api",
     skill: Skill | None = None,
     sandbox_base: Path | None = None,
     keep_sandbox: bool = False,
@@ -127,6 +128,9 @@ async def run_matrix(
         The ``runs/`` root.
     max_concurrency
         Ceiling on simultaneous agents.
+    auth_mode
+        Which credential every run authenticates with; benchmark passes always use ``"api"``
+        so the recorded ``cost_usd`` reflects real metered spend.
     skill
         The skill every run in this matrix installs, or ``None`` for the baseline. One
         matrix is one arm, so this is a property of the pass rather than of a run.
@@ -164,6 +168,7 @@ async def run_matrix(
                 model=item.model,
                 max_turns=item.max_turns,
                 max_usd=item.max_usd,
+                auth_mode=auth_mode,
                 skill=skill,
                 sandbox_base=sandbox_base,
                 keep_sandbox=keep_sandbox,

@@ -20,7 +20,7 @@ from pathlib import Path
 from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
 from acumen.config import Config
-from acumen.env import Target, scrubbed_env, seed_credentials
+from acumen.env import AuthMode, Target, build_agent_env
 from acumen.logs import LiveLog
 from acumen.prompts import draft_prompt
 from acumen.skills import (
@@ -69,6 +69,7 @@ async def draft_skill(
     cfg: Config,
     target: Target,
     skills_root: Path,
+    auth_mode: AuthMode = "session",
     model: str | None = None,
     max_turns: int | None = None,
     max_usd: float | None = None,
@@ -86,6 +87,9 @@ async def draft_skill(
         The prepared target, supplying the source checkout and interpreter.
     skills_root
         The ``skills/`` root. The new version is the next unused one.
+    auth_mode
+        Which credential the drafting agent authenticates with — ``"session"`` (the Claude
+        subscription) or ``"api"`` (see :func:`acumen.env.build_agent_env`).
     model, max_turns
         Overrides for the drafting agent; default to the config's.
     max_usd
@@ -118,8 +122,7 @@ async def draft_skill(
         for path in (staging, home, config_dir, home / "tmp"):
             path.mkdir(parents=True, exist_ok=True)
 
-        seed_credentials(config_dir)
-        env = scrubbed_env(config_dir=config_dir, home=home, extra_path=[target.bin_dir])
+        env = build_agent_env(config_dir=config_dir, home=home, extra_path=[target.bin_dir], auth_mode=auth_mode)
 
         prompt = draft_prompt(
             package=target.pkg_name,

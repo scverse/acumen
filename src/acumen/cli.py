@@ -12,7 +12,7 @@ from pathlib import Path
 from acumen.bench import build_matrix, pending, run_matrix, summarize
 from acumen.config import ConfigError, load_config
 from acumen.draft import DraftError, draft_skill
-from acumen.env import DEFAULT_CACHE_ROOT, EnvError, check_auth, prepare_target
+from acumen.env import DEFAULT_CACHE_ROOT, AuthMode, EnvError, prepare_target, resolve_auth_mode
 from acumen.improve import ImproveError, improve_skill
 from acumen.logs import LiveLog
 from acumen.paths import SPLITS
@@ -61,6 +61,28 @@ def _add_feedback_arg(parser: argparse.ArgumentParser, *, extra: str = "") -> No
     """
     help_text = "extra guidance for the agent, injected into its prompt as subordinate guidance"
     parser.add_argument("--feedback", help=(help_text + extra) or None)
+
+
+def _add_auth_arg(parser: argparse.ArgumentParser) -> None:
+    """Add the ``--auth`` flag to a single-agent subcommand.
+
+    These commands spawn one agent, so they default to the Claude subscription ("session")
+    when a subscription login is present and fall back to the API key otherwise. ``bench`` has
+    no such flag — it always bills the API so its recorded ``cost_usd`` is real.
+    """
+    parser.add_argument(
+        "--auth",
+        choices=("auto", "session", "api"),
+        default="auto",
+        help="which credential to bill: 'session' (Claude subscription), 'api' (Anthropic API), "
+        "or 'auto' (default: session if you're logged in, else the API)",
+    )
+
+
+def _print_auth(mode: AuthMode) -> None:
+    """Report which credential the run will bill, so the choice is never silent."""
+    label = "Claude subscription (session)" if mode == "session" else "API key"
+    print(f"auth: {label}", flush=True)
 
 
 def _print_log_result(log: LiveLog) -> None:
@@ -174,7 +196,8 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     if not todo:
         return 0
 
-    check_auth()
+    # bench records real per-run cost, so it must bill the API — never the subscription.
+    auth_mode = resolve_auth_mode("api", allow_session=False)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]} (venv {target.venv_dir})", flush=True)
@@ -187,6 +210,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
             target=target,
             runs_root=args.runs,
             max_concurrency=cfg.max_concurrency,
+            auth_mode=auth_mode,
             skill=skill,
             keep_sandbox=args.keep_sandboxes,
             stderr=StderrFilter(),
@@ -232,7 +256,8 @@ def _cmd_draft(args: argparse.Namespace) -> int:
         )
         return 2
 
-    check_auth()
+    auth_mode = resolve_auth_mode(args.auth, allow_session=True)
+    _print_auth(auth_mode)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
@@ -246,6 +271,7 @@ def _cmd_draft(args: argparse.Namespace) -> int:
                 cfg=cfg,
                 target=target,
                 skills_root=args.skills,
+                auth_mode=auth_mode,
                 max_turns=args.max_turns,
                 max_usd=args.max_usd,
                 feedback=args.feedback,
@@ -284,7 +310,8 @@ def _cmd_improve(args: argparse.Namespace) -> int:
     skill = load_skill(args.skills, parent, expect_name=cfg.skill_name)
     print(f"improving {skill.version} ({skill.name}, {skill.hash[:19]}…) with {cfg.improve_model}")
 
-    check_auth()
+    auth_mode = resolve_auth_mode(args.auth, allow_session=True)
+    _print_auth(auth_mode)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
@@ -299,6 +326,7 @@ def _cmd_improve(args: argparse.Namespace) -> int:
                 skills_root=args.skills,
                 runs_root=args.runs,
                 tasks=tasks,
+                auth_mode=auth_mode,
                 parent_version=parent,
                 max_turns=args.max_turns,
                 max_usd=args.max_usd,
@@ -339,7 +367,8 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
         )
         return 2
 
-    check_auth()
+    auth_mode = resolve_auth_mode(args.auth, allow_session=True)
+    _print_auth(auth_mode)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
@@ -356,6 +385,7 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
                 cfg=cfg,
                 target=target,
                 out_path=out,
+                auth_mode=auth_mode,
                 max_turns=args.max_turns,
                 max_usd=args.max_usd,
                 force=args.force,
@@ -385,7 +415,8 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         else ("a GitHub URL — the change is delivered as a pull request")
     )
     print(f"shipping {args.version} of {cfg.skill_name} into {cfg.repo} ({where})")
-    check_auth()
+    auth_mode = resolve_auth_mode(args.auth, allow_session=True)
+    _print_auth(auth_mode)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
@@ -404,6 +435,7 @@ def _cmd_ship(args: argparse.Namespace) -> int:
                 target=target,
                 skills_root=args.skills,
                 version=args.version,
+                auth_mode=auth_mode,
                 max_turns=args.max_turns,
                 max_usd=args.max_usd,
                 force=args.force,
@@ -466,6 +498,7 @@ def build_parser() -> argparse.ArgumentParser:
     draft.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     draft.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     draft.add_argument("--force", action="store_true", help="draft another version even if some already exist")
+    _add_auth_arg(draft)
     _add_feedback_arg(draft, extra=" (e.g. package context, what the skill should emphasise)")
     _add_log_args(draft)
     draft.set_defaults(func=_cmd_draft)
@@ -481,6 +514,7 @@ def build_parser() -> argparse.ArgumentParser:
     improve.add_argument("--max-usd", type=float, help="override config max_usd for the improving agent")
     improve.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     improve.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
+    _add_auth_arg(improve)
     _add_feedback_arg(
         improve,
         extra=" (e.g. what to fix or emphasise; do NOT paste test-split answers — that defeats the held-out split)",
@@ -497,6 +531,7 @@ def build_parser() -> argparse.ArgumentParser:
     tasks_cmd.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     tasks_cmd.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     tasks_cmd.add_argument("--force", action="store_true", help="overwrite an existing tasks file")
+    _add_auth_arg(tasks_cmd)
     _add_feedback_arg(tasks_cmd, extra=" (e.g. which functionality to skip or focus on)")
     _add_log_args(tasks_cmd)
     tasks_cmd.set_defaults(func=_cmd_tasks)
@@ -513,6 +548,7 @@ def build_parser() -> argparse.ArgumentParser:
     ship.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     ship.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     ship.add_argument("--force", action="store_true", help="ship even if the package already has an installer")
+    _add_auth_arg(ship)
     _add_log_args(ship)
     ship.set_defaults(func=_cmd_ship)
 

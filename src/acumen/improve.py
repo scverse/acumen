@@ -30,7 +30,7 @@ from typing import Any
 from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, ResultMessage, query
 
 from acumen.config import Config
-from acumen.env import Target, scrubbed_env, seed_credentials
+from acumen.env import AuthMode, Target, build_agent_env
 from acumen.logs import LiveLog
 from acumen.paths import (
     ANSWER_FILE,
@@ -321,6 +321,7 @@ async def improve_skill(
     skills_root: Path,
     runs_root: Path,
     tasks: list[Task],
+    auth_mode: AuthMode = "session",
     parent_version: str | None = None,
     model: str | None = None,
     max_turns: int | None = None,
@@ -343,6 +344,9 @@ async def improve_skill(
         The ``runs/`` root, read for train evidence and guarded against test access.
     tasks
         The loaded tasks, to pair runs with their prompts and expected answers.
+    auth_mode
+        Which credential the improving agent authenticates with — ``"session"`` (the Claude
+        subscription) or ``"api"`` (see :func:`acumen.env.build_agent_env`).
     parent_version
         The version to improve; defaults to the latest present.
     model, max_turns
@@ -390,8 +394,7 @@ async def improve_skill(
         _seed_staging(staging, parent)
         _write_material(train_dir, train_runs)
 
-        seed_credentials(config_dir)
-        env = scrubbed_env(config_dir=config_dir, home=home, extra_path=[target.bin_dir])
+        env = build_agent_env(config_dir=config_dir, home=home, extra_path=[target.bin_dir], auth_mode=auth_mode)
 
         prompt = improve_prompt(
             package=target.pkg_name,

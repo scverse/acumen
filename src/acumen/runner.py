@@ -17,7 +17,7 @@ from typing import TextIO
 
 from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
-from acumen.env import Target, sdk_version
+from acumen.env import AuthMode, Target, sdk_version
 from acumen.grade import Grade, Reason, grade_run
 from acumen.paths import (
     ANSWER_FILE,
@@ -193,6 +193,7 @@ async def run_once(
     model: str,
     max_turns: int,
     max_usd: float,
+    auth_mode: AuthMode = "api",
     skill: Skill | None = None,
     sandbox_base: Path | None = None,
     keep_sandbox: bool = False,
@@ -212,6 +213,9 @@ async def run_once(
         Where the five run files are written.
     model, max_turns, max_usd
         Already resolved against per-task overrides by the caller.
+    auth_mode
+        Which credential benchmark runs authenticate with; always ``"api"`` so the recorded
+        ``cost_usd`` reflects real metered spend.
     skill
         The skill to install, or ``None`` for the baseline arm. Must agree with
         ``key.arm``, else the run would be filed under an arm it doesn't belong to.
@@ -240,7 +244,7 @@ async def run_once(
     result: ResultMessage | None = None
     error: str | None = None
 
-    with sandbox(target, base=sandbox_base, keep=keep_sandbox, skill=skill) as box:
+    with sandbox(target, auth_mode=auth_mode, base=sandbox_base, keep=keep_sandbox, skill=skill) as box:
         prompt = benchmark_prompt(
             split.prompt,
             sandbox=box.root,

@@ -21,6 +21,7 @@ import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from acumen.config import Config
 from acumen.paths import slugify
@@ -248,6 +249,26 @@ AUTH_ENV_VARS = (
     "CLAUDE_CODE_USE_VERTEX",
 )
 
+#: A resolved authentication mode for an agent run. ``"session"`` bills the user's Claude
+#: subscription via an OAuth login; ``"api"`` bills the Anthropic API (or a cloud provider)
+#: per token — the only mode that yields the real ``cost_usd`` the benchmark records.
+AuthMode = Literal["session", "api"]
+
+#: Allowlisted variables that carry *metered* (API/cloud) authentication, as distinct from a
+#: subscription OAuth login. A subset of :data:`AUTH_ENV_VARS` that deliberately excludes
+#: ``CLAUDE_CODE_OAUTH_TOKEN`` — that token bills the subscription, not the API. A run in
+#: ``"api"`` mode keeps these and drops the OAuth token; a ``"session"`` run does the reverse.
+API_AUTH_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+)
+
+#: The subscription (OAuth) token variable — a portable ``claude setup-token`` credential.
+#: Kept in ``"session"`` mode and dropped in ``"api"`` mode so exactly one auth path is live.
+SESSION_AUTH_ENV_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
+
 
 def _credentials_path() -> Path:
     """The user's Claude OAuth credentials file — what :func:`seed_credentials` copies."""
@@ -287,6 +308,110 @@ def check_auth() -> None:
     )
 
 
+def _has_oauth_credentials() -> bool:
+    """Whether the user's credentials file holds a Claude subscription (OAuth) login.
+
+    ``claude`` login writes ``.credentials.json`` as ``{"claudeAiOauth": {...}}`` — the
+    presence of that object is what distinguishes a subscription login from a bare API-key
+    setup, and it is the signal that "session usage" is available. A missing, unreadable, or
+    API-only credentials file is not a subscription.
+    """
+    try:
+        data = json.loads(_credentials_path().read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(data.get("claudeAiOauth"), dict)
+
+
+def session_auth_available() -> bool:
+    """Whether an agent run could bill the Claude subscription ("session usage").
+
+    True when a portable ``CLAUDE_CODE_OAUTH_TOKEN`` is set, or the user has a subscription
+    OAuth login on disk (:func:`_has_oauth_credentials`). An empty variable does not count.
+    """
+    if os.environ.get(SESSION_AUTH_ENV_VAR):
+        return True
+    return _has_oauth_credentials()
+
+
+def api_auth_available() -> bool:
+    """Whether an agent run could bill the Anthropic API (or a cloud provider) per token.
+
+    True when any metered auth variable is set (:data:`API_AUTH_ENV_VARS`): a direct
+    Anthropic key/token, or a Bedrock/Vertex routing flag whose own cloud credentials then
+    apply. The subscription OAuth token is deliberately excluded — it bills the plan, not
+    the API. An empty variable does not count.
+    """
+    return any(os.environ.get(var) for var in API_AUTH_ENV_VARS)
+
+
+def resolve_auth_mode(requested: str, *, allow_session: bool) -> AuthMode:
+    """Resolve a requested auth choice to the concrete mode a run will use, or fail loudly.
+
+    A preflight guard that replaces :func:`check_auth` on the agentic commands: it both
+    validates that the chosen credential is actually reachable and reports which mode the
+    run will bill, so the choice is never silent.
+
+    Parameters
+    ----------
+    requested
+        The user's choice: ``"auto"`` (prefer the subscription, else the API), ``"session"``
+        (force the subscription), or ``"api"`` (force the API).
+    allow_session
+        Whether the subscription is a permitted mode. ``bench`` passes ``False`` because it
+        records real per-run ``cost_usd``, which only means anything under metered API
+        billing — so bench always resolves to ``"api"`` and rejects ``"session"``.
+
+    Returns
+    -------
+    ``"session"`` or ``"api"``.
+    """
+    if not allow_session:
+        if requested == "session":
+            raise EnvError(
+                "bench records real per-run cost and must bill the API, so --auth session is "
+                "not available for it — the Claude subscription does not meter per-run spend. "
+                "Run the single-agent commands (draft/improve/tasks/ship) on the session instead."
+            )
+        if not api_auth_available():
+            raise EnvError(
+                "no API credential found — bench must bill the API. Set ANTHROPIC_API_KEY (or "
+                "ANTHROPIC_AUTH_TOKEN), or enable a provider with CLAUDE_CODE_USE_BEDROCK / "
+                "CLAUDE_CODE_USE_VERTEX."
+            )
+        return "api"
+
+    if requested == "session":
+        if not session_auth_available():
+            raise EnvError(
+                "no Claude subscription login found for --auth session. Log in with `claude` so "
+                "~/.claude/.credentials.json exists, or set CLAUDE_CODE_OAUTH_TOKEN (from "
+                "`claude setup-token`)."
+            )
+        return "session"
+    if requested == "api":
+        if not api_auth_available():
+            raise EnvError(
+                "no API credential found for --auth api. Set ANTHROPIC_API_KEY (or "
+                "ANTHROPIC_AUTH_TOKEN), or enable a provider with CLAUDE_CODE_USE_BEDROCK / "
+                "CLAUDE_CODE_USE_VERTEX."
+            )
+        return "api"
+
+    # "auto": prefer the subscription (it's what the user is paying a flat rate for), fall
+    # back to the metered API, and only then give up.
+    if session_auth_available():
+        return "session"
+    if api_auth_available():
+        return "api"
+    raise EnvError(
+        "no Claude credentials found — an agent run cannot authenticate. Log in with `claude` "
+        "so ~/.claude/.credentials.json exists (subscription), or set ANTHROPIC_API_KEY (or "
+        "ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_OAUTH_TOKEN), or enable a provider with "
+        "CLAUDE_CODE_USE_BEDROCK / CLAUDE_CODE_USE_VERTEX."
+    )
+
+
 def seed_credentials(config_dir: Path) -> bool:
     """Copy the user's Claude credentials into a throwaway config dir.
 
@@ -309,7 +434,31 @@ def seed_credentials(config_dir: Path) -> bool:
     return True
 
 
-def scrubbed_env(*, config_dir: Path, home: Path, extra_path: list[Path] | None = None) -> dict[str, str]:
+def _apply_auth_mode(env: dict[str, str], auth_mode: AuthMode | None) -> None:
+    """Drop the credential variables that the chosen mode must not authenticate with.
+
+    So exactly one auth path is live: ``"session"`` removes the metered API/cloud variables
+    and keeps the subscription OAuth token; ``"api"`` removes the OAuth token and keeps the
+    metered ones. ``None`` leaves the allowlisted credentials untouched (the historical
+    behavior, for callers that don't select a mode).
+    """
+    if auth_mode == "session":
+        drop = API_AUTH_ENV_VARS
+    elif auth_mode == "api":
+        drop = (SESSION_AUTH_ENV_VAR,)
+    else:
+        return
+    for var in drop:
+        env.pop(var, None)
+
+
+def scrubbed_env(
+    *,
+    config_dir: Path,
+    home: Path,
+    extra_path: list[Path] | None = None,
+    auth_mode: AuthMode | None = None,
+) -> dict[str, str]:
     """Build the environment an isolated agent runs under.
 
     Everything outside :data:`ENV_ALLOWLIST` is dropped. ``HOME`` and
@@ -325,12 +474,19 @@ def scrubbed_env(*, config_dir: Path, home: Path, extra_path: list[Path] | None 
     extra_path
         Directories to prepend to ``PATH`` — the target venv's ``bin`` goes here, so
         ``python`` in the sandbox is the interpreter with the package installed.
+    auth_mode
+        Which credential the run should authenticate with. ``"session"`` keeps only the
+        subscription OAuth token, ``"api"`` keeps only the metered API/cloud credentials, and
+        ``None`` leaves both in place (the historical behavior). Note that ``"session"`` needs
+        :func:`seed_credentials` to have placed the OAuth login in ``config_dir`` — pair the
+        two via :func:`build_agent_env`.
 
     Returns
     -------
     The environment mapping to hand to the SDK.
     """
     env = {key: os.environ[key] for key in ENV_ALLOWLIST if key in os.environ}
+    _apply_auth_mode(env, auth_mode)
 
     path_parts = [str(p) for p in (extra_path or [])]
     cli_dir = claude_cli_dir()
@@ -361,6 +517,29 @@ def scrubbed_env(*, config_dir: Path, home: Path, extra_path: list[Path] | None 
     env["XDG_CONFIG_HOME"] = str(home / ".config")
     env["XDG_CACHE_HOME"] = str(home / ".cache")
     return env
+
+
+def build_agent_env(
+    *,
+    config_dir: Path,
+    home: Path,
+    extra_path: list[Path] | None = None,
+    auth_mode: AuthMode,
+) -> dict[str, str]:
+    """Prepare an isolated agent's environment for a resolved auth mode.
+
+    Pairs the two steps that must agree: in ``"session"`` mode the subscription OAuth login is
+    seeded into ``config_dir`` (only ``.credentials.json`` is copied — never settings, memories,
+    or skills, so isolation is unchanged), and the API/cloud variables are stripped from the
+    env; in ``"api"`` mode nothing is seeded and the OAuth token is stripped instead. Either
+    way exactly one credential reaches the run, so billing is deterministic.
+
+    Every isolated agent (bench sandboxes and the draft/improve/tasks meta-agents) builds its
+    env through here, so the seed-and-scrub pairing lives in one place.
+    """
+    if auth_mode == "session":
+        seed_credentials(config_dir)
+    return scrubbed_env(config_dir=config_dir, home=home, extra_path=extra_path, auth_mode=auth_mode)
 
 
 def _default_cache_root() -> Path:

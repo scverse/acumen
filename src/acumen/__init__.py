@@ -5,7 +5,19 @@ from importlib.metadata import version
 from acumen.bench import PlannedRun, build_matrix, pending, run_matrix, summarize
 from acumen.config import Config, ConfigError, load_config, parse_config
 from acumen.draft import DraftError, DraftResult, draft_skill
-from acumen.env import EnvError, Target, auth_available, check_auth, prepare_target, scrubbed_env
+from acumen.env import (
+    AuthMode,
+    EnvError,
+    Target,
+    api_auth_available,
+    auth_available,
+    build_agent_env,
+    check_auth,
+    prepare_target,
+    resolve_auth_mode,
+    scrubbed_env,
+    session_auth_available,
+)
 from acumen.grade import Grade, Reason, grade_answer, grade_run
 from acumen.improve import (
     ImproveError,
@@ -47,6 +59,7 @@ from acumen.tasks import Task, TaskError, TaskSplit, load_tasks, parse_tasks
 from acumen.transcript import locate_transcript, render_transcript
 
 __all__ = [
+    "AuthMode",
     "Config",
     "ConfigError",
     "DraftError",
@@ -78,11 +91,13 @@ __all__ = [
     "TaskSplit",
     "TrainRun",
     "__version__",
+    "api_auth_available",
     "arm_metrics",
     "arm_name",
     "auth_available",
     "available_versions",
     "check_auth",
+    "build_agent_env",
     "build_filtered_source",
     "build_matrix",
     "build_report",
@@ -113,12 +128,14 @@ __all__ = [
     "pending",
     "prepare_target",
     "render_transcript",
+    "resolve_auth_mode",
     "run_dir",
     "run_matrix",
     "run_once",
     "sandbox",
     "scaffold",
     "scrubbed_env",
+    "session_auth_available",
     "ship_skill",
     "skill_content",
     "skill_from_arm",

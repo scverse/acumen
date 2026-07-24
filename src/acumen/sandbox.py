@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from acumen.env import Target, scrubbed_env, seed_credentials
+from acumen.env import AuthMode, Target, build_agent_env
 from acumen.skills import Skill, content_files
 
 #: Where the ``claude`` CLI looks for project skills, relative to the agent's cwd.
@@ -82,6 +82,7 @@ def install_skill(root: Path, skill: Skill) -> Path:
 def sandbox(
     target: Target,
     *,
+    auth_mode: AuthMode,
     base: Path | None = None,
     keep: bool = False,
     skill: Skill | None = None,
@@ -92,6 +93,9 @@ def sandbox(
     ----------
     target
         The prepared target; its venv ``bin`` goes on the sandbox PATH.
+    auth_mode
+        Which credential the run authenticates with (see :func:`acumen.env.build_agent_env`).
+        Benchmark runs always pass ``"api"`` so the recorded ``cost_usd`` is real.
     base
         Parent directory for the sandbox. Defaults to the system temp dir.
     keep
@@ -114,14 +118,14 @@ def sandbox(
             path.mkdir(parents=True, exist_ok=True)
         if skill is not None:
             install_skill(root, skill)
-        authenticated = seed_credentials(config_dir)
-        env = scrubbed_env(config_dir=config_dir, home=home, extra_path=[target.bin_dir])
+        env = build_agent_env(config_dir=config_dir, home=home, extra_path=[target.bin_dir], auth_mode=auth_mode)
         yield Sandbox(
             root=root,
             home=home,
             config_dir=config_dir,
             env=env,
-            authenticated=authenticated,
+            # Only session mode seeds the OAuth login into the throwaway config dir.
+            authenticated=auth_mode == "session",
             skill=skill,
         )
     finally:

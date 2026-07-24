@@ -12,7 +12,17 @@ import pytest
 
 from acumen.bench import build_matrix, pending
 from acumen.config import ConfigError, derive_skill_name, load_config, parse_config
-from acumen.env import AUTH_ENV_VARS, EnvError, auth_available, check_auth
+from acumen.env import (
+    AUTH_ENV_VARS,
+    EnvError,
+    api_auth_available,
+    auth_available,
+    build_agent_env,
+    check_auth,
+    resolve_auth_mode,
+    scrubbed_env,
+    session_auth_available,
+)
 from acumen.grade import grade_answer, grade_run
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
 from acumen.prompts import draft_prompt, feedback_block
@@ -230,3 +240,121 @@ def test_auth_preflight(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     (tmp_path / ".credentials.json").write_text("{}")
     assert auth_available() is True
     check_auth()
+
+
+def _clear_auth(monkeypatch: pytest.MonkeyPatch, config_dir: Path) -> None:
+    """Isolate auth detection: empty credential dir, every auth variable stripped."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    for var in AUTH_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
+def _write_oauth_credentials(config_dir: Path) -> None:
+    """Write a credentials file shaped like a real `claude` subscription login."""
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / ".credentials.json").write_text('{"claudeAiOauth": {"accessToken": "x"}}')
+
+
+def test_session_and_api_availability(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_auth(monkeypatch, tmp_path)
+
+    # Nothing present → neither mode is available.
+    assert session_auth_available() is False
+    assert api_auth_available() is False
+
+    # An API key is API auth, not a subscription.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    assert api_auth_available() is True
+    assert session_auth_available() is False
+
+    # The OAuth token is a subscription credential, not API auth.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token")
+    assert session_auth_available() is True
+    assert api_auth_available() is False
+
+    # A bare credentials file with no OAuth block is not a subscription…
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    (tmp_path / ".credentials.json").write_text("{}")
+    assert session_auth_available() is False
+    # …but a real `claude` login (claudeAiOauth) is.
+    _write_oauth_credentials(tmp_path)
+    assert session_auth_available() is True
+
+
+def test_resolve_auth_mode_for_meta_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_auth(monkeypatch, tmp_path)
+
+    # No credentials at all → auto cannot resolve.
+    with pytest.raises(EnvError, match="no Claude credentials"):
+        resolve_auth_mode("auto", allow_session=True)
+
+    # auto prefers the subscription when a login exists.
+    _write_oauth_credentials(tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    assert resolve_auth_mode("auto", allow_session=True) == "session"
+
+    # auto falls back to the API when there is no subscription.
+    (tmp_path / ".credentials.json").unlink()
+    assert resolve_auth_mode("auto", allow_session=True) == "api"
+
+    # Forcing a mode requires that mode's credential.
+    assert resolve_auth_mode("api", allow_session=True) == "api"
+    with pytest.raises(EnvError, match="--auth session"):
+        resolve_auth_mode("session", allow_session=True)
+    _write_oauth_credentials(tmp_path)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert resolve_auth_mode("session", allow_session=True) == "session"
+    with pytest.raises(EnvError, match="--auth api"):
+        resolve_auth_mode("api", allow_session=True)
+
+
+def test_resolve_auth_mode_for_bench(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_auth(monkeypatch, tmp_path)
+
+    # bench never bills the subscription, even when only a subscription is available.
+    _write_oauth_credentials(tmp_path)
+    with pytest.raises(EnvError, match="session is not available for it"):
+        resolve_auth_mode("session", allow_session=False)
+    with pytest.raises(EnvError, match="must bill the API"):
+        resolve_auth_mode("api", allow_session=False)
+
+    # With an API credential, bench resolves to api.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    assert resolve_auth_mode("api", allow_session=False) == "api"
+
+
+def test_scrubbed_env_auth_mode_filters_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_auth(monkeypatch, tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token")
+    home = tmp_path / "home"
+
+    # session keeps only the subscription token; api keeps only the API key.
+    session_env = scrubbed_env(config_dir=tmp_path / "cfg", home=home, auth_mode="session")
+    assert "ANTHROPIC_API_KEY" not in session_env
+    assert session_env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-token"
+
+    api_env = scrubbed_env(config_dir=tmp_path / "cfg", home=home, auth_mode="api")
+    assert api_env["ANTHROPIC_API_KEY"] == "sk-test"
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in api_env
+
+    # No mode leaves both credentials in place (the historical behavior).
+    both = scrubbed_env(config_dir=tmp_path / "cfg", home=home)
+    assert both["ANTHROPIC_API_KEY"] == "sk-test"
+    assert both["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-token"
+
+
+def test_build_agent_env_seeds_only_in_session_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "source"
+    _clear_auth(monkeypatch, source)
+    _write_oauth_credentials(source)  # the user's real login, discovered via CLAUDE_CONFIG_DIR
+    home = tmp_path / "home"
+
+    session_cfg = tmp_path / "session_cfg"
+    build_agent_env(config_dir=session_cfg, home=home, auth_mode="session")
+    assert (session_cfg / ".credentials.json").is_file()  # seeded
+
+    api_cfg = tmp_path / "api_cfg"
+    build_agent_env(config_dir=api_cfg, home=home, auth_mode="api")
+    assert not (api_cfg / ".credentials.json").exists()  # not seeded
