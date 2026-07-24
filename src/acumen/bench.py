@@ -107,6 +107,7 @@ async def run_matrix(
     max_concurrency: int,
     auth_mode: AuthMode = "api",
     skill: Skill | None = None,
+    skill_name: str | None = None,
     sandbox_base: Path | None = None,
     keep_sandbox: bool = False,
     stderr: Callable[[str], None] | None = None,
@@ -135,6 +136,10 @@ async def run_matrix(
     skill
         The skill every run in this matrix installs, or ``None`` for the baseline. One
         matrix is one arm, so this is a property of the pass rather than of a run.
+    skill_name
+        Name of the skill under test (``config.skill_name``), used to recognise it in each
+        transcript. Pass it in the baseline arm too — nothing is installed there, but a
+        baseline run that loads it anyway is the contamination worth catching.
     sandbox_base
         Parent directory for sandboxes.
     keep_sandbox
@@ -174,6 +179,7 @@ async def run_matrix(
                 max_usd=item.max_usd,
                 auth_mode=auth_mode,
                 skill=skill,
+                skill_name=skill_name,
                 sandbox_base=sandbox_base,
                 keep_sandbox=keep_sandbox,
                 stderr=stderr,

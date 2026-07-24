@@ -6,6 +6,7 @@ broke, not an exhaustive sweep of each validator.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -35,7 +36,7 @@ from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
 from acumen.procs import label_env, reap, supported, survivors
 from acumen.prompts import draft_prompt, feedback_block
 from acumen.report import ReportError, load_results, metrics_figure, resolve_palette
-from acumen.runner import StderrFilter
+from acumen.runner import StderrFilter, _skill_fired
 from acumen.ship import _ship_env
 from acumen.skills import SkillError, load_skill, read_meta, skill_hash, write_meta
 from acumen.tasks import TaskError, load_tasks, parse_tasks
@@ -146,6 +147,28 @@ def test_build_matrix_and_resume(project: Path, model: str, make_result) -> None
     make_result(runs, RunKey(arm="skill_v1", split="train", model=model, task_id="example_task", rep=1))
     assert [p.key.split for p in pending(planned, runs)] == ["test"]
     assert len(pending(planned, runs, resume=False)) == 2
+
+
+def test_skill_fired_matches_the_skill_under_test_only(tmp_path: Path) -> None:
+    def transcript(*skills: str) -> Path:
+        path = tmp_path / f"{'-'.join(skills) or 'none'}.jsonl"
+        records = [
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "tool_use", "name": "Skill", "input": {"skill": name}}]},
+            }
+            for name in skills
+        ]
+        path.write_text("".join(f"{json.dumps(r)}\n" for r in records))
+        return path
+
+    assert _skill_fired(transcript("target"), "target") is True
+    # Skills bundled with the CLI are reachable in either arm and are not what is measured.
+    assert _skill_fired(transcript("dataviz", "init"), "target") is False
+    assert _skill_fired(transcript("dataviz", "target"), "target") is True
+    assert _skill_fired(transcript(), "target") is False
+    # A missing transcript is unknown, not a miss.
+    assert _skill_fired(tmp_path / "absent.jsonl", "target") is None
 
 
 def test_stderr_filter_keeps_first_of_each_line() -> None:

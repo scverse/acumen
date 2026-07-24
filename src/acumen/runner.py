@@ -72,13 +72,18 @@ def _find_transcript(box: Sandbox, session_id: str) -> Path | None:
     return locate_transcript(box.config_dir, box.root, session_id)
 
 
-def _skill_fired(jsonl: Path) -> bool | None:
-    """Return whether the agent invoked the Skill tool, read from the transcript.
+def _skill_fired(jsonl: Path, name: str) -> bool | None:
+    """Return whether the agent loaded the skill called ``name``, read from the transcript.
 
     This is the evidence the skill arm actually used the skill — the skill arm must show it
     loading and the baseline must not — so it is recorded per run rather than left to
     hand-inspection. ``None`` means the transcript was unavailable, which is not the same
-    as the skill not firing.
+    as the skill not loading.
+
+    The match is on the skill *identity*, not on the tool: a ``Skill`` call carries the
+    requested skill in ``input.skill``, and the CLI ships bundled skills of its own that the
+    agent can reach in either arm. Loading one of those says nothing about the skill under
+    test, so only ``input.skill == name`` counts.
     """
     try:
         lines = jsonl.read_text().splitlines()
@@ -95,7 +100,10 @@ def _skill_fired(jsonl: Path) -> bool | None:
         if not isinstance(content, list):
             continue
         for block in content:
-            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "Skill":
+            if not isinstance(block, dict) or block.get("type") != "tool_use" or block.get("name") != "Skill":
+                continue
+            payload = block.get("input")
+            if isinstance(payload, dict) and payload.get("skill") == name:
                 return True
     return False
 
@@ -195,6 +203,7 @@ async def run_once(
     max_usd: float,
     auth_mode: AuthMode = "api",
     skill: Skill | None = None,
+    skill_name: str | None = None,
     sandbox_base: Path | None = None,
     keep_sandbox: bool = False,
     stderr: Callable[[str], None] | None = None,
@@ -220,6 +229,11 @@ async def run_once(
     skill
         The skill to install, or ``None`` for the baseline arm. Must agree with
         ``key.arm``, else the run would be filed under an arm it doesn't belong to.
+    skill_name
+        Name of the skill under test, used to recognise it in the transcript. Defaults to
+        the installed skill's name; pass it in the baseline arm too, where nothing is
+        installed but a stray load of that same skill is exactly what must be caught.
+        Without either, ``skill_loaded`` is left ``None`` — unattributable, not absent.
     sandbox_base
         Parent directory for the throwaway sandbox.
     keep_sandbox
@@ -278,9 +292,11 @@ async def run_once(
 
     rendered = False
     skill_loaded: bool | None = None
+    expected_skill = skill.name if skill is not None else skill_name
     if (run_dir / TRANSCRIPT_JSONL).is_file():
         rendered = render_transcript(run_dir / TRANSCRIPT_JSONL, run_dir / TRANSCRIPT_HTML)
-        skill_loaded = _skill_fired(run_dir / TRANSCRIPT_JSONL)
+        if expected_skill is not None:
+            skill_loaded = _skill_fired(run_dir / TRANSCRIPT_JSONL, expected_skill)
 
     grade: Grade = grade_run(run_dir, split.answer)
     if error is not None or result is None:

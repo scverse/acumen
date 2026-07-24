@@ -212,6 +212,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
             max_concurrency=cfg.max_concurrency,
             auth_mode=auth_mode,
             skill=skill,
+            skill_name=cfg.skill_name,
             keep_sandbox=args.keep_sandboxes,
             stderr=StderrFilter(),
             on_start=progress.on_start,
@@ -237,7 +238,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
     elif loaded:
-        print(f"warning: the Skill tool fired in {loaded} baseline runs", file=sys.stderr)
+        print(f"warning: {cfg.skill_name} loaded in {loaded} baseline runs", file=sys.stderr)
     print(f"runs written to {args.runs.resolve()}")
     return 0
 

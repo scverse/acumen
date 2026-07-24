@@ -528,9 +528,10 @@ class Report:
 def _integrity_notes(df: pd.DataFrame) -> list[str]:
     """Flag arms whose ``skill_loaded`` disagrees with what the arm name claims.
 
-    A skill arm where the Skill tool never fired is not measuring the skill; a noskill run
-    where it did fire is not a clean baseline. Either makes the comparison a lie, so it is
-    surfaced in the report rather than left in the transcripts.
+    A skill arm that never loaded the skill under test is not measuring it; a noskill run
+    that did load it is not a clean baseline. Either makes the comparison a lie, so it is
+    surfaced in the report rather than left in the transcripts. Other skills the agent may
+    reach — the ones bundled with the CLI — do not count either way.
     """
     notes = []
     if "skill_loaded" not in df.columns:
@@ -540,19 +541,20 @@ def _integrity_notes(df: pd.DataFrame) -> list[str]:
         loaded = int(group["skill_loaded"].fillna(False).sum())
         if arm == NOSKILL_ARM:
             if loaded:
-                notes.append(f"baseline arm '{arm}' fired the Skill tool in {loaded}/{len(group)} runs")
+                notes.append(f"baseline arm '{arm}' loaded the skill under test in {loaded}/{len(group)} runs")
         elif loaded < len(group):
             notes.append(f"skill arm '{arm_label(arm)}' loaded the skill in only {loaded}/{len(group)} runs")
     return notes
 
 
 def _loaded_cell(row: pd.Series) -> str:
-    """Per-run 'skill loaded' cell: did the Skill tool actually fire in this run?
+    """Per-run 'skill loaded' cell: did this run load the skill under test?
 
     ``—`` for a baseline run (no skill to load), ``yes``/``no`` for a skill run, and ``?``
-    when the transcript was unavailable so it could not be determined. A ``no`` is
-    highlighted — that is a skill run not measuring its skill, and the transcript link in
-    the same row is where to see why it did not load.
+    when the transcript was unavailable so it could not be determined. Any other skill the
+    agent loaded — the CLI ships its own — is not this skill and does not read ``yes``. A
+    ``no`` is highlighted: that is a skill run not measuring its skill, and the transcript
+    link in the same row is where to see why it did not load.
     """
     if row["arm"] == NOSKILL_ARM:
         return "&mdash;"
