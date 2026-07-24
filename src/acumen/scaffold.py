@@ -33,7 +33,7 @@ max_usd: 3.0                          # budget cap (USD) for benchmark agents; d
 draft_model: claude-opus-4-8          # model that writes the first skill (reads the source)
 improve_model: claude-opus-4-8        # model that improves a skill from its train results
 tasks_model: claude-opus-4-8          # model for `acumen tasks` (generates this file); runs code
-ship_model: claude-opus-4-8           # model for `acumen ship` (packages a skill into the target)
+ship_model: claude-opus-4-8           # model for `acumen ship` (wires a multi-framework install-skills script)
 
 # skill_name: your_skill              # name for the built skill; defaults to the repo's name
 """

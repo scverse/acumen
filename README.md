@@ -54,8 +54,10 @@ acumen ship --skill v2           # add a <dist>-install-skills console script (P
 ```
 
 `acumen ship` packages the chosen skill version into the target: the package gains a
-`<dist>-install-skills` command that installs the skill into `~/.claude/skills/`, so the
-package's own users get the guidance with one command.
+`<dist>-install-skills` command that installs the skill into the skills directory of whichever
+agent the user names — `--agent {claude,codex,agents,claude-science}`, or an explicit `--dest` —
+so the package's own users get the guidance with one command, wherever they run their agent. The
+same bundle installs verbatim into every framework.
 
 `acumen tasks`, `acumen draft`, and `acumen improve` each accept `--feedback "…"` to steer the
 agent with context it can't infer — which functionality to skip when generating tasks, what a

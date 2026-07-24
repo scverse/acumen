@@ -2,9 +2,10 @@
 
 Once a maintainer has benchmarked a skill and knows which version is best, ``acumen ship
 --skill vN`` packages that version into the target so the package gains a ``<dist>-install-skills``
-console script — one command drops the skill into ``~/.claude/skills/<name>/`` for the package's
-users. For a GitHub URL the change arrives as a pull request the agent opens itself; for
-a local path it is written straight into the working tree.
+console script — one command drops the skill into the skills directory of whichever agentic
+framework the user names (``--agent {claude,codex,agents,claude-science}`` or an explicit
+``--dest``) for the package's users. For a GitHub URL the change arrives as a pull request the
+agent opens itself; for a local path it is written straight into the working tree.
 
 The whole point is **generalization**: the agent reasons about the repo — distribution vs import
 name, src-vs-flat layout, build backend — rather than pattern-matching decoupler's shape. So, like
@@ -131,14 +132,20 @@ def _ship_env(target: Target, auth_mode: AuthMode) -> dict[str, str]:
     everything else the user has (PATH, HOME, credentials, tokens) is carried through untouched.
 
     The one exception is the model credential: to bill the chosen ``auth_mode`` deterministically
-    we drop the *other* mode's variables — ``"session"`` removes the metered API/cloud keys (the
-    user's real ``~/.claude`` OAuth login then authenticates), ``"api"`` removes the subscription
-    OAuth token (the API key then wins). Everything non-credential is still carried through.
+    we neutralize the *other* mode's variables — ``"session"`` clears the metered API/cloud keys
+    (the user's real ``~/.claude`` OAuth login then authenticates), ``"api"`` clears the
+    subscription OAuth token (the API key then wins). Everything non-credential is still carried
+    through.
+
+    The cleared variables are set to ``""``, not deleted: the SDK merges this mapping over
+    ``os.environ`` (``{**os.environ, **options.env}``), so a key we merely drop from the dict
+    falls back through from the inherited environment and the run bills the wrong credential. An
+    explicit empty value overrides the inherited one, which the CLI reads as unset.
     """
     env = dict(os.environ)
     drop = API_AUTH_ENV_VARS if auth_mode == "session" else (SESSION_AUTH_ENV_VAR,)
     for var in drop:
-        env.pop(var, None)
+        env[var] = ""
     parts = [str(target.bin_dir)]
     cli_dir = claude_cli_dir()
     if cli_dir is not None:

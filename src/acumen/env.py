@@ -435,12 +435,18 @@ def seed_credentials(config_dir: Path) -> bool:
 
 
 def _apply_auth_mode(env: dict[str, str], auth_mode: AuthMode | None) -> None:
-    """Drop the credential variables that the chosen mode must not authenticate with.
+    """Neutralize the credential variables the chosen mode must not authenticate with.
 
-    So exactly one auth path is live: ``"session"`` removes the metered API/cloud variables
-    and keeps the subscription OAuth token; ``"api"`` removes the OAuth token and keeps the
+    So exactly one auth path is live: ``"session"`` neutralizes the metered API/cloud variables
+    and keeps the subscription OAuth token; ``"api"`` neutralizes the OAuth token and keeps the
     metered ones. ``None`` leaves the allowlisted credentials untouched (the historical
     behavior, for callers that don't select a mode).
+
+    The variables are set to ``""``, not deleted. The SDK builds the agent subprocess env as
+    ``{**os.environ, **options.env}`` — it merges our mapping *over* the inherited environment —
+    so a credential we merely omit falls back through from ``os.environ`` unchanged and the run
+    silently authenticates with the wrong one. An explicit empty value overrides the inherited
+    one, which the CLI reads as unset.
     """
     if auth_mode == "session":
         drop = API_AUTH_ENV_VARS
@@ -449,7 +455,7 @@ def _apply_auth_mode(env: dict[str, str], auth_mode: AuthMode | None) -> None:
     else:
         return
     for var in drop:
-        env.pop(var, None)
+        env[var] = ""
 
 
 def scrubbed_env(

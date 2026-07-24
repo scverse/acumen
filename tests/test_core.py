@@ -6,6 +6,7 @@ broke, not an exhaustive sweep of each validator.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from acumen.config import ConfigError, derive_skill_name, load_config, parse_con
 from acumen.env import (
     AUTH_ENV_VARS,
     EnvError,
+    Target,
     api_auth_available,
     auth_available,
     build_agent_env,
@@ -27,6 +29,7 @@ from acumen.grade import grade_answer, grade_run
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
 from acumen.prompts import draft_prompt, feedback_block
 from acumen.runner import StderrFilter
+from acumen.ship import _ship_env
 from acumen.skills import SkillError, load_skill, read_meta, skill_hash, write_meta
 from acumen.tasks import TaskError, load_tasks, parse_tasks
 
@@ -330,19 +333,56 @@ def test_scrubbed_env_auth_mode_filters_credentials(tmp_path: Path, monkeypatch:
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token")
     home = tmp_path / "home"
 
+    # The unwanted credential is set to "" (not omitted) so it overrides the inherited value
+    # under the SDK's {**os.environ, **options.env} merge — see the merge regression below.
     # session keeps only the subscription token; api keeps only the API key.
     session_env = scrubbed_env(config_dir=tmp_path / "cfg", home=home, auth_mode="session")
-    assert "ANTHROPIC_API_KEY" not in session_env
+    assert session_env["ANTHROPIC_API_KEY"] == ""
     assert session_env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-token"
 
     api_env = scrubbed_env(config_dir=tmp_path / "cfg", home=home, auth_mode="api")
     assert api_env["ANTHROPIC_API_KEY"] == "sk-test"
-    assert "CLAUDE_CODE_OAUTH_TOKEN" not in api_env
+    assert api_env["CLAUDE_CODE_OAUTH_TOKEN"] == ""
 
     # No mode leaves both credentials in place (the historical behavior).
     both = scrubbed_env(config_dir=tmp_path / "cfg", home=home)
     assert both["ANTHROPIC_API_KEY"] == "sk-test"
     assert both["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-token"
+
+
+def test_session_mode_neutralizes_the_api_key_under_the_sdk_env_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The credential drop must survive the SDK's env merge, not just the returned dict.
+
+    The SDK builds the agent subprocess env as ``{**os.environ, **options.env}``, so a
+    credential we *omit* from our mapping falls back through from ``os.environ`` and the run
+    bills the wrong path. Setting it to "" is what actually neutralizes it. This guards the
+    session-mode meta-agents (draft/improve/tasks and the unscrubbed ship env) from silently
+    billing the API when ``ANTHROPIC_API_KEY`` is present in the environment.
+    """
+    _clear_auth(monkeypatch, tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token")
+    home = tmp_path / "home"
+    target = Target(
+        source="/pkg",
+        ref="main",
+        src_dir=tmp_path / "src",
+        venv_dir=tmp_path / "venv",
+        commit="abc123",
+        pkg_name="pkg",
+        pkg_version="1.0",
+    )
+
+    # scrubbed_env (draft/improve/tasks) and the unscrubbed ship env must both hold up.
+    for agent_env in (
+        scrubbed_env(config_dir=tmp_path / "cfg", home=home, auth_mode="session"),
+        _ship_env(target, "session"),
+    ):
+        merged = {**os.environ, **agent_env}  # what the SDK actually hands the subprocess
+        assert not merged["ANTHROPIC_API_KEY"], "API key leaked into a session-mode agent"
+        assert merged["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-token"
 
 
 def test_build_agent_env_seeds_only_in_session_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

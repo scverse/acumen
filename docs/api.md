@@ -110,6 +110,12 @@ so `from acumen import build_report` works.
 
 ## Shipping
 
+`ship_skill` wires a `<dist>-install-skills` console script into the target package. The
+installed command drops the skill into whichever agentic framework the user names —
+`--agent {claude,codex,agents,claude-science}` (or an explicit `--dest`) — copying the same
+`SKILL.md` + `references/` bundle verbatim; there is no default framework and no per-framework
+conversion.
+
 ```{eval-rst}
 .. autosummary::
     :toctree: generated

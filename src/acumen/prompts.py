@@ -356,64 +356,185 @@ want a per-task override (`max_turns`, `max_usd`, or `model` are the only ones a
 #: to be edited into it, and ``importlib.resources`` so it reads the skill data from wherever
 #: the wheel installed it — which is exactly what the build-verify gate confirms.
 SHIP_INSTALL_TEMPLATE = '''\
-"""Install the bundled ``__SKILL_NAME__`` Claude skill into a skills directory.
+"""Install the bundled ``__SKILL_NAME__`` skill into an agentic framework's skills directory.
 
-Console script (wired as ``<dist>-install-skills`` in ``pyproject.toml``): copy the skill
-that ships inside this package into ``~/.claude/skills/__SKILL_NAME__/`` so an agent can load
-it. The skill files live in the ``data/`` directory next to this module and are read via
+Console script (wired as ``<dist>-install-skills`` in ``pyproject.toml``): copy the skill that
+ships inside this package into a chosen framework's skills directory, so an agent can load it.
+The same ``SKILL.md`` + ``references/`` bundle is a cross-framework standard, so it installs
+verbatim — no per-framework conversion.
+
+Frameworks (``--agent``):
+
+- ``claude``          -> ``~/.claude/skills`` (honours ``CLAUDE_CONFIG_DIR``)
+- ``codex``           -> ``~/.codex/skills`` (honours ``CODEX_HOME``)
+- ``agents``          -> ``~/.agents/skills``
+- ``claude-science``  -> the active org's skills dir, resolved from
+  ``~/.claude-science/active-org.json``
+
+``--dest`` overrides all of them. There is **no default framework**: pass ``--agent`` or
+``--dest``. The skill files live in the ``data/`` directory next to this module and are read via
 ``importlib.resources``, so this works from an installed wheel, not just an editable checkout.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import shutil
 import sys
 from importlib import resources
 from pathlib import Path
 
-#: The skill name; the skill installs to ``~/.claude/skills/<SKILL_NAME>/``.
+#: The skill name; it installs to ``<framework-skills-dir>/<SKILL_NAME>/``.
 SKILL_NAME = "__SKILL_NAME__"
 
+#: Framework -> (env var that overrides the config root, default config root). The skills
+#: directory is ``<root>/skills``. ``claude-science`` is resolved separately.
+_AGENT_ROOTS = {
+    "codex": ("CODEX_HOME", "~/.codex"),
+    "claude": ("CLAUDE_CONFIG_DIR", "~/.claude"),
+    "agents": (None, "~/.agents"),
+}
 
-def default_dest() -> Path:
-    """Return the default install directory, ``~/.claude/skills/<SKILL_NAME>``."""
-    return Path.home() / ".claude" / "skills" / SKILL_NAME
+#: The frameworks ``--agent`` accepts.
+AGENTS = (*sorted(_AGENT_ROOTS), "claude-science")
+
+
+def source_dir() -> Path:
+    """Return the package-owned skill directory (the bundle that gets copied)."""
+    source = Path(str(resources.files(__package__).joinpath("data")))
+    if not (source / "SKILL.md").is_file():
+        raise RuntimeError(f"packaged skill data is missing: {source}")
+    return source
+
+
+def _claude_science_skills_dir() -> Path:
+    """Resolve the active Claude Science org's skills directory."""
+    root = Path("~/.claude-science").expanduser()
+    active_org_path = root / "active-org.json"
+    try:
+        active_org = json.loads(active_org_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            "cannot resolve the Claude Science active organization from "
+            f"{active_org_path}; pass --dest instead"
+        ) from error
+    org_uuid = active_org.get("org_uuid") if isinstance(active_org, dict) else None
+    if (
+        not isinstance(org_uuid, str)
+        or not org_uuid
+        or Path(org_uuid).name != org_uuid
+        or org_uuid in {".", ".."}
+    ):
+        raise ValueError(f"invalid Claude Science org_uuid in {active_org_path}; pass --dest instead")
+    return root / "orgs" / org_uuid / "skills"
+
+
+def _skills_dir(agent: str) -> Path:
+    """Return the skills directory (parent of the install dir) for a framework."""
+    if agent == "claude-science":
+        return _claude_science_skills_dir()
+    variable, fallback = _AGENT_ROOTS[agent]
+    root = os.environ.get(variable) if variable is not None else None
+    return Path(root or fallback).expanduser() / "skills"
+
+
+def resolve_dest(agent: str | None, dest: Path | None) -> Path:
+    """Resolve the install destination from ``--agent`` / ``--dest``.
+
+    ``--dest`` wins. With neither, raise ``ValueError`` — there is no default framework.
+    """
+    if dest is not None:
+        return dest.expanduser()
+    if agent is None:
+        raise ValueError("pass --agent {" + ",".join(AGENTS) + "} or --dest to choose where to install")
+    return _skills_dir(agent) / SKILL_NAME
+
+
+def _snapshot(root: Path) -> dict[str, bytes]:
+    """Map each file under ``root`` to its bytes, for exact tree comparison."""
+    return {
+        str(item.relative_to(root)): item.read_bytes()
+        for item in root.rglob("*")
+        if item.is_file()
+    }
+
+
+def _matches(source: Path, target: Path) -> bool:
+    """Report whether ``target`` is a byte-for-byte copy of ``source``."""
+    return target.is_dir() and _snapshot(source) == _snapshot(target)
 
 
 def main(argv: list[str] | None = None) -> int:
     """Install the bundled skill; entry point for the ``<dist>-install-skills`` script."""
     parser = argparse.ArgumentParser(
-        description=f"Install the {SKILL_NAME} Claude skill into your skills directory.",
+        description=f"Install the {SKILL_NAME} skill bundled with this package into an agent's skills directory.",
+    )
+    parser.add_argument(
+        "--agent",
+        choices=AGENTS,
+        default=None,
+        help="framework to install into (no default — pass this or --dest)",
     )
     parser.add_argument(
         "--dest",
         type=Path,
         default=None,
-        help="skills directory to install into (default: ~/.claude/skills/<name>)",
+        help="exact skills directory to install into (overrides --agent)",
     )
-    parser.add_argument("--force", action="store_true", help="overwrite an existing installation")
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite an existing installation that differs from the bundled skill",
+    )
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument(
+        "--check",
+        action="store_true",
+        help="report whether the installed skill matches the bundled one; do not install",
+    )
+    action.add_argument(
         "--print-path",
         action="store_true",
-        help="print the install destination and exit without installing",
+        help="print the bundled skill's location inside the package and exit",
     )
     args = parser.parse_args(argv)
 
-    dest = args.dest if args.dest is not None else default_dest()
-    if args.print_path:
-        print(dest)
-        return 0
-
-    if dest.exists():
-        if not args.force:
-            print(f"{dest} already exists; pass --force to overwrite", file=sys.stderr)
+    try:
+        source = source_dir()
+        if args.print_path:
+            print(source)
+            return 0
+        if args.check:
+            target = resolve_dest(args.agent, args.dest)
+            if not target.exists():
+                print(f"{SKILL_NAME} skill is not installed at {target}", file=sys.stderr)
+                return 1
+            if _matches(source, target):
+                print(f"{SKILL_NAME} skill at {target} matches the bundled copy")
+                return 0
+            print(f"{SKILL_NAME} skill at {target} differs from the bundled copy", file=sys.stderr)
             return 1
-        shutil.rmtree(dest)
 
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with resources.as_file(resources.files(__package__).joinpath("data")) as data_dir:
-        shutil.copytree(data_dir, dest)
+        dest = resolve_dest(args.agent, args.dest)
+        if dest.exists():
+            if _matches(source, dest):
+                print(f"{SKILL_NAME} skill already up to date at {dest}")
+                return 0
+            if not args.force:
+                print(f"{dest} already exists and differs; pass --force to overwrite", file=sys.stderr)
+                return 1
+            if dest.is_dir():
+                shutil.rmtree(dest)
+            else:
+                dest.unlink()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, dest)
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
     print(f"installed the {SKILL_NAME} skill to {dest}")
     return 0
 
@@ -424,10 +545,12 @@ if __name__ == "__main__":
 
 
 SHIP_PROMPT = """\
-You are making a benchmarked Claude Skill installable *into* the Python package it documents.
+You are making a benchmarked Skill installable *into* the Python package it documents.
 When you are done, the package will expose a console script `<dist>-install-skills` that drops
-the skill into `~/.claude/skills/{skill_name}/`, so the package's own users get the agent
-guidance with one command.
+the skill into the skills directory of whichever agentic framework the user names —
+`--agent {{claude,codex,agents,claude-science}}`, or an explicit `--dest` — so the package's own
+users get the agent guidance with one command, wherever they run their agent. The same skill
+bundle installs verbatim into every framework; there is no per-framework conversion.
 
 You work in the package's checkout, and this is the REAL environment — real network, real
 git/`gh` credentials, real `uv`. You may run any command you need.
@@ -494,9 +617,11 @@ prevent, and it fails silently. Before you deliver anything, prove the data ship
 2. Install THAT wheel into a FRESH throwaway venv (`uv venv`, then `uv pip install <the-wheel>`) —
    a fresh venv, NOT an editable install, because an editable install sees the source tree
    regardless of packaging and would hide the bug.
-3. From that venv, run `<dist-name>-install-skills --dest <a-scratch-dir>` and confirm
-   `<a-scratch-dir>/SKILL.md` exists and is byte-identical to `{skill_src}/SKILL.md`. Also run
-   `<dist-name>-install-skills --print-path` and confirm it prints a sensible destination.
+3. From that venv, run `<dist-name>-install-skills --agent codex --dest <a-scratch-dir>` and
+   confirm `<a-scratch-dir>/SKILL.md` exists and is byte-identical to `{skill_src}/SKILL.md`.
+   (There is no default framework, so pass an explicit `--dest` — or `--agent` — here.) Also run
+   `<dist-name>-install-skills --print-path` and confirm it prints a path inside the installed
+   package that contains the shipped `SKILL.md`.
 4. If `SKILL.md` did not land, your packaging is wrong — FIX IT and rebuild. Do not proceed to
    delivery until a fresh-venv install ships the skill.
 
@@ -505,8 +630,9 @@ prevent, and it fails silently. Before you deliver anything, prove the data ship
 - Bundle EXACTLY ONE skill — version {version}, copied verbatim. Nothing else.
 - Do NOT write any test file. (Deliberate scope decision.)
 - Update the README / docs to mention the `<dist-name>-install-skills` command ONLY if there is a
-  natural spot for it (e.g. an existing install or usage section). Keep it to a sentence. If there
-  is no natural spot, skip it — do not invent a section.
+  natural spot for it (e.g. an existing install or usage section). Keep it to a sentence, noting
+  the `--agent {{claude,codex,agents,claude-science}}` (or `--dest`) choice. If there is no natural
+  spot, skip it — do not invent a section.
 
 # Deliver
 
@@ -718,7 +844,7 @@ def ship_prompt(
         detects the import package name and layout itself.
     skill_name
         The skill's frontmatter name — baked into the install script and the
-        ``~/.claude/skills/<name>/`` install path.
+        ``<framework-skills-dir>/<name>/`` install path.
     version
         The skill version being shipped, e.g. ``v2`` — named in the branch/commit/PR.
     checkout
@@ -743,7 +869,6 @@ def ship_prompt(
         delivery_report = "confirmation that the working tree now carries the change"
     return SHIP_PROMPT.format(
         package=package,
-        skill_name=skill_name,
         version=version,
         checkout=checkout,
         skill_src=skill_src,
