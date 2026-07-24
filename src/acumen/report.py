@@ -44,8 +44,8 @@ from acumen.tasks import Task
 # ── Palette ──────────────────────────────────────────────────────────────────────────
 # A warm-neutral scheme fixed by the maintainer. The page and the plot area are both white,
 # so a figure sits on the page with no visible frame around it and the ink carries the
-# structure. Bars are coloured by model (see the sequential ramp below); train/test is a
-# texture, not a colour.
+# structure. Bars are coloured by model (see the sequential ramp below), with a grey bar
+# pooling every model; train/test is a texture, not a colour.
 INK = "#1c1813"  # axes, text, ticks
 PAGE = "#ffffff"  # page + figure background
 PLOT_BG = "#ffffff"  # the plot area itself; also the hairline between adjacent bars
@@ -67,6 +67,13 @@ _MODEL_COLOR = {
     "haiku": "#eec0b0",  # lightest — least potent
 }
 _OTHER_MODEL_COLOR = "#8a8378"  # neutral fallback for an unrecognised model id
+
+# Alongside the per-model bars, each cell carries one pooled bar over every model at once —
+# the overall position of the models being evaluated. It is deliberately outside the model
+# ramp: a neutral grey, so it reads as a summary of the hues rather than another hue.
+_ALL_MODELS = "\x00all-models"  # sentinel model id; not a value any real id can take
+_ALL_MODELS_LABEL = "all models"
+_ALL_MODELS_COLOR = "#9b968d"
 
 # Train vs test is a *texture*, not a colour — so it never competes with the model hue.
 _SPLIT_ORDER = ("train", "test")
@@ -365,6 +372,19 @@ def _models_in_order(df: pd.DataFrame) -> list[str]:
     return sorted(df["model"].unique(), key=key)
 
 
+def _bar_rows(models: Sequence[str]) -> list[str]:
+    """The bar slots in a cell: one per model, plus the pooled row when there are several.
+
+    With a single model the pooled bar would simply restate it, so it is left out.
+    """
+    return [*models, _ALL_MODELS] if len(models) > 1 else list(models)
+
+
+def _row_label(model: str) -> str:
+    """Legend label for a bar slot — a model id, or the pooled row's name."""
+    return _ALL_MODELS_LABEL if model == _ALL_MODELS else _model_label(model)
+
+
 def _cell_value(df: pd.DataFrame, arm: str, model: str, split: str, key: str) -> tuple[float, float, bool]:
     """One (arm, model, split) cell's metric value, its error bar, and whether it has runs.
 
@@ -373,10 +393,16 @@ def _cell_value(df: pd.DataFrame, arm: str, model: str, split: str, key: str) ->
     sum — ``sqrt(n) * std`` over the per-run values, i.e. how much the total would vary run
     to run (0 with <2 runs).
 
+    ``model`` may be the :data:`_ALL_MODELS` sentinel, which pools every model in the arm —
+    so the proportions read as the overall rate across all runs (not a mean of per-model
+    rates, which would weight an under-sampled model as heavily as the rest), and the
+    resource totals as the arm's grand total.
+
     The third element distinguishes a genuine zero (e.g. a 0% success rate) from a cell with
     no runs at all: a model not run in this arm reserves its slot but draws no bar.
     """
-    group = df[(df["arm"] == arm) & (df["model"] == model) & (df["split"] == split)]
+    rows = (df["arm"] == arm) & (df["split"] == split)
+    group = df[rows if model == _ALL_MODELS else rows & (df["model"] == model)]
     if group.empty:
         return 0.0, 0.0, False
     if key in _PROPORTION_COLUMN:
@@ -393,33 +419,34 @@ def _draw_cell(
     ax: plt.Axes,
     df: pd.DataFrame,
     arm: str,
-    models: list[str],
+    rows: list[str],
     splits: list[str],
     key: str,
     *,
     value_label,
     colors: Mapping[str, str],
 ) -> None:
-    """Draw one grid cell — one fixed slot per model (colour), grouped by split (texture).
+    """Draw one grid cell — one fixed slot per bar row (colour), grouped by split (texture).
 
-    Every model in ``models`` gets a slot at the same y-position in every cell, so bars line
-    up across skills. A model with no runs in this arm reserves its slot but draws nothing —
-    no bar, no error bar, no label — so a stretched neighbour can't be mistaken for it.
+    ``rows`` is the models plus, last, the pooled :data:`_ALL_MODELS` row. Every row gets a
+    slot at the same y-position in every cell, so bars line up across skills. A model with no
+    runs in this arm reserves its slot but draws nothing — no bar, no error bar, no label —
+    so a stretched neighbour can't be mistaken for it.
     """
-    n_models = len(models)
+    n_models = len(rows)
     n_splits = len(splits)
     group_h = 0.8
     bar_h = group_h / n_splits
     nan = float("nan")
     for si, split in enumerate(splits):
         offset = (si - (n_splits - 1) / 2) * bar_h
-        cells = [_cell_value(df, arm, model, split, key) for model in models]
+        cells = [_cell_value(df, arm, model, split, key) for model in rows]
         # A NaN width draws no bar and no error bar; the y-slot is still occupied.
         bars = ax.barh(
             [m + offset for m in range(n_models)],
             [value if present else nan for value, _err, present in cells],
             bar_h * 0.86,
-            color=[colors[model] for model in models],
+            color=[colors[model] for model in rows],
             hatch=_SPLIT_HATCH[split] if n_splits > 1 else "",
             edgecolor=PLOT_BG,
             linewidth=0.6,
@@ -446,9 +473,10 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, st
     load rate is the share of runs that loaded the skill under test — the baseline arm is
     drawn too, where a bar above zero means the baseline is not clean.
 
-    Inside each cell, bars are coloured by model; when ``split_hue`` is set, train and test
-    are shown as two textures (test solid, train hatched) rather than two colours, leaving
-    the model hue intact.
+    Inside each cell, bars are coloured by model, with a final grey bar pooling every model
+    at once — where the evaluated models sit overall. When ``split_hue`` is set, train and
+    test are shown as two textures (test solid, train hatched) rather than two colours,
+    leaving the model hue intact.
 
     Parameters
     ----------
@@ -465,13 +493,15 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, st
     """
     arms = _arms_in_order(df)
     models = _models_in_order(df)
+    rows = _bar_rows(models)
     resolved = colors or {}
     colors = {model: resolved.get(model, _model_color(model)) for model in models}
+    colors[_ALL_MODELS] = _ALL_MODELS_COLOR
     splits = list(_SPLIT_ORDER) if split_hue else [_REPORTED_SPLIT]
-    # Every model gets a fixed slot in every arm's cell, so bars align across skills and a
+    # Every row gets a fixed slot in every arm's cell, so bars align across skills and a
     # model that wasn't run leaves a reserved gap rather than letting its neighbour stretch.
     n_rows = max(1, len(arms))
-    max_bars = max(1, len(models) * len(splits))
+    max_bars = max(1, len(rows) * len(splits))
     with plt.rc_context(_RC):
         # Height scales with the number of bars per cell; the small constant covers the
         # per-row breathing room, not a fixed block, so few-model plots stay compact.
@@ -482,7 +512,7 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, st
         for c, (title, key, formatter, value_label) in enumerate(_COLUMNS):
             for r, arm in enumerate(arms):
                 ax = axes[r][c]
-                _draw_cell(ax, df, arm, models, splits, key, value_label=value_label, colors=colors)
+                _draw_cell(ax, df, arm, rows, splits, key, value_label=value_label, colors=colors)
                 ax.xaxis.set_major_formatter(formatter)
                 ax.xaxis.set_major_locator(mticker.MaxNLocator(3))
                 if r == 0:
@@ -497,7 +527,7 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, st
                     (
                         v + e
                         for arm in arms
-                        for m in models
+                        for m in rows
                         for s in splits
                         for v, e, present in [_cell_value(df, arm, m, s, key)]
                         if present
@@ -506,10 +536,9 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, st
                 )
                 axes[-1][c].set_xlim(0, reach * 1.35 if reach else 1)
 
-        model_labels = [_model_label(m) for m in models]
+        model_labels = [_row_label(m) for m in rows]
         model_handles = [
-            Patch(facecolor=colors[m], edgecolor=PLOT_BG, label=lab)
-            for m, lab in zip(models, model_labels, strict=True)
+            Patch(facecolor=colors[m], edgecolor=PLOT_BG, label=lab) for m, lab in zip(rows, model_labels, strict=True)
         ]
         fig.legend(
             model_handles, model_labels, title="model", frameon=False, loc="upper left", bbox_to_anchor=(1.0, 0.98)

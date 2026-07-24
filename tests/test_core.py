@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -584,6 +585,32 @@ def test_metrics_figure_paints_bars_with_the_palette(runs_root: Path, model: str
         assert "#3b7ea1" in faces
     finally:
         plt.close(figure)
+
+
+def test_metrics_figure_pools_every_model_into_a_last_grey_bar(runs_root: Path, model: str, make_result) -> None:
+    """With several models, each cell ends in a grey bar over all of them pooled.
+
+    It is the rate across every run, not the mean of the per-model rates — an under-sampled
+    model must not weigh as much as a well-sampled one.
+    """
+    other = "claude-opus-5"
+    key = RunKey(arm="noskill", split="test", model=other, task_id="example_task", rep=1)
+    make_result(runs_root, key, success=False)
+    make_result(runs_root, replace(key, rep=2), success=False)
+    df = load_results(runs_root)  # the fixture's one passing test run, plus two failing ones
+
+    figure = metrics_figure(df, split_hue=False, colors=resolve_palette([model, other]))
+    try:
+        (rate_ax,) = [ax for ax in figure.axes if ax.get_title() == "Success rate"]
+        bars = rate_ax.patches
+        widths = [bar.get_width() for bar in bars]
+        pooled_color = to_hex(bars[-1].get_facecolor())
+    finally:
+        plt.close(figure)
+
+    # Most potent model first, then the pooled bar last: opus 0/2, haiku 1/1, overall 1/3.
+    assert widths == pytest.approx([0.0, 1.0, 1 / 3])
+    assert pooled_color not in {to_hex(c) for c in resolve_palette([model, other]).values()}
 
 
 def test_skill_loaded_column_counts_undetermined_runs_as_not_loaded(runs_root: Path, model: str, make_result) -> None:
