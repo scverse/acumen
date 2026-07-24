@@ -514,6 +514,31 @@ def test_metrics_figure_paints_bars_with_the_palette(runs_root: Path, model: str
         plt.close(figure)
 
 
+def test_skill_loaded_column_counts_undetermined_runs_as_not_loaded(runs_root: Path, model: str, make_result) -> None:
+    """The load-rate bar is the share of runs that loaded the skill under test.
+
+    A run whose transcript could not be read is undetermined, not evidence of a load, so it
+    counts against the rate — the same reading the runs CSV takes.
+    """
+    for rep, loaded in ((1, True), (2, None)):
+        key = RunKey(arm="skill_v1", split="test", model=model, task_id="example_task", rep=rep)
+        make_result(runs_root, key, skill_loaded=loaded)
+    df = load_results(runs_root)
+
+    figure = metrics_figure(df, split_hue=False, colors=resolve_palette([model]))
+    try:
+        # Only the top row is titled, so the title locates the column; the grid is
+        # row-major with one row per arm — noskill first, then skill v1.
+        columns = [i for i, ax in enumerate(figure.axes) if ax.get_title() == "Skill loaded"]
+        assert len(columns) == 1
+        n_cols = len(figure.axes) // 2
+        widths = [figure.axes[columns[0] + row * n_cols].patches[0].get_width() for row in range(2)]
+    finally:
+        plt.close(figure)
+
+    assert widths == [0.0, 0.5]  # the baseline loaded nothing; one of two skill runs is determined
+
+
 # --- orphan reaping --------------------------------------------------------------------
 
 #: A child that outlives its parent, and a parent that exits immediately after starting it.

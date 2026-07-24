@@ -215,6 +215,18 @@ def _rate_and_error(successes: pd.Series) -> tuple[float, float]:
     return p, math.sqrt(p * (1.0 - p) / n)
 
 
+def _loaded_flags(df: pd.DataFrame) -> pd.Series:
+    """Per-run "loaded the skill under test" booleans, one per row of ``df``.
+
+    A run whose transcript could not be read leaves ``skill_loaded`` unset — undetermined,
+    which is not evidence the skill loaded, so it reads ``False`` here and counts against
+    the load rate. Results predating the field are treated the same way.
+    """
+    if "skill_loaded" not in df.columns:
+        return pd.Series(False, index=df.index, dtype=bool)
+    return df["skill_loaded"].fillna(False).astype(bool)
+
+
 def arm_metrics(df: pd.DataFrame) -> pd.DataFrame:
     """Per-arm success rate and resource totals for the runs in ``df``.
 
@@ -248,16 +260,21 @@ def arm_metrics(df: pd.DataFrame) -> pd.DataFrame:
 # ── Figures ──────────────────────────────────────────────────────────────────────────
 
 
-#: The four metric columns: (title, key, x-axis formatter, bar-label fn). The key selects
-#: the value; ``"rate"`` is special-cased for binomial error bars.
+#: The metric columns: (title, key, x-axis formatter, bar-label fn). The key selects the
+#: value; the proportion keys below are special-cased for binomial error bars.
 _COLUMNS = [
     ("Success rate", "rate", mticker.PercentFormatter(1.0), lambda v: f"{v:.0%}"),
+    ("Skill loaded", "loaded", mticker.PercentFormatter(1.0), lambda v: f"{v:.0%}"),
     ("Total tokens", "tokens", mticker.FuncFormatter(lambda v, _p: _fmt_tokens(v)), _fmt_tokens),
     ("Total cost", "cost", mticker.FuncFormatter(lambda v, _p: f"${v:.2f}"), lambda v: f"${v:.2f}"),
     ("Total time", "time", mticker.FuncFormatter(lambda v, _p: _fmt_seconds(v)), _fmt_seconds),
 ]
 
-#: Metric key → the column that is summed for it (``rate`` is handled separately).
+#: Metric key → the boolean column it averages. These are proportions of runs, drawn on a
+#: fixed 0–1 axis with a binomial error bar; every other key sums a resource column.
+_PROPORTION_COLUMN = {"rate": "success", "loaded": "skill_loaded"}
+
+#: Metric key → the column that is summed for it (the proportions are handled separately).
 _SUM_COLUMN = {"tokens": "total_tokens", "cost": "cost_usd", "time": "duration_s"}
 
 
@@ -351,9 +368,10 @@ def _models_in_order(df: pd.DataFrame) -> list[str]:
 def _cell_value(df: pd.DataFrame, arm: str, model: str, split: str, key: str) -> tuple[float, float, bool]:
     """One (arm, model, split) cell's metric value, its error bar, and whether it has runs.
 
-    For ``rate`` it is the success rate and its binomial standard error. For the resource
-    totals it is the sum and the standard deviation of that sum — ``sqrt(n) * std`` over
-    the per-run values, i.e. how much the total would vary run to run (0 with <2 runs).
+    For the proportions (``rate``, ``loaded``) it is the fraction of runs and its binomial
+    standard error. For the resource totals it is the sum and the standard deviation of that
+    sum — ``sqrt(n) * std`` over the per-run values, i.e. how much the total would vary run
+    to run (0 with <2 runs).
 
     The third element distinguishes a genuine zero (e.g. a 0% success rate) from a cell with
     no runs at all: a model not run in this arm reserves its slot but draws no bar.
@@ -361,8 +379,9 @@ def _cell_value(df: pd.DataFrame, arm: str, model: str, split: str, key: str) ->
     group = df[(df["arm"] == arm) & (df["model"] == model) & (df["split"] == split)]
     if group.empty:
         return 0.0, 0.0, False
-    if key == "rate":
-        rate, error = _rate_and_error(group["success"])
+    if key in _PROPORTION_COLUMN:
+        flags = _loaded_flags(group) if key == "loaded" else group[_PROPORTION_COLUMN[key]]
+        rate, error = _rate_and_error(flags)
         return rate, error, True
     values = group[_SUM_COLUMN[key]]
     total = float(values.sum())
@@ -422,10 +441,14 @@ def _draw_cell(
 def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, str] | None = None) -> plt.Figure:
     """The metrics grid: one subplot row per skill, one column per metric.
 
-    Columns (success rate with binomial error bars, total tokens, total cost, total time)
-    share an x-axis so skills are comparable within a metric. Inside each cell, bars are
-    coloured by model; when ``split_hue`` is set, train and test are shown as two textures
-    (test solid, train hatched) rather than two colours, leaving the model hue intact.
+    Columns (success rate and skill-load rate, both with binomial error bars, then total
+    tokens, cost and time) share an x-axis so skills are comparable within a metric. The
+    load rate is the share of runs that loaded the skill under test — the baseline arm is
+    drawn too, where a bar above zero means the baseline is not clean.
+
+    Inside each cell, bars are coloured by model; when ``split_hue`` is set, train and test
+    are shown as two textures (test solid, train hatched) rather than two colours, leaving
+    the model hue intact.
 
     Parameters
     ----------
@@ -453,7 +476,9 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, st
         # Height scales with the number of bars per cell; the small constant covers the
         # per-row breathing room, not a fixed block, so few-model plots stay compact.
         row_h = 0.26 * max_bars + 0.22
-        fig, axes = plt.subplots(n_rows, 4, sharex="col", squeeze=False, figsize=(8.4, n_rows * row_h + 0.6))
+        fig, axes = plt.subplots(
+            n_rows, len(_COLUMNS), sharex="col", squeeze=False, figsize=(10.0, n_rows * row_h + 0.6)
+        )
         for c, (title, key, formatter, value_label) in enumerate(_COLUMNS):
             for r, arm in enumerate(arms):
                 ax = axes[r][c]
@@ -465,7 +490,7 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, st
                 if c == 0:
                     ax.set_ylabel(_skill_label(arm), rotation=0, ha="right", va="center", fontweight="bold")
             # sharex="col" ties the whole column together, so one xlim covers every row.
-            if key == "rate":
+            if key in _PROPORTION_COLUMN:
                 axes[-1][c].set_xlim(0, 1.28)
             else:
                 reach = max(
@@ -538,7 +563,7 @@ def _integrity_notes(df: pd.DataFrame) -> list[str]:
         return notes
     for arm in _arms_in_order(df):
         group = df[df["arm"] == arm]
-        loaded = int(group["skill_loaded"].fillna(False).sum())
+        loaded = int(_loaded_flags(group).sum())
         if arm == NOSKILL_ARM:
             if loaded:
                 notes.append(f"baseline arm '{arm}' loaded the skill under test in {loaded}/{len(group)} runs")
@@ -954,10 +979,10 @@ def build_report(
     internal = [c for c in ("result_path", "transcript_path", "_arm_order") if c in df.columns]
     data = df.drop(columns=internal)
     if "skill_loaded" in data.columns:
-        # The HTML keeps '?' for a run whose transcript could not be read, but the CSV is
-        # for counting: every row is True or False, so summing the column means what it
-        # looks like. Undetermined is not evidence the skill loaded, so it reads False.
-        data["skill_loaded"] = data["skill_loaded"].fillna(False).astype(bool)
+        # The HTML table keeps '?' for a run whose transcript could not be read, but the CSV
+        # is for counting: every row is True or False, so summing the column means what it
+        # looks like — the same reading the skill-loaded figure takes.
+        data["skill_loaded"] = _loaded_flags(data)
     data.to_csv(data_path, index=False)
 
     html_text = render_report(
