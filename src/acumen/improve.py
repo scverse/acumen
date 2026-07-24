@@ -394,7 +394,13 @@ async def improve_skill(
         _seed_staging(staging, parent)
         _write_material(train_dir, train_runs)
 
-        env = build_agent_env(config_dir=config_dir, home=home, extra_path=[target.bin_dir], auth_mode=auth_mode)
+        env = build_agent_env(
+            config_dir=config_dir,
+            home=home,
+            extra_path=[target.bin_dir],
+            auth_mode=auth_mode,
+            extra_allow=cfg.env_passthrough,
+        )
 
         prompt = improve_prompt(
             package=target.pkg_name,

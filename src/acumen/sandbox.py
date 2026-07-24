@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,6 +86,7 @@ def sandbox(
     base: Path | None = None,
     keep: bool = False,
     skill: Skill | None = None,
+    env_passthrough: Sequence[str] | None = None,
 ) -> Iterator[Sandbox]:
     """Create a fresh sandbox for one run and clean it up afterwards.
 
@@ -102,6 +103,9 @@ def sandbox(
         Leave the sandbox on disk after the run — useful when debugging a failure.
     skill
         Skill to install for this run, or ``None`` for the baseline arm.
+    env_passthrough
+        Extra environment variable names to carry into the sandbox on top of the built-in
+        allowlist (the operator's ``config.env_passthrough``).
 
     Yields
     ------
@@ -118,7 +122,13 @@ def sandbox(
             path.mkdir(parents=True, exist_ok=True)
         if skill is not None:
             install_skill(root, skill)
-        env = build_agent_env(config_dir=config_dir, home=home, extra_path=[target.bin_dir], auth_mode=auth_mode)
+        env = build_agent_env(
+            config_dir=config_dir,
+            home=home,
+            extra_path=[target.bin_dir],
+            auth_mode=auth_mode,
+            extra_allow=env_passthrough,
+        )
         yield Sandbox(
             root=root,
             home=home,

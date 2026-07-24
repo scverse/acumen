@@ -22,6 +22,7 @@ repo: https://github.com/OWNER/REPO   # GitHub URL, or a local path to an instal
 ref: main                             # branch, tag, or commit (ignored for local paths)
 extras: []                            # optional pip extras, e.g. [dev, test]
 python: "3.12"                        # interpreter for the target's throwaway venv
+env_passthrough: []                   # extra env vars agents may keep (e.g. [OMP_NUM_THREADS]); the agent env is otherwise a clean allowlist
 
 models: [claude-opus-4-8, claude-sonnet-5, claude-haiku-4-5-20251001]   # benchmark models; a pass is models x tasks x reps x splits
 n_replicates: 3                       # runs per (model, task, split) cell

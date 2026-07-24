@@ -89,8 +89,12 @@ def test_config_defaults_and_derived_skill_name() -> None:
     assert cfg.skill_name == "scanpy"
     assert cfg.ref == "main"
     assert cfg.n_replicates == 3
+    assert cfg.env_passthrough == []
     assert not cfg.is_local
     assert derive_skill_name("git@github.com:scverse/scanpy.git") == "scanpy"
+
+    cfg2 = parse_config({"repo": "https://github.com/scverse/scanpy", "env_passthrough": ["OMP_NUM_THREADS"]})
+    assert cfg2.env_passthrough == ["OMP_NUM_THREADS"]
 
 
 def test_config_rejects_unknown_keys() -> None:
@@ -383,6 +387,49 @@ def test_session_mode_neutralizes_the_api_key_under_the_sdk_env_merge(
         merged = {**os.environ, **agent_env}  # what the SDK actually hands the subprocess
         assert not merged["ANTHROPIC_API_KEY"], "API key leaked into a session-mode agent"
         assert merged["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-token"
+
+
+def test_scrubbed_env_blanks_ambient_vars_under_the_sdk_env_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-allowlisted ambient variable must not reach the agent through the env merge.
+
+    The SDK builds the agent env as ``{**os.environ, **options.env}``, so a variable
+    scrubbed_env merely omits falls straight through from the operator's shell into the
+    web-enabled agent. scrubbed_env therefore blanks every inherited variable it did not
+    keep, and the check that matters is on the *merged* mapping, not the returned dict.
+    """
+    _clear_auth(monkeypatch, tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")  # allowlisted — must survive
+    monkeypatch.setenv("MY_APP_SECRET", "hunter2")  # ambient secret — must be neutralized
+    monkeypatch.setenv("OMP_NUM_THREADS", "8")  # target-needed — kept only via env_passthrough
+    home = tmp_path / "home"
+
+    env = scrubbed_env(config_dir=tmp_path / "cfg", home=home, auth_mode="api")
+    merged = {**os.environ, **env}  # what the SDK actually hands the subprocess
+    assert merged["ANTHROPIC_API_KEY"] == "sk-test"  # allowlisted credential preserved
+    assert not merged["MY_APP_SECRET"], "ambient secret leaked into a benchmark agent"
+    assert not merged["OMP_NUM_THREADS"], "non-allowlisted var leaked without env_passthrough"
+    # Our throwaway overrides still land.
+    assert merged["CLAUDE_CODE_DISABLE_CLAUDE_MDS"] == "1"
+    assert merged["HOME"] == str(home)
+
+
+def test_env_passthrough_carries_declared_vars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A variable named in env_passthrough survives the scrub; an undeclared one does not."""
+    _clear_auth(monkeypatch, tmp_path)
+    monkeypatch.setenv("OMP_NUM_THREADS", "8")
+    monkeypatch.setenv("MY_APP_SECRET", "hunter2")
+    home = tmp_path / "home"
+
+    env = scrubbed_env(config_dir=tmp_path / "cfg", home=home, auth_mode="api", extra_allow=["OMP_NUM_THREADS"])
+    merged = {**os.environ, **env}
+    assert merged["OMP_NUM_THREADS"] == "8", "declared passthrough var was dropped"
+    assert not merged["MY_APP_SECRET"], "undeclared var leaked"
+
+    # A declared var that isn't actually set in the shell is simply absent, not blanked to "".
+    env2 = scrubbed_env(config_dir=tmp_path / "cfg", home=home, auth_mode="api", extra_allow=["NOT_SET_ANYWHERE"])
+    assert "NOT_SET_ANYWHERE" not in env2
 
 
 def test_build_agent_env_seeds_only_in_session_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

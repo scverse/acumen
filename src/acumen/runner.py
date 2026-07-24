@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import shutil
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
@@ -198,6 +198,7 @@ async def run_once(
     sandbox_base: Path | None = None,
     keep_sandbox: bool = False,
     stderr: Callable[[str], None] | None = None,
+    env_passthrough: Sequence[str] | None = None,
 ) -> RunOutcome:
     """Execute one benchmark run end to end and write its ``result.json``.
 
@@ -227,6 +228,9 @@ async def run_once(
         Callback for the CLI subprocess's stderr, one line at a time. Pass a shared
         :class:`StderrFilter` across a pass to collapse the per-spawn startup warnings;
         ``None`` (the default) lets the subprocess stderr inherit the terminal unfiltered.
+    env_passthrough
+        Extra environment variable names to carry into the sandbox on top of the built-in
+        allowlist (the operator's ``config.env_passthrough``).
 
     Returns
     -------
@@ -244,7 +248,14 @@ async def run_once(
     result: ResultMessage | None = None
     error: str | None = None
 
-    with sandbox(target, auth_mode=auth_mode, base=sandbox_base, keep=keep_sandbox, skill=skill) as box:
+    with sandbox(
+        target,
+        auth_mode=auth_mode,
+        base=sandbox_base,
+        keep=keep_sandbox,
+        skill=skill,
+        env_passthrough=env_passthrough,
+    ) as box:
         prompt = benchmark_prompt(
             split.prompt,
             sandbox=box.root,

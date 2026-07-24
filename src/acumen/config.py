@@ -24,6 +24,13 @@ class Config:
     ref: str = "main"
     extras: list[str] = field(default_factory=list)
     python: str = "3.12"
+    #: Names of environment variables to carry from the operator's shell into isolated
+    #: agents (bench sandboxes and the draft/improve/tasks meta-agents), on top of the
+    #: built-in auth/proxy allowlist. The agent env is otherwise a clean allowlist — every
+    #: other inherited variable is blanked — so a target that needs a runtime variable
+    #: (``OMP_NUM_THREADS``, ``R_HOME``, a service key) must name it here. Values are passed
+    #: through verbatim; only list what the package genuinely needs.
+    env_passthrough: list[str] = field(default_factory=list)
     models: list[str] = field(default_factory=lambda: ["claude-opus-4-8"])
     n_replicates: int = 3
     max_concurrency: int = 4
@@ -48,6 +55,7 @@ _KNOWN = {
     "ref",
     "extras",
     "python",
+    "env_passthrough",
     "models",
     "n_replicates",
     "max_concurrency",
@@ -156,6 +164,7 @@ def parse_config(raw: Any) -> Config:
         ref=_optional_str(raw, "ref", "main"),
         extras=_str_list(raw, "extras", []),
         python=_optional_str(raw, "python", "3.12"),
+        env_passthrough=_str_list(raw, "env_passthrough", []),
         models=models,
         n_replicates=_positive_int(raw, "n_replicates", 3),
         max_concurrency=_positive_int(raw, "max_concurrency", 4),

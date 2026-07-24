@@ -341,7 +341,13 @@ async def generate_tasks(
         # real checkout — so existing skills cannot bias the tasks it generates.
         source_copy = build_filtered_source(target.src_dir, holder / "source")
 
-        env = build_agent_env(config_dir=config_dir, home=home, extra_path=[target.bin_dir], auth_mode=auth_mode)
+        env = build_agent_env(
+            config_dir=config_dir,
+            home=home,
+            extra_path=[target.bin_dir],
+            auth_mode=auth_mode,
+            extra_allow=cfg.env_passthrough,
+        )
 
         prompt = taskgen_prompt(
             package=target.pkg_name,

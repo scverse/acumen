@@ -112,6 +112,7 @@ async def run_matrix(
     stderr: Callable[[str], None] | None = None,
     on_start: Callable[[PlannedRun], None] | None = None,
     on_done: Callable[[RunOutcome], None] | None = None,
+    env_passthrough: Sequence[str] | None = None,
 ) -> list[RunOutcome]:
     """Run planned runs concurrently, bounded by ``max_concurrency``.
 
@@ -148,6 +149,9 @@ async def run_matrix(
     on_done
         Optional callable invoked with each :class:`~acumen.runner.RunOutcome` as it
         lands, for progress output.
+    env_passthrough
+        Extra environment variable names each run carries into its sandbox on top of the
+        built-in allowlist (the operator's ``config.env_passthrough``).
 
     Returns
     -------
@@ -173,6 +177,7 @@ async def run_matrix(
                 sandbox_base=sandbox_base,
                 keep_sandbox=keep_sandbox,
                 stderr=stderr,
+                env_passthrough=env_passthrough,
             )
             if on_done is not None:
                 on_done(outcome)

@@ -122,7 +122,13 @@ async def draft_skill(
         for path in (staging, home, config_dir, home / "tmp"):
             path.mkdir(parents=True, exist_ok=True)
 
-        env = build_agent_env(config_dir=config_dir, home=home, extra_path=[target.bin_dir], auth_mode=auth_mode)
+        env = build_agent_env(
+            config_dir=config_dir,
+            home=home,
+            extra_path=[target.bin_dir],
+            auth_mode=auth_mode,
+            extra_allow=cfg.env_passthrough,
+        )
 
         prompt = draft_prompt(
             package=target.pkg_name,

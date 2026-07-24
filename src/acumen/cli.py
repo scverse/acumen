@@ -216,6 +216,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
             stderr=StderrFilter(),
             on_start=progress.on_start,
             on_done=progress.on_done,
+            env_passthrough=cfg.env_passthrough,
         )
     )
 

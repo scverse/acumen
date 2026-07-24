@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -464,12 +465,22 @@ def scrubbed_env(
     home: Path,
     extra_path: list[Path] | None = None,
     auth_mode: AuthMode | None = None,
+    extra_allow: Sequence[str] | None = None,
 ) -> dict[str, str]:
     """Build the environment an isolated agent runs under.
 
-    Everything outside :data:`ENV_ALLOWLIST` is dropped. ``HOME`` and
-    ``CLAUDE_CONFIG_DIR`` point at throwaway directories so no user settings or
-    ``CLAUDE.md`` memories are discoverable.
+    The result is a clean allowlist: only :data:`ENV_ALLOWLIST` (plus ``extra_allow``) and
+    a handful of throwaway overrides survive; **every other variable inherited from the
+    operator's shell is blanked**. ``HOME`` and ``CLAUDE_CONFIG_DIR`` point at throwaway
+    directories so no user settings or ``CLAUDE.md`` memories are discoverable.
+
+    The blanking is not cosmetic. The SDK builds the agent subprocess env as
+    ``{**os.environ, **options.env}`` — it merges this mapping *over* the inherited
+    environment (see :func:`_apply_auth_mode`), so a variable we merely *omit* falls back
+    through from ``os.environ`` unchanged. To actually keep an ambient secret out of the
+    (web-enabled) agent we must return it set to ``""``, which overrides the inherited value
+    and the CLI reads as unset. So we enumerate everything in ``os.environ`` that isn't
+    allowlisted or overridden and empty it explicitly.
 
     Parameters
     ----------
@@ -486,12 +497,17 @@ def scrubbed_env(
         ``None`` leaves both in place (the historical behavior). Note that ``"session"`` needs
         :func:`seed_credentials` to have placed the OAuth login in ``config_dir`` — pair the
         two via :func:`build_agent_env`.
+    extra_allow
+        Additional variable names to carry through from ``os.environ`` on top of
+        :data:`ENV_ALLOWLIST` — the operator's declared ``env_passthrough``, for a target
+        that needs a runtime variable the built-in allowlist doesn't cover.
 
     Returns
     -------
     The environment mapping to hand to the SDK.
     """
-    env = {key: os.environ[key] for key in ENV_ALLOWLIST if key in os.environ}
+    allow = (*ENV_ALLOWLIST, *(extra_allow or ()))
+    env = {key: os.environ[key] for key in allow if key in os.environ}
     _apply_auth_mode(env, auth_mode)
 
     path_parts = [str(p) for p in (extra_path or [])]
@@ -522,6 +538,15 @@ def scrubbed_env(
     # Keep pip/uv from reaching into the real user's caches and configs.
     env["XDG_CONFIG_HOME"] = str(home / ".config")
     env["XDG_CACHE_HOME"] = str(home / ".cache")
+
+    # Blank every inherited variable we did not deliberately keep or override. Omission is a
+    # no-op under the SDK's env merge, so the only way to stop the operator's ambient secrets
+    # (cloud creds, service tokens, anything exported in the shell) from reaching a web-enabled
+    # agent is to override each one with an empty value. Anything a target legitimately needs is
+    # declared via extra_allow (config env_passthrough) and was kept above.
+    for key in os.environ:
+        if key not in env:
+            env[key] = ""
     return env
 
 
@@ -531,6 +556,7 @@ def build_agent_env(
     home: Path,
     extra_path: list[Path] | None = None,
     auth_mode: AuthMode,
+    extra_allow: Sequence[str] | None = None,
 ) -> dict[str, str]:
     """Prepare an isolated agent's environment for a resolved auth mode.
 
@@ -541,11 +567,15 @@ def build_agent_env(
     way exactly one credential reaches the run, so billing is deterministic.
 
     Every isolated agent (bench sandboxes and the draft/improve/tasks meta-agents) builds its
-    env through here, so the seed-and-scrub pairing lives in one place.
+    env through here, so the seed-and-scrub pairing lives in one place. ``extra_allow`` (the
+    operator's ``env_passthrough``) names variables to carry through on top of the built-in
+    allowlist, for a target that needs one at runtime.
     """
     if auth_mode == "session":
         seed_credentials(config_dir)
-    return scrubbed_env(config_dir=config_dir, home=home, extra_path=extra_path, auth_mode=auth_mode)
+    return scrubbed_env(
+        config_dir=config_dir, home=home, extra_path=extra_path, auth_mode=auth_mode, extra_allow=extra_allow
+    )
 
 
 def _default_cache_root() -> Path:
