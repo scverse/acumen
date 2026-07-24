@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 
 import pytest
+from matplotlib import pyplot as plt
+from matplotlib.colors import to_hex
 
 from acumen.bench import build_matrix, pending
 from acumen.config import ConfigError, derive_skill_name, load_config, parse_config
@@ -28,6 +30,7 @@ from acumen.env import (
 from acumen.grade import grade_answer, grade_run
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
 from acumen.prompts import draft_prompt, feedback_block
+from acumen.report import ReportError, load_results, metrics_figure, resolve_palette
 from acumen.runner import StderrFilter
 from acumen.ship import _ship_env
 from acumen.skills import SkillError, load_skill, read_meta, skill_hash, write_meta
@@ -445,3 +448,40 @@ def test_build_agent_env_seeds_only_in_session_mode(tmp_path: Path, monkeypatch:
     api_cfg = tmp_path / "api_cfg"
     build_agent_env(config_dir=api_cfg, home=home, auth_mode="api")
     assert not (api_cfg / ".credentials.json").exists()  # not seeded
+
+
+def test_resolve_palette_overrides_by_id_and_by_label() -> None:
+    """An override wins over the tier default, keyed by the raw id or its display form."""
+    models = ["claude-opus-5", "claude-haiku-4-5-20251001"]
+
+    colors = resolve_palette(models, {"claude-opus-5": "#3b7ea1", "claude-haiku-4-5": "rebeccapurple"})
+
+    assert colors["claude-opus-5"] == "#3b7ea1"
+    # The legend strips the snapshot date, so that form is accepted as a key too.
+    assert colors["claude-haiku-4-5-20251001"] == "rebeccapurple"
+    # Every model gets an entry, overridden or not.
+    assert resolve_palette(models, None) == resolve_palette(models, {})
+    assert set(resolve_palette(models, None)) == set(models)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"claude-opus-5": "not-a-colour"}, "not a colour"),
+        ({"gpt-4": "#3b7ea1"}, "no such model"),
+    ],
+)
+def test_resolve_palette_rejects_bad_input(overrides: dict[str, str], message: str) -> None:
+    with pytest.raises(ReportError, match=message):
+        resolve_palette(["claude-opus-5"], overrides)
+
+
+def test_metrics_figure_paints_bars_with_the_palette(runs_root: Path, model: str) -> None:
+    """The resolved colour reaches the bars themselves, not just the legend."""
+    df = load_results(runs_root)
+    figure = metrics_figure(df, split_hue=False, colors=resolve_palette([model], {model: "#3b7ea1"}))
+    try:
+        faces = {to_hex(patch.get_facecolor()) for ax in figure.axes for patch in ax.patches}
+        assert "#3b7ea1" in faces
+    finally:
+        plt.close(figure)

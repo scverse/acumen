@@ -453,6 +453,24 @@ def _cmd_ship(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_palette(values: list[str] | None) -> dict[str, str]:
+    """Parse ``--palette MODEL=COLOUR`` arguments into a mapping.
+
+    The flag repeats, and one value may carry several comma-separated pairs — neither a
+    model id nor a colour spec contains a comma, so the split is unambiguous.
+    """
+    palette = {}
+    for value in values or []:
+        for pair in value.split(","):
+            if not pair.strip():
+                continue
+            model, sep, color = pair.partition("=")
+            if not sep or not model.strip() or not color.strip():
+                raise ReportError(f"--palette expects MODEL=COLOUR, got {pair.strip()!r}")
+            palette[model.strip()] = color.strip()
+    return palette
+
+
 def _cmd_report(args: argparse.Namespace) -> int:
     tasks = load_tasks(args.tasks) if args.tasks.exists() else None
     if tasks is None:
@@ -460,7 +478,7 @@ def _cmd_report(args: argparse.Namespace) -> int:
     skills_root = args.skills if args.skills.is_dir() else None
     if skills_root is None:
         print(f"note: {args.skills} not found — skill rationale/diff will be omitted", file=sys.stderr)
-    report = build_report(args.runs, args.out, tasks, skills_root=skills_root)
+    report = build_report(args.runs, args.out, tasks, skills_root=skills_root, palette=_parse_palette(args.palette))
     df = report.results
     arms = ", ".join(sorted(df["arm_label"].unique(), key=lambda a: (a != "noskill", a)))
     print(f"aggregated {report.n_runs} runs across arms: {arms}")
@@ -558,6 +576,12 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml (for task text)")
     report.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree (rationale/diff)")
     report.add_argument("--out", type=Path, default=Path("report.html"), help="output HTML path (overwritten)")
+    report.add_argument(
+        "--palette",
+        action="append",
+        metavar="MODEL=COLOUR",
+        help="recolour a model's bars, e.g. --palette claude-opus-5=#3b7ea1 (repeatable, or comma-separated)",
+    )
     report.set_defaults(func=_cmd_report)
 
     init = sub.add_parser("init", help="scaffold a starter config.yaml and tasks.yaml")

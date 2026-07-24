@@ -22,7 +22,7 @@ import io
 import json
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,6 +34,7 @@ matplotlib.use("Agg")  # headless: we never open a window, we render straight to
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import pandas as pd
+from matplotlib.colors import is_color_like
 from matplotlib.patches import Patch
 
 from acumen.paths import NOSKILL_ARM, RESULT_FILE, TRANSCRIPT_HTML, skill_from_arm
@@ -41,13 +42,14 @@ from acumen.skills import SkillError, read_meta, skill_content, skill_dir
 from acumen.tasks import Task
 
 # ── Palette ──────────────────────────────────────────────────────────────────────────
-# A warm-neutral scheme fixed by the maintainer. The two surfaces are the page and the
-# plot area, one a step lighter than the other, which gives each figure a subtle card
-# inset against the page. Bars are coloured by model (see the sequential ramp below);
-# train/test is a texture, not a colour.
+# A warm-neutral scheme fixed by the maintainer. The page and the plot area are both white,
+# so a figure sits on the page with no visible frame around it and the ink carries the
+# structure. Bars are coloured by model (see the sequential ramp below); train/test is a
+# texture, not a colour.
 INK = "#1c1813"  # axes, text, ticks
-PAGE = "#efe7d7"  # page + figure background
-PLOT_BG = "#f7f3ec"  # the plot area itself, a step lighter than the page
+PAGE = "#ffffff"  # page + figure background
+PLOT_BG = "#ffffff"  # the plot area itself; also the hairline between adjacent bars
+SURFACE = "#f7f3ec"  # the one tinted surface — the inline skill diffs, so code reads as a block
 BAR = "#565149"  # a neutral tone, used where model hue does not apply
 ACCENT = "#b2ac9e"  # the light warm tone, for table tints and notes
 
@@ -55,7 +57,8 @@ ACCENT = "#b2ac9e"  # the light warm tone, for table tints and notes
 # (Fable) is the DARKEST / most saturated — the Claude orange — and each weaker tier is a
 # lighter tint of that same hue. The mapping is fixed by *tier* (parsed from the model id),
 # so a given tier always reads the same colour regardless of which — or how many — models a
-# pass happens to include.
+# pass happens to include. This is only the *default*: a caller can recolour any model by id
+# (see :func:`resolve_palette`), while the page and plot surfaces above stay fixed.
 _MODEL_ORDER = ("fable", "opus", "sonnet", "haiku")
 _MODEL_COLOR = {
     "fable": "#d86f53",  # Claude orange — most potent, darkest/most saturated
@@ -288,6 +291,53 @@ def _model_label(model: str) -> str:
     return _MODEL_DATE_RE.sub("", model)
 
 
+def resolve_palette(models: Sequence[str], overrides: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Bar colour per model id — the tier defaults, with ``overrides`` merged over them.
+
+    Parameters
+    ----------
+    models
+        Every model id the report covers. The result has an entry for each of them, so a
+        figure never has to fall back mid-draw.
+    overrides
+        Colours keyed by model id, e.g. ``{"claude-opus-5": "#3b7ea1"}``. A key may also be
+        the display form with the snapshot date stripped (``claude-haiku-4-5`` for
+        ``claude-haiku-4-5-20251001``), since that is what the legend shows. Any matplotlib
+        colour spec is accepted — hex, a named colour, an ``rgb``/``rgba`` tuple.
+
+    Raises
+    ------
+    ReportError
+        If a colour is unparseable, or a key matches no model in ``models``. Both are
+        caught up front so a typo shows as a clear message rather than a miscoloured
+        figure or a matplotlib error part-way through rendering.
+    """
+    colors = {model: _model_color(model) for model in models}
+    if not overrides:
+        return colors
+
+    unparseable = sorted(f"{key}={value!r}" for key, value in overrides.items() if not is_color_like(value))
+    if unparseable:
+        raise ReportError(f"palette: not a colour: {', '.join(unparseable)}")
+
+    by_label: dict[str, list[str]] = {}
+    for model in models:
+        by_label.setdefault(_model_label(model), []).append(model)
+    unknown = []
+    for key, value in overrides.items():
+        if key in colors:
+            colors[key] = value
+        elif key in by_label:
+            for model in by_label[key]:
+                colors[model] = value
+        else:
+            unknown.append(key)
+    if unknown:
+        known = ", ".join(sorted(models))
+        raise ReportError(f"palette: no such model: {', '.join(sorted(unknown))} (models in these runs: {known})")
+    return colors
+
+
 def _models_in_order(df: pd.DataFrame) -> list[str]:
     """Models present, most-potent first (fable, opus, sonnet, haiku), then any others."""
 
@@ -329,6 +379,7 @@ def _draw_cell(
     key: str,
     *,
     value_label,
+    colors: Mapping[str, str],
 ) -> None:
     """Draw one grid cell — one fixed slot per model (colour), grouped by split (texture).
 
@@ -349,7 +400,7 @@ def _draw_cell(
             [m + offset for m in range(n_models)],
             [value if present else nan for value, _err, present in cells],
             bar_h * 0.86,
-            color=[_model_color(model) for model in models],
+            color=[colors[model] for model in models],
             hatch=_SPLIT_HATCH[split] if n_splits > 1 else "",
             edgecolor=PLOT_BG,
             linewidth=0.6,
@@ -368,7 +419,7 @@ def _draw_cell(
     ax.tick_params(length=0)
 
 
-def metrics_figure(df: pd.DataFrame, *, split_hue: bool) -> plt.Figure:
+def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, str] | None = None) -> plt.Figure:
     """The metrics grid: one subplot row per skill, one column per metric.
 
     Columns (success rate with binomial error bars, total tokens, total cost, total time)
@@ -383,9 +434,16 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool) -> plt.Figure:
     split_hue
         ``True`` for the per-task view (train + test as texture); ``False`` for the
         overview (the reported test split only).
+    colors
+        Bar colour per model id, as returned by :func:`resolve_palette`. It may cover more
+        models than ``df`` holds — one map resolved over the whole report is reused for
+        every per-task figure, so a model keeps its colour across them. Models missing
+        from it fall back to their tier default; ``None`` uses the defaults throughout.
     """
     arms = _arms_in_order(df)
     models = _models_in_order(df)
+    resolved = colors or {}
+    colors = {model: resolved.get(model, _model_color(model)) for model in models}
     splits = list(_SPLIT_ORDER) if split_hue else [_REPORTED_SPLIT]
     # Every model gets a fixed slot in every arm's cell, so bars align across skills and a
     # model that wasn't run leaves a reserved gap rather than letting its neighbour stretch.
@@ -399,7 +457,7 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool) -> plt.Figure:
         for c, (title, key, formatter, value_label) in enumerate(_COLUMNS):
             for r, arm in enumerate(arms):
                 ax = axes[r][c]
-                _draw_cell(ax, df, arm, models, splits, key, value_label=value_label)
+                _draw_cell(ax, df, arm, models, splits, key, value_label=value_label, colors=colors)
                 ax.xaxis.set_major_formatter(formatter)
                 ax.xaxis.set_major_locator(mticker.MaxNLocator(3))
                 if r == 0:
@@ -425,7 +483,7 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool) -> plt.Figure:
 
         model_labels = [_model_label(m) for m in models]
         model_handles = [
-            Patch(facecolor=_model_color(m), edgecolor=PLOT_BG, label=lab)
+            Patch(facecolor=colors[m], edgecolor=PLOT_BG, label=lab)
             for m, lab in zip(models, model_labels, strict=True)
         ]
         fig.legend(
@@ -561,7 +619,7 @@ def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
 
 
 _STYLE = f"""
-:root {{ color-scheme: light; --ink: {INK}; --page: {PAGE}; --plot: {PLOT_BG}; --bar: {BAR}; }}
+:root {{ color-scheme: light; --ink: {INK}; --page: {PAGE}; --surface: {SURFACE}; --bar: {BAR}; }}
 * {{ box-sizing: border-box; }}
 html {{ scroll-behavior: smooth; }}
 body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin: 0; line-height: 1.5;
@@ -597,7 +655,7 @@ tr.fail td {{ background: {ACCENT}66; }}
 .note {{ background: {ACCENT}55; border-left: 3px solid var(--bar); padding: 0.5rem 0.8rem;
         margin: 0.5rem 0; border-radius: 3px; }}
 .rationale {{ margin: 0.3rem 0 0.8rem; white-space: pre-wrap; }}
-pre.diff {{ background: var(--plot); border: 1px solid {INK}22; border-radius: 4px;
+pre.diff {{ background: var(--surface); border: 1px solid {INK}22; border-radius: 4px;
         padding: 0.6rem 0.8rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.35;
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 0.4rem 0 1.4rem; }}
 pre.diff span {{ display: block; white-space: pre; }}
@@ -750,6 +808,7 @@ def render_report(
     tasks: Sequence[Task] | None = None,
     data_href: str | None = None,
     skills_root: Path | None = None,
+    palette: Mapping[str, str] | None = None,
 ) -> str:
     """Render the full report HTML for the results in ``df``.
 
@@ -770,8 +829,14 @@ def render_report(
         The ``skills/`` root, if available — used to render the per-version rationale and a
         diff of each skill against its parent. When ``None`` (or missing), the section is
         omitted, so a noskill-only report still renders.
+    palette
+        Bar colours keyed by model id, overriding the tier defaults — see
+        :func:`resolve_palette`. Resolved once here, against every model in ``df``, so a
+        bad key fails before any figure is drawn and each model keeps one colour across
+        the overview and the per-task figures.
     """
-    overview_uri = figure_data_uri(metrics_figure(df, split_hue=False))
+    colors = resolve_palette(_models_in_order(df), palette)
+    overview_uri = figure_data_uri(metrics_figure(df, split_hue=False, colors=colors))
     task_by_id = {t.id: t for t in tasks or []}
     skills_section, skills_toc = _skills_section_html(df, skills_root)
 
@@ -779,7 +844,7 @@ def render_report(
     toc_tasks = []
     for task_id in sorted(df["task_id"].unique()):
         subset = df[df["task_id"] == task_id]
-        uri = figure_data_uri(metrics_figure(subset, split_hue=True))
+        uri = figure_data_uri(metrics_figure(subset, split_hue=True, colors=colors))
         task = task_by_id.get(task_id)
         desc = _task_desc_html(task) if task is not None else ""
         anchor = f"task-{task_id}"
@@ -849,6 +914,7 @@ def build_report(
     out_path: Path,
     tasks: Sequence[Task] | None = None,
     skills_root: Path | None = None,
+    palette: Mapping[str, str] | None = None,
 ) -> Report:
     """Aggregate the run tree and render ``report.html``.
 
@@ -866,12 +932,16 @@ def build_report(
     skills_root
         The ``skills/`` root, if available — used to render each skill version's rationale
         and its diff against the parent version. When ``None``, the section is omitted.
+    palette
+        Bar colours keyed by model id, e.g. ``{"claude-opus-5": "#3b7ea1"}``, overriding
+        the tier defaults — see :func:`resolve_palette`.
 
     Returns
     -------
     The rendered :class:`Report` (also written to ``out_path``).
     """
     df = load_results(runs_root)
+    resolve_palette(_models_in_order(df), palette)  # reject a bad palette before writing anything
     out_path = out_path.resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -882,6 +952,8 @@ def build_report(
     internal = [c for c in ("result_path", "transcript_path", "_arm_order") if c in df.columns]
     df.drop(columns=internal).to_csv(data_path, index=False)
 
-    html_text = render_report(df, out_path.parent, tasks, data_href=data_path.name, skills_root=skills_root)
+    html_text = render_report(
+        df, out_path.parent, tasks, data_href=data_path.name, skills_root=skills_root, palette=palette
+    )
     out_path.write_text(html_text)
     return Report(html=html_text, results=df)

@@ -125,6 +125,20 @@ def test_report_writes_html_and_csv(project: Path, runs_root: Path, capsys: pyte
     assert "aggregated 2 runs" in capsys.readouterr().out
 
 
+def test_report_palette_recolours_and_validates(
+    project: Path, runs_root: Path, model: str, capsys: pytest.CaptureFixture
+) -> None:
+    """--palette is accepted end to end; a key naming no benchmarked model is an error."""
+    out_path = project / "report.html"
+    argv = ["report", "--runs", str(runs_root), "--out", str(out_path)]
+
+    assert main([*argv, "--palette", f"{model}=#3b7ea1"]) == 0
+    assert out_path.is_file()
+
+    assert main([*argv, "--palette", "gpt-4=#3b7ea1"]) == 2
+    assert "no such model" in capsys.readouterr().err
+
+
 def test_report_without_runs_errors(project: Path, capsys: pytest.CaptureFixture) -> None:
     assert main(["report", "--runs", str(project / "runs"), "--out", str(project / "report.html")]) == 2
     assert "error:" in capsys.readouterr().err

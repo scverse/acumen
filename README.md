@@ -26,7 +26,8 @@ generalization, not memorized answers.
   the skill is the only difference between arms.
 - **`acumen improve`** — refine the skill from its train results, then benchmark again.
 - **`acumen report`** — aggregate every run into one self-contained `report.html`: success
-  rate per version, train vs. test.
+  rate per version, train vs. test. Bars are coloured by model; pass
+  `--palette claude-opus-5=#3b7ea1` (repeatable) to recolour any of them.
 
 You decide when to stop. Every version is benchmarked on both splits, and only train results
 reach the improver — so a widening train/test gap is a visible sign a skill is overfitting

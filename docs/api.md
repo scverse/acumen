@@ -145,6 +145,7 @@ conversion.
     build_report
     load_results
     arm_metrics
+    resolve_palette
     Report
 ```
 
