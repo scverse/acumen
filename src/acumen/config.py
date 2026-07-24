@@ -34,6 +34,7 @@ class Config:
     models: list[str] = field(default_factory=lambda: ["claude-opus-5"])
     n_replicates: int = 3
     max_concurrency: int = 4
+    #: Turn cap for benchmark agents only; draft/improve/ship/tasks are unbounded by default.
     max_turns: int = 40
     #: Budget cap (USD) for benchmark agents only; draft/improve/ship/tasks are unbounded by default.
     max_usd: float = 3.0

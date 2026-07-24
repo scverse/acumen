@@ -307,7 +307,7 @@ def _validate_staged(staging: Path, skill_name: str) -> None:
     if not (staging / SKILL_FILE).is_file():
         raise ImproveError(
             f"the improving agent left no {SKILL_FILE} in the staging directory — nothing to "
-            "promote. Inspect the prompt or raise max_turns."
+            "promote. Inspect the run log or the prompt."
         )
     try:
         load_skill(staging.parent, staging.name, expect_name=skill_name)
@@ -350,11 +350,12 @@ async def improve_skill(
         subscription) or ``"api"`` (see :func:`acumen.env.build_agent_env`).
     parent_version
         The version to improve; defaults to the latest present.
-    model, max_turns
-        Overrides for the improving agent; default to the config's.
-    max_usd
-        Budget cap for the improving agent. **Unbounded by default** — the config's ``max_usd``
-        caps benchmark agents only; pass an explicit cap to bound the improver.
+    model
+        Override for the improving model; defaults to the config's.
+    max_turns, max_usd
+        Turn and budget caps for the improving agent. **Unbounded by default** — the config's
+        ``max_turns``/``max_usd`` cap benchmark agents only; pass explicit caps to bound the
+        improver.
     feedback
         Optional maintainer guidance, injected into the improve prompt as a subordinated block
         and recorded in ``meta.json`` as provenance. It is prompt text only — it cannot reach
@@ -423,9 +424,9 @@ async def improve_skill(
             cwd=str(work),
             env=env,
             model=model or cfg.improve_model,
-            max_turns=max_turns or cfg.max_turns,
-            # No default budget cap: only bound the agent if the caller asked. The config's
-            # ``max_usd`` caps benchmark agents only.
+            # No default turn or budget cap: only bound the agent if the caller asked. The
+            # config's ``max_turns``/``max_usd`` cap benchmark agents only.
+            max_turns=max_turns,
             max_budget_usd=max_usd,
             setting_sources=["project"],
             permission_mode="bypassPermissions",

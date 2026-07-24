@@ -28,7 +28,7 @@ models: [claude-opus-5, claude-sonnet-5, claude-haiku-4-5-20251001]   # benchmar
 n_replicates: 3                       # runs per (model, task, split) cell
 max_concurrency: 4                    # simultaneous agents
 
-max_turns: 40                         # per-agent turn cap; a breach is recorded as a failure
+max_turns: 40                         # turn cap for benchmark agents; draft/improve/ship/tasks are unbounded
 max_usd: 3.0                          # budget cap (USD) for benchmark agents; draft/improve/ship/tasks are unbounded
 
 draft_model: claude-opus-5            # model that writes the first skill (reads the source)

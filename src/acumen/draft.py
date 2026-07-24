@@ -55,8 +55,7 @@ def _validate_staged(staging: Path, skill_name: str) -> None:
     """Fail loudly if the agent's output isn't a usable skill, before it becomes a version."""
     if not (staging / SKILL_FILE).is_file():
         raise DraftError(
-            f"the drafting agent did not write {SKILL_FILE} — nothing to promote. "
-            "Inspect the prompt or raise max_turns."
+            f"the drafting agent did not write {SKILL_FILE} — nothing to promote. Inspect the run log or the prompt."
         )
     # load_skill enforces the frontmatter contract (name matches, description present).
     try:
@@ -91,11 +90,12 @@ async def draft_skill(
     auth_mode
         Which credential the drafting agent authenticates with — ``"session"`` (the Claude
         subscription) or ``"api"`` (see :func:`acumen.env.build_agent_env`).
-    model, max_turns
-        Overrides for the drafting agent; default to the config's.
-    max_usd
-        Budget cap for the drafting agent. **Unbounded by default** — the config's ``max_usd``
-        caps benchmark agents only; pass an explicit cap to bound the drafter.
+    model
+        Override for the drafting model; defaults to the config's.
+    max_turns, max_usd
+        Turn and budget caps for the drafting agent. **Unbounded by default** — the config's
+        ``max_turns``/``max_usd`` cap benchmark agents only; pass explicit caps to bound the
+        drafter.
     rationale
         Recorded in ``meta.json`` as why this version exists.
     feedback
@@ -148,9 +148,9 @@ async def draft_skill(
             cwd=str(work),
             env=env,
             model=model or cfg.draft_model,
-            max_turns=max_turns or cfg.max_turns,
-            # No default budget cap: only bound the agent if the caller asked. The config's
-            # ``max_usd`` caps benchmark agents only.
+            # No default turn or budget cap: only bound the agent if the caller asked. The
+            # config's ``max_turns``/``max_usd`` cap benchmark agents only.
+            max_turns=max_turns,
             max_budget_usd=max_usd,
             # The drafter reads the target source; benchmark agents never do.
             add_dirs=[str(target.src_dir)],
