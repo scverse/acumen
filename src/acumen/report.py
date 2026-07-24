@@ -259,7 +259,7 @@ _SUM_COLUMN = {"tokens": "total_tokens", "cost": "cost_usd", "time": "duration_s
 
 
 def _model_tier(model: str) -> str:
-    """Map a model id (e.g. ``claude-opus-4-8``) onto its family, or ``"other"``."""
+    """Map a model id (e.g. ``claude-opus-5``) onto its family, or ``"other"``."""
     lower = model.lower()
     for tier in _MODEL_ORDER:
         if tier in lower:
@@ -274,14 +274,14 @@ def _model_color(model: str) -> str:
 
 #: A trailing snapshot date on a model id, e.g. the ``-20251001`` on
 #: ``claude-haiku-4-5-20251001``. Some ids pin a dated snapshot and some don't
-#: (``claude-opus-4-8``); we strip it for display so the legend reads consistently.
+#: (``claude-opus-5``); we strip it for display so the legend reads consistently.
 _MODEL_DATE_RE = re.compile(r"-\d{6,8}$")
 
 
 def _model_label(model: str) -> str:
     """Display label for a model id, with any trailing snapshot date removed.
 
-    ``claude-haiku-4-5-20251001`` -> ``claude-haiku-4-5``; ``claude-opus-4-8`` is unchanged.
+    ``claude-haiku-4-5-20251001`` -> ``claude-haiku-4-5``; ``claude-opus-5`` is unchanged.
     The raw id is kept everywhere it is data (the runs table, the CSV) — this only tidies
     what the figures show.
     """

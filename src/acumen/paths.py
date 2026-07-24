@@ -42,7 +42,7 @@ def slugify(text: str) -> str:
     Parameters
     ----------
     text
-        Arbitrary text, e.g. a model name such as ``anthropic/claude-opus-4-8``.
+        Arbitrary text, e.g. a model name such as ``anthropic/claude-opus-5``.
 
     Returns
     -------

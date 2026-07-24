@@ -24,17 +24,17 @@ extras: []                            # optional pip extras, e.g. [dev, test]
 python: "3.12"                        # interpreter for the target's throwaway venv
 env_passthrough: []                   # extra env vars agents may keep (e.g. [OMP_NUM_THREADS]); the agent env is otherwise a clean allowlist
 
-models: [claude-opus-4-8, claude-sonnet-5, claude-haiku-4-5-20251001]   # benchmark models; a pass is models x tasks x reps x splits
+models: [claude-opus-5, claude-sonnet-5, claude-haiku-4-5-20251001]   # benchmark models; a pass is models x tasks x reps x splits
 n_replicates: 3                       # runs per (model, task, split) cell
 max_concurrency: 4                    # simultaneous agents
 
 max_turns: 40                         # per-agent turn cap; a breach is recorded as a failure
 max_usd: 3.0                          # budget cap (USD) for benchmark agents; draft/improve/ship/tasks are unbounded
 
-draft_model: claude-opus-4-8          # model that writes the first skill (reads the source)
-improve_model: claude-opus-4-8        # model that improves a skill from its train results
-tasks_model: claude-opus-4-8          # model for `acumen tasks` (generates this file); runs code
-ship_model: claude-opus-4-8           # model for `acumen ship` (wires a multi-framework install-skills script)
+draft_model: claude-opus-5            # model that writes the first skill (reads the source)
+improve_model: claude-opus-5          # model that improves a skill from its train results
+tasks_model: claude-opus-5            # model for `acumen tasks` (generates this file); runs code
+ship_model: claude-opus-5             # model for `acumen ship` (wires a multi-framework install-skills script)
 
 # skill_name: your_skill              # name for the built skill; defaults to the repo's name
 """

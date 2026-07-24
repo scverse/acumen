@@ -31,16 +31,16 @@ class Config:
     #: (``OMP_NUM_THREADS``, ``R_HOME``, a service key) must name it here. Values are passed
     #: through verbatim; only list what the package genuinely needs.
     env_passthrough: list[str] = field(default_factory=list)
-    models: list[str] = field(default_factory=lambda: ["claude-opus-4-8"])
+    models: list[str] = field(default_factory=lambda: ["claude-opus-5"])
     n_replicates: int = 3
     max_concurrency: int = 4
     max_turns: int = 40
     #: Budget cap (USD) for benchmark agents only; draft/improve/ship/tasks are unbounded by default.
     max_usd: float = 3.0
-    draft_model: str = "claude-opus-4-8"
-    improve_model: str = "claude-opus-4-8"
-    tasks_model: str = "claude-opus-4-8"
-    ship_model: str = "claude-opus-4-8"
+    draft_model: str = "claude-opus-5"
+    improve_model: str = "claude-opus-5"
+    tasks_model: str = "claude-opus-5"
+    ship_model: str = "claude-opus-5"
 
     @property
     def is_local(self) -> bool:
@@ -151,7 +151,7 @@ def parse_config(raw: Any) -> Config:
     repo = _require_str(raw, "repo")
     skill_name = _require_str(raw, "skill_name") if "skill_name" in raw else derive_skill_name(repo)
 
-    models = _str_list(raw, "models", ["claude-opus-4-8"])
+    models = _str_list(raw, "models", ["claude-opus-5"])
     if not models:
         raise ConfigError("'models' must list at least one model")
     if len(set(models)) != len(models):

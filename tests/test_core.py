@@ -61,10 +61,10 @@ def test_grade_run_reads_answer_md(tmp_path: Path) -> None:
 
 
 def test_run_dir_round_trips(tmp_path: Path) -> None:
-    key = RunKey(arm="skill_v2", split="test", model="claude-opus-4-8", task_id="tf_activity", rep=3)
+    key = RunKey(arm="skill_v2", split="test", model="claude-opus-5", task_id="tf_activity", rep=3)
     directory = run_dir(tmp_path, key)
 
-    assert directory == tmp_path / "skill_v2/test/claude-opus-4-8/tf_activity/rep_3"
+    assert directory == tmp_path / "skill_v2/test/claude-opus-5/tf_activity/rep_3"
     assert parse_run_dir(tmp_path, directory) == key
     assert key.skill == "v2"
 
