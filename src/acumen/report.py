@@ -952,7 +952,13 @@ def build_report(
     # keys) so it stays a clean, portable table.
     data_path = out_path.with_suffix(".csv")
     internal = [c for c in ("result_path", "transcript_path", "_arm_order") if c in df.columns]
-    df.drop(columns=internal).to_csv(data_path, index=False)
+    data = df.drop(columns=internal)
+    if "skill_loaded" in data.columns:
+        # The HTML keeps '?' for a run whose transcript could not be read, but the CSV is
+        # for counting: every row is True or False, so summing the column means what it
+        # looks like. Undetermined is not evidence the skill loaded, so it reads False.
+        data["skill_loaded"] = data["skill_loaded"].fillna(False).astype(bool)
+    data.to_csv(data_path, index=False)
 
     html_text = render_report(
         df, out_path.parent, tasks, data_href=data_path.name, skills_root=skills_root, palette=palette

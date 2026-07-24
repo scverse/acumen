@@ -8,6 +8,7 @@ single token is spent.
 
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 
 import pytest
@@ -123,6 +124,20 @@ def test_report_writes_html_and_csv(project: Path, runs_root: Path, capsys: pyte
     # Self-contained: figures are inlined, so nothing is fetched from the network.
     assert "http://" not in html and "https://" not in html
     assert "aggregated 2 runs" in capsys.readouterr().out
+
+
+def test_report_csv_records_skill_loaded_as_a_plain_bool(
+    project: Path, runs_root: Path, model: str, make_result
+) -> None:
+    """Undetermined (a transcript that could not be read) counts as not loaded in the CSV."""
+    key = RunKey(arm="skill_v1", split="train", model=model, task_id="example_task", rep=1)
+    make_result(runs_root, key, skill_loaded=None)
+    out_path = project / "report.html"
+    assert main(["report", "--runs", str(runs_root), "--out", str(out_path)]) == 0
+
+    with out_path.with_suffix(".csv").open(newline="") as handle:
+        loaded = [row["skill_loaded"] for row in csv.DictReader(handle)]
+    assert set(loaded) == {"False"}  # two baseline runs and one undetermined skill run
 
 
 def test_report_palette_recolours_and_validates(
