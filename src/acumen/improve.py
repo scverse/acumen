@@ -41,6 +41,7 @@ from acumen.paths import (
     arm_name,
     parse_run_dir,
 )
+from acumen.procs import label_env, reap
 from acumen.prompts import improve_prompt
 from acumen.skills import (
     SKILL_FILE,
@@ -394,12 +395,16 @@ async def improve_skill(
         _seed_staging(staging, parent)
         _write_material(train_dir, train_runs)
 
-        env = build_agent_env(
-            config_dir=config_dir,
-            home=home,
-            extra_path=[target.bin_dir],
-            auth_mode=auth_mode,
-            extra_allow=cfg.env_passthrough,
+        # Marks the agent's processes so the teardown below can find what it leaves running.
+        env = label_env(
+            build_agent_env(
+                config_dir=config_dir,
+                home=home,
+                extra_path=[target.bin_dir],
+                auth_mode=auth_mode,
+                extra_allow=cfg.env_passthrough,
+            ),
+            holder,
         )
 
         prompt = improve_prompt(
@@ -474,6 +479,8 @@ async def improve_skill(
             log_html=log.html_path if log is not None and log.html_rendered else None,
         )
     finally:
+        # Kill anything the agent left running before removing the directory it runs in.
+        reap(holder)
         shutil.rmtree(holder, ignore_errors=True)
 
 

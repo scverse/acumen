@@ -26,6 +26,7 @@ dependencies = [
   "claude-code-log",
   "matplotlib",
   "pandas",
+  "psutil>=5.9",
   "pyyaml",
   "scipy",
   # for debug logging (referenced from the issue template)

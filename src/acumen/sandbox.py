@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from acumen.env import AuthMode, Target, build_agent_env
+from acumen.procs import label_env, reap
 from acumen.skills import Skill, content_files
 
 #: Where the ``claude`` CLI looks for project skills, relative to the agent's cwd.
@@ -122,12 +123,16 @@ def sandbox(
             path.mkdir(parents=True, exist_ok=True)
         if skill is not None:
             install_skill(root, skill)
-        env = build_agent_env(
-            config_dir=config_dir,
-            home=home,
-            extra_path=[target.bin_dir],
-            auth_mode=auth_mode,
-            extra_allow=env_passthrough,
+        # The marker is what lets the teardown below find whatever this agent leaves running.
+        env = label_env(
+            build_agent_env(
+                config_dir=config_dir,
+                home=home,
+                extra_path=[target.bin_dir],
+                auth_mode=auth_mode,
+                extra_allow=env_passthrough,
+            ),
+            holder,
         )
         yield Sandbox(
             root=root,
@@ -139,5 +144,10 @@ def sandbox(
             skill=skill,
         )
     finally:
+        # The agent's own descendants outlive it — a backgrounded job, or anything still
+        # running when the CLI was terminated on a cap breach or a Ctrl-C. Kill them before
+        # the directory goes, so nothing is left writing into a path that no longer exists.
+        # ``keep`` preserves the files for inspection, never the processes.
+        reap(holder)
         if not keep:
             shutil.rmtree(holder, ignore_errors=True)

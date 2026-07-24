@@ -37,6 +37,7 @@ from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 from acumen.config import Config
 from acumen.env import API_AUTH_ENV_VARS, SESSION_AUTH_ENV_VAR, AuthMode, Target, claude_cli_dir
 from acumen.logs import LiveLog
+from acumen.procs import label_env, reap
 from acumen.prompts import ship_prompt
 from acumen.skills import Skill, content_files, load_skill
 
@@ -241,8 +242,10 @@ async def ship_skill(
         options = ClaudeAgentOptions(
             # The agent edits the checkout in place, so its cwd IS the checkout.
             cwd=str(target.src_dir),
-            # Real environment — NOT scrubbed: git/gh creds + network + uv.
-            env=_ship_env(target, auth_mode),
+            # Real environment — NOT scrubbed: git/gh creds + network + uv. Marked with the
+            # holder so the teardown below can find whatever the agent leaves running; the
+            # holder path appears nowhere else in this agent's environment.
+            env=label_env(_ship_env(target, auth_mode), holder),
             model=model or cfg.ship_model,
             # No default budget cap: only bound the agent if the caller asked.
             max_turns=max_turns,
@@ -289,4 +292,7 @@ async def ship_skill(
             log_html=log.html_path if log is not None and log.html_rendered else None,
         )
     finally:
+        # Kill anything the agent left running before removing the directory it runs in.
+        # ship's agent works in the target checkout, but its env still points at the holder.
+        reap(holder)
         shutil.rmtree(holder, ignore_errors=True)

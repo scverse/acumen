@@ -7,6 +7,9 @@ broke, not an exhaustive sweep of each validator.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -29,6 +32,7 @@ from acumen.env import (
 )
 from acumen.grade import grade_answer, grade_run
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
+from acumen.procs import label_env, reap, supported, survivors
 from acumen.prompts import draft_prompt, feedback_block
 from acumen.report import ReportError, load_results, metrics_figure, resolve_palette
 from acumen.runner import StderrFilter
@@ -485,3 +489,74 @@ def test_metrics_figure_paints_bars_with_the_palette(runs_root: Path, model: str
         assert "#3b7ea1" in faces
     finally:
         plt.close(figure)
+
+
+# --- orphan reaping --------------------------------------------------------------------
+
+#: A child that outlives its parent, and a parent that exits immediately after starting it.
+#: Reproduces the leak: the SDK terminates the agent, and the commands it started live on
+#: with no parent left to find them by.
+_ORPHAN = "import time; time.sleep(60)"
+_ABANDONING_PARENT = f"import subprocess, sys; subprocess.Popen([sys.executable, '-c', {_ORPHAN!r}])"
+
+#: Linux, macOS and Windows all qualify; this only skips where psutil cannot read a
+#: process's environment, which is the one thing the reaper is built on.
+pytestmark_procs = pytest.mark.skipif(not supported(), reason="psutil cannot read process environments here")
+
+
+def _spawn_orphan(holder: Path) -> None:
+    """Start a labelled process whose parent then exits, leaving it running and unparented."""
+    parent = subprocess.Popen(
+        [sys.executable, "-c", _ABANDONING_PARENT],
+        env=label_env(dict(os.environ), holder),
+    )
+    parent.wait()
+
+
+@pytestmark_procs
+def test_reap_kills_a_command_that_outlived_its_agent(tmp_path: Path) -> None:
+    """The whole point: a process whose parent is gone is still found, by its marker, and killed."""
+    holder = tmp_path / "run"
+    holder.mkdir()
+    _spawn_orphan(holder)
+
+    orphans = survivors(holder)
+    assert orphans, "the orphaned command was not found after its parent exited"
+
+    assert set(reap(holder)) == set(orphans)
+    deadline = time.monotonic() + 5
+    while survivors(holder) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not survivors(holder)
+
+
+@pytestmark_procs
+def test_reap_leaves_everything_outside_the_run_alone(tmp_path: Path) -> None:
+    """Only the marked run is reaped — not the test process, and not another run's agent."""
+    mine = tmp_path / "mine"
+    other = tmp_path / "other"
+    for path in (mine, other):
+        path.mkdir()
+    _spawn_orphan(other)
+    bystander = subprocess.Popen([sys.executable, "-c", _ORPHAN])
+    try:
+        assert os.getpid() not in survivors(mine)
+        assert bystander.pid not in survivors(mine)
+        assert reap(mine) == []
+        assert survivors(other), "reaping one run killed another run's processes"
+        assert bystander.poll() is None
+    finally:
+        bystander.kill()
+        reap(other)
+
+
+@pytestmark_procs
+def test_label_env_marks_a_run_without_disturbing_the_rest(tmp_path: Path) -> None:
+    """Stamping is additive — an agent's carefully built environment is otherwise untouched."""
+    holder = tmp_path / "run"
+    base = {"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "sk-test"}
+
+    marked = label_env(dict(base), holder)
+
+    assert marked.items() >= base.items()
+    assert str(holder) in marked.values()

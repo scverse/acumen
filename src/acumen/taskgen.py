@@ -42,6 +42,7 @@ from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, ResultMessage, que
 from acumen.config import Config
 from acumen.env import AuthMode, Target, build_agent_env
 from acumen.logs import LiveLog
+from acumen.procs import label_env, reap
 from acumen.prompts import taskgen_prompt
 from acumen.tasks import Task, TaskError, load_tasks
 
@@ -341,12 +342,16 @@ async def generate_tasks(
         # real checkout — so existing skills cannot bias the tasks it generates.
         source_copy = build_filtered_source(target.src_dir, holder / "source")
 
-        env = build_agent_env(
-            config_dir=config_dir,
-            home=home,
-            extra_path=[target.bin_dir],
-            auth_mode=auth_mode,
-            extra_allow=cfg.env_passthrough,
+        # Marks the agent's processes so the teardown below can find what it leaves running.
+        env = label_env(
+            build_agent_env(
+                config_dir=config_dir,
+                home=home,
+                extra_path=[target.bin_dir],
+                auth_mode=auth_mode,
+                extra_allow=cfg.env_passthrough,
+            ),
+            holder,
         )
 
         prompt = taskgen_prompt(
@@ -414,4 +419,6 @@ async def generate_tasks(
             log_html=log.html_path if log is not None and log.html_rendered else None,
         )
     finally:
+        # Kill anything the agent left running before removing the directory it runs in.
+        reap(holder)
         shutil.rmtree(holder, ignore_errors=True)
