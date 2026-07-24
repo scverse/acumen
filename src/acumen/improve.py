@@ -74,7 +74,12 @@ class ImproveError(RuntimeError):
 
 @dataclass(frozen=True)
 class TrainRun:
-    """One train-split benchmark run of the parent skill, as evidence for the improver."""
+    """One train-split benchmark run of the parent skill, as evidence for the improver.
+
+    ``success`` and ``skill_loaded`` are independent outcomes with independent fixes: a run
+    that never loaded the skill says nothing about the skill's body, only about its
+    ``description``. Both reach the improver so it can tell the two apart.
+    """
 
     task_id: str
     model: str
@@ -85,6 +90,9 @@ class TrainRun:
     reason: str
     success: bool
     directory: Path
+    #: Whether the agent actually invoked the skill. ``None`` when the transcript could not
+    #: be read — undetermined, which is not the same as "did not load".
+    skill_loaded: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -153,44 +161,122 @@ def collect_train_runs(runs_root: Path, arm: str, tasks: list[Task]) -> list[Tra
                 reason=str(data.get("reason", "")),
                 success=bool(data.get("success", False)),
                 directory=result_path.parent,
+                skill_loaded=_loaded(data.get("skill_loaded")),
             )
         )
     runs.sort(key=lambda r: (r.success, r.task_id, r.model, r.rep))
     return runs
 
 
+def _loaded(value: Any) -> bool | None:
+    """Coerce a ``result.json`` ``skill_loaded`` field, preserving "undetermined" as ``None``."""
+    return None if value is None else bool(value)
+
+
+def load_rates(runs: list[TrainRun]) -> dict[str, tuple[int, int, int]]:
+    """Count how often the skill actually loaded, per model.
+
+    Reported per model rather than pooled because the load rate varies far more across models
+    than across skill versions — a pooled number invites the improver to chase a model whose
+    behaviour no wording can reach.
+
+    Parameters
+    ----------
+    runs
+        The train runs to tally.
+
+    Returns
+    -------
+    ``{model: (loaded, total, undetermined)}``, where ``undetermined`` counts runs whose
+    transcript could not be read and which are therefore excluded from ``loaded``.
+    """
+    rates: dict[str, tuple[int, int, int]] = {}
+    for run in runs:
+        loaded, total, unknown = rates.get(run.model, (0, 0, 0))
+        rates[run.model] = (
+            loaded + (run.skill_loaded is True),
+            total + 1,
+            unknown + (run.skill_loaded is None),
+        )
+    return dict(sorted(rates.items()))
+
+
+def _load_mark(loaded: bool | None) -> str:
+    """The phrase naming a run's load outcome, used identically in SUMMARY.md and run.md."""
+    if loaded is None:
+        return "skill load UNDETERMINED"
+    return "skill LOADED" if loaded else "skill NOT LOADED"
+
+
+def _load_section(runs: list[TrainRun]) -> list[str]:
+    """The SUMMARY.md section reporting per-model load rates."""
+    rates = load_rates(runs)
+    lines = [
+        "## Did the skill load at all?",
+        "",
+        "A run where the skill never loaded is not evidence about the skill's body — the agent",
+        "never read it. Only the `description` in the frontmatter decides whether a skill loads.",
+        "",
+        "| model | loaded | runs | rate |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    total_loaded = total_runs = total_unknown = 0
+    for model, (loaded, total, unknown) in rates.items():
+        total_loaded += loaded
+        total_runs += total
+        total_unknown += unknown
+        lines.append(f"| `{model}` | {loaded} | {total} | {loaded / total:.0%} |")
+    if total_runs:
+        lines.extend(["", f"**Overall: {total_loaded}/{total_runs} ({total_loaded / total_runs:.0%}).**"])
+    if total_unknown:
+        noun = "run" if total_unknown == 1 else "runs"
+        lines.append(
+            f"({total_unknown} {noun} had no readable transcript, so loading is undetermined and is "
+            "counted as not loaded above.)"
+        )
+    lines.append("")
+    return lines
+
+
 def _write_material(train_dir: Path, runs: list[TrainRun]) -> None:
     """Lay out the curated train evidence the improver reads.
 
-    A ``SUMMARY.md`` digest (failures first) plus one directory per run holding the run's
-    ``script.py``, transcript, and a ``run.md`` stating prompt/expected/actual/outcome.
-    Copied, not linked, so the agent never has a path back into the real runs tree.
+    A ``SUMMARY.md`` digest (per-model load rates, then runs with failures first) plus one
+    directory per run holding the run's ``script.py``, transcript, and a ``run.md`` stating
+    prompt/expected/actual/outcome and whether the skill loaded. Copied, not linked, so the
+    agent never has a path back into the real runs tree.
     """
     train_dir.mkdir(parents=True, exist_ok=True)
+    n_fail = sum(1 for r in runs if not r.success)
+    noun = "run" if len(runs) == 1 else "runs"
     lines = [
         "# Train-split evidence for the current skill",
         "",
-        "Each run below benchmarked the current skill on one train task. Read the failing",
-        "runs first: a failure is either the skill steering the agent wrong or the skill",
-        "saying nothing where it should have. Open a run's `run.md`, `script.py`, and",
-        "`transcript.html` for the detail.",
+        "Each run below benchmarked the current skill on one train task. Two things were",
+        "recorded per run, and they fail for different reasons and take different fixes:",
+        "whether the agent got the answer RIGHT, and whether the agent LOADED the skill at",
+        "all. Read the load rates first, then the failing runs. Open a run's `run.md`,",
+        "`script.py`, and `transcript.html` for the detail.",
+        "",
+        f"**{len(runs)} {noun}, {n_fail} failing.**",
+        "",
+        *_load_section(runs),
+        "## Runs",
         "",
     ]
-    n_fail = sum(1 for r in runs if not r.success)
-    noun = "run" if len(runs) == 1 else "runs"
-    lines.append(f"**{len(runs)} {noun}, {n_fail} failing.**")
-    lines.append("")
     for run in runs:
         slug = f"{run.task_id}__{run.model}__rep_{run.rep}"
         mark = "PASS" if run.success else "FAIL"
         lines.append(
-            f"- `{slug}/` — **{mark}** ({run.reason}) — task `{run.task_id}` — "
-            f"expected `{run.expected}`, got `{run.answer!r}`"
+            f"- `{slug}/` — **{mark}** ({run.reason}) — {_load_mark(run.skill_loaded)} — "
+            f"task `{run.task_id}` on `{run.model}` — expected `{run.expected}`, got `{run.answer!r}`"
         )
         run_out = train_dir / slug
         run_out.mkdir(parents=True, exist_ok=True)
         (run_out / "run.md").write_text(
             f"# {run.task_id} — {mark} ({run.reason})\n\n"
+            f"- Model: `{run.model}`\n"
+            f"- Skill: {_load_mark(run.skill_loaded)}\n\n"
             f"## Task prompt\n\n{run.prompt}\n\n"
             f"## Expected answer\n\n{run.expected}\n\n"
             f"## Answer the agent gave\n\n{run.answer!r}\n\n"

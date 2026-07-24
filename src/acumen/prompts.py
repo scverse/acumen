@@ -193,9 +193,9 @@ You are producing version {new_version} — an improvement of version {parent_ve
   version {new_version}.
 - `{train_dir}` — evidence from benchmarking the current skill on the TRAIN split. Read
   `{train_dir}/SUMMARY.md` first. For each run you will find the task prompt, the expected
-  answer, the answer the agent actually gave, whether it passed, the `script.py` it wrote,
-  and its full transcript. This is your only signal about what the skill gets right and
-  what it gets wrong.
+  answer, the answer the agent actually gave, whether it passed, WHETHER THE AGENT LOADED THE
+  SKILL AT ALL, which model ran it, the `script.py` it wrote, and its full transcript. This is
+  your only signal about what the skill gets right and what it gets wrong.
 - `{package}` is installed; run `{python}` (also `python` on your PATH) to verify any
   claim about the API before you write it down. Do not install or upgrade packages.
 - You have web access if the published docs help.
@@ -212,17 +212,55 @@ Do not attempt it — reaching test data would invalidate the whole benchmark.
 1. Edit the skill in place under `{skill_dir}`. When you finish, `{skill_dir}/SKILL.md`
    must still begin with YAML frontmatter whose `name` is exactly `{skill_name}` and whose
    `description` is an honest one-sentence statement of what the skill covers and when to
-   use it.
+   use it. The `description` is the ONLY thing that decides whether the skill loads — see
+   below.
 
 2. `{rationale_path}` — one short paragraph stating WHAT you changed and WHY, grounded in
    the train evidence. Write it here, OUTSIDE the skill directory. Do not put the rationale
    inside `{skill_dir}`.
 
-# How to improve it
+# Two different failures, two different fixes
 
-- **Fix what the evidence shows is broken.** Read the failing runs first. A failure is
-  either the skill steering the agent wrong, or the skill saying nothing where it should
-  have. Address the cause you can see in the transcript, not one you imagine.
+Every run records whether the agent LOADED the skill and whether it SUCCEEDED. Separate them
+before you change anything — they look identical in a list of failures and have opposite fixes.
+
+1. **The skill never loaded.** The agent never read a word of the body, so nothing in the body
+   caused this and nothing you write in the body can fix it. The only lever is the
+   `description`. Editing the body in response to these runs is wasted work.
+2. **The skill loaded and the run still failed.** Now the body is on trial: it steered the
+   agent wrong, or it was silent where it should have spoken. Fix the body, using the cause
+   you can see in that run's transcript — not one you imagine.
+3. **The skill loaded and the run passed.** Evidence the body works. Do not rewrite it for
+   style.
+
+A skill that is never loaded scores exactly like no skill at all, however good its body is. If
+the load rate in `SUMMARY.md` is low, that is the biggest available win — and the only thing
+you can do about it is the `description`.
+
+# The description is the trigger
+
+The `description` is the ONE sentence an agent sees before deciding whether to open the skill.
+It is the entire loading decision. Its job is to make the skill load exactly when it is
+relevant and not otherwise.
+
+- **Read the load rates per model.** They are in `SUMMARY.md`, broken down by model. If one
+  model loads the skill reliably and another almost never does, that gap is mostly the model's
+  behaviour, not your wording — do not contort the sentence chasing it. Act on a rate that is
+  low across the board.
+- **State the goals a user would actually phrase**, in their words, not the package's. An
+  agent matches the description against the task in front of it. Name the outcomes and the
+  kinds of question the skill answers.
+- **Do not overfit it to the train tasks.** Widening the description with the specific
+  datasets, methods, or phrasings you just read in the train runs is the same cheating as
+  putting them in the body: it buys train load rate and loses on the test split. Widen to
+  the CATEGORY of goal, never to the instances you saw.
+- **Do not oversell.** A description that claims coverage the body does not deliver loads the
+  skill on tasks it cannot help with, and costs every one of those runs its tokens for nothing.
+
+# How to improve the body
+
+- **Fix what the evidence shows is broken.** Work from the runs where the skill loaded and
+  the agent still failed. Address the cause visible in the transcript, not one you imagine.
 - **Generalise — never overfit.** NEVER name a specific dataset, parameter value, column,
   expected answer, or task from the train runs in the skill. The skill must help on tasks
   you have not seen. Guidance that enumerates these particular cases is cheating and will
@@ -738,6 +776,11 @@ def improve_prompt(
     Unlike the drafter, the improver never sees the package source — it works from the
     current skill and the *train-split* evidence of how that skill performed. The test split
     is unreachable, enforced structurally, not by this prompt.
+
+    The prompt separates the two outcomes the evidence records: whether the agent loaded the
+    skill (governed only by the ``description``) and whether it then succeeded (governed by the
+    body). Conflating them makes the improver rewrite body prose in response to runs where the
+    body was never read.
 
     Parameters
     ----------

@@ -32,9 +32,10 @@ from acumen.env import (
     session_auth_available,
 )
 from acumen.grade import grade_answer, grade_run
+from acumen.improve import _write_material, collect_train_runs, load_rates
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
 from acumen.procs import label_env, reap, supported, survivors
-from acumen.prompts import draft_prompt, feedback_block
+from acumen.prompts import draft_prompt, feedback_block, improve_prompt
 from acumen.report import ReportError, load_results, metrics_figure, resolve_palette
 from acumen.runner import StderrFilter, _skill_fired
 from acumen.ship import _ship_env
@@ -246,6 +247,77 @@ def test_write_meta_persists_feedback_but_omits_it_when_absent(tmp_path: Path) -
 
     write_meta(directory, parent="v1", rationale="fixed", feedback="  emphasise pseudobulk  ")
     assert read_meta(directory).feedback == "emphasise pseudobulk"
+
+
+# --- improve evidence ------------------------------------------------------------------
+
+
+def _train_evidence(project: Path, make_result, loaded: list[bool | None]) -> list:
+    """Write one train run per entry of ``loaded``, then collect them as improver evidence."""
+    runs = project / "runs"
+    models = ("model_a", "model_b")
+    for i, flag in enumerate(loaded):
+        key = RunKey(arm="skill_v1", split="train", model=models[i % 2], task_id="example_task", rep=i + 1)
+        make_result(runs, key, success=flag is True, skill_loaded=flag)
+    return collect_train_runs(runs, "skill_v1", load_tasks(project / "tasks.yaml"))
+
+
+def test_collect_train_runs_carries_load_status(project: Path, make_result) -> None:
+    """A run's ``skill_loaded`` must reach the improver, with undetermined kept distinct."""
+    runs = _train_evidence(project, make_result, [True, False, None])
+
+    assert sorted(r.skill_loaded is True for r in runs).count(True) == 1
+    assert [r.skill_loaded for r in runs].count(False) == 1
+    # Unreadable transcripts stay None — undetermined is not the same as "did not load".
+    assert [r.skill_loaded for r in runs].count(None) == 1
+
+
+def test_load_rates_split_by_model_and_count_undetermined(project: Path, make_result) -> None:
+    """Rates are per model, since the load rate varies more by model than by skill version."""
+    rates = load_rates(_train_evidence(project, make_result, [True, True, False, None]))
+
+    # model_a took reps 1 and 3 (True, False); model_b took reps 2 and 4 (True, None).
+    assert rates == {"model_a": (1, 2, 0), "model_b": (1, 2, 1)}
+
+
+def test_written_evidence_reports_load_rate_and_marks_each_run(project: Path, make_result, tmp_path: Path) -> None:
+    """The improver reads SUMMARY.md, so the load signal has to survive into the file."""
+    runs = _train_evidence(project, make_result, [True, False, None])
+    train_dir = tmp_path / "train"
+
+    _write_material(train_dir, runs)
+
+    summary = (train_dir / "SUMMARY.md").read_text()
+    assert "Did the skill load at all?" in summary
+    assert "| `model_a` |" in summary and "| `model_b` |" in summary
+    assert "skill LOADED" in summary
+    assert "skill NOT LOADED" in summary
+    assert "skill load UNDETERMINED" in summary
+
+    # Every per-run page states it too, so a reader who opens one run isn't left guessing.
+    pages = [p.read_text() for p in train_dir.rglob("run.md")]
+    assert len(pages) == 3
+    assert all("- Skill: skill " in page for page in pages)
+
+
+def test_improve_prompt_separates_loading_from_the_body() -> None:
+    """The prompt must not let a never-loaded run be read as evidence against the body."""
+    prompt = improve_prompt(
+        package="p",
+        version="1",
+        python=Path("/py"),
+        skill_dir=Path("/skill"),
+        train_dir=Path("/train"),
+        rationale_path=Path("/r.md"),
+        skill_name="p",
+        parent_version="v1",
+        new_version="v2",
+    )
+
+    assert "The skill never loaded" in prompt
+    assert "description" in prompt
+    # Raising the load rate must not become licence to name the train tasks in it.
+    assert prompt.index("Do not overfit it to the train tasks") < prompt.index("When you are done")
 
 
 # --- auth preflight --------------------------------------------------------------------
