@@ -345,8 +345,11 @@ async def improve_skill(
         The loaded tasks, to pair runs with their prompts and expected answers.
     parent_version
         The version to improve; defaults to the latest present.
-    model, max_turns, max_usd
+    model, max_turns
         Overrides for the improving agent; default to the config's.
+    max_usd
+        Budget cap for the improving agent. **Unbounded by default** — the config's ``max_usd``
+        caps benchmark agents only; pass an explicit cap to bound the improver.
     feedback
         Optional maintainer guidance, injected into the improve prompt as a subordinated block
         and recorded in ``meta.json`` as provenance. It is prompt text only — it cannot reach
@@ -407,7 +410,9 @@ async def improve_skill(
             env=env,
             model=model or cfg.improve_model,
             max_turns=max_turns or cfg.max_turns,
-            max_budget_usd=max_usd or cfg.max_usd,
+            # No default budget cap: only bound the agent if the caller asked. The config's
+            # ``max_usd`` caps benchmark agents only.
+            max_budget_usd=max_usd,
             setting_sources=["project"],
             permission_mode="bypassPermissions",
             system_prompt={"type": "preset", "preset": "claude_code"},

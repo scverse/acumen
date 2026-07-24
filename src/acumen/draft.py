@@ -86,8 +86,11 @@ async def draft_skill(
         The prepared target, supplying the source checkout and interpreter.
     skills_root
         The ``skills/`` root. The new version is the next unused one.
-    model, max_turns, max_usd
+    model, max_turns
         Overrides for the drafting agent; default to the config's.
+    max_usd
+        Budget cap for the drafting agent. **Unbounded by default** — the config's ``max_usd``
+        caps benchmark agents only; pass an explicit cap to bound the drafter.
     rationale
         Recorded in ``meta.json`` as why this version exists.
     feedback
@@ -132,7 +135,9 @@ async def draft_skill(
             env=env,
             model=model or cfg.draft_model,
             max_turns=max_turns or cfg.max_turns,
-            max_budget_usd=max_usd or cfg.max_usd,
+            # No default budget cap: only bound the agent if the caller asked. The config's
+            # ``max_usd`` caps benchmark agents only.
+            max_budget_usd=max_usd,
             # The drafter reads the target source; benchmark agents never do.
             add_dirs=[str(target.src_dir)],
             setting_sources=["project"],

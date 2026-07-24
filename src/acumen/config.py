@@ -28,6 +28,7 @@ class Config:
     n_replicates: int = 3
     max_concurrency: int = 4
     max_turns: int = 40
+    #: Budget cap (USD) for benchmark agents only; draft/improve/ship/tasks are unbounded by default.
     max_usd: float = 3.0
     draft_model: str = "claude-opus-4-8"
     improve_model: str = "claude-opus-4-8"

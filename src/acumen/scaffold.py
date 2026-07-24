@@ -28,7 +28,7 @@ n_replicates: 3                       # runs per (model, task, split) cell
 max_concurrency: 4                    # simultaneous agents
 
 max_turns: 40                         # per-agent turn cap; a breach is recorded as a failure
-max_usd: 3.0                          # per-agent budget cap (USD)
+max_usd: 3.0                          # budget cap (USD) for benchmark agents; draft/improve/ship/tasks are unbounded
 
 draft_model: claude-opus-4-8          # model that writes the first skill (reads the source)
 improve_model: claude-opus-4-8        # model that improves a skill from its train results
