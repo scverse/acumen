@@ -33,10 +33,12 @@ from acumen.paths import RunKey, Split, arm_name, is_complete, parse_run_dir, ru
 from acumen.report import (
     Report,
     ReportError,
+    SkillTests,
     arm_metrics,
     build_report,
     load_results,
     resolve_palette,
+    skill_tests,
     tradeoff_figure,
 )
 from acumen.runner import RunOutcome, run_once
@@ -146,9 +148,11 @@ __all__ = [
     "scrubbed_env",
     "session_auth_available",
     "ship_skill",
+    "SkillTests",
     "skill_content",
     "skill_from_arm",
     "skill_hash",
+    "skill_tests",
     "summarize",
     "tradeoff_figure",
 ]

@@ -14,6 +14,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+import pandas as pd
 import pytest
 from matplotlib import pyplot as plt
 from matplotlib.colors import to_hex
@@ -40,12 +41,16 @@ from acumen.prompts import draft_prompt, feedback_block, improve_prompt
 from acumen.report import (
     ReportError,
     _arm_marker,
+    _best_cells,
+    _holm,
     _integrity_notes,
     _pareto_front,
     _pareto_steps,
+    _tests_table_html,
     load_results,
     metrics_figure,
     resolve_palette,
+    skill_tests,
     tradeoff_figure,
 )
 from acumen.runner import StderrFilter, _skill_fired
@@ -883,6 +888,198 @@ def test_pareto_steps_never_cuts_a_diagonal() -> None:
     xs, ys = _pareto_steps([(0.1, 0.8), (0.2, 0.9)], y_min=0.5)
 
     assert list(zip(xs, ys, strict=True)) == [(0.1, 0.5), (0.1, 0.8), (0.2, 0.8), (0.2, 0.9)]
+
+
+# --- significance -----------------------------------------------------------------------
+
+#: Enough tasks that a resample can actually resolve a difference. The bootstrap draws whole
+#: tasks, so an effect carried by a single task is invisible in the (n-1 / n)**n of resamples
+#: that happen to miss it -- with four tasks that is a third of them.
+_TASKS = ("alpha", "beta", "gamma", "delta", "epsilon")
+
+
+def _arena(runs_root: Path, model: str, make_result, spec: dict[str, tuple[float, list[bool]]]) -> pd.DataFrame:
+    """A run tree of ``arm -> (cost per run, one success flag per task)``, one rep each."""
+    for arm, (cost, outcomes) in spec.items():
+        for task, ok in zip(_TASKS, outcomes, strict=True):
+            key = RunKey(arm=arm, split="test", model=model, task_id=task, rep=1)
+            make_result(runs_root, key, cost_usd=cost, success=ok)
+    return load_results(runs_root)
+
+
+def test_cheaper_but_worse_does_not_dominate(runs_root: Path, model: str, make_result) -> None:
+    """The behaviour the whole design exists for: price cannot buy past a worse success rate.
+
+    A single combined score would rank the cheap arm first — it is a fraction of the cost and only
+    slightly less accurate. Requiring *both* axes to improve refuses it, because the evidence for
+    dominance is only as strong as its weaker half.
+    """
+    df = _arena(
+        runs_root,
+        model,
+        make_result,
+        {
+            "noskill": (1.00, [True, True, False, False, False]),
+            "skill_v1": (0.10, [True, False, False, False, False]),  # far cheaper, strictly worse
+            "skill_v2": (0.10, [True, True, True, True, True]),  # cheaper and better everywhere
+        },
+    )
+
+    tests = skill_tests(df, resamples=4000)
+    by_arm = tests.comparisons.set_index("challenger")
+
+    # Overwhelming evidence on cost, none on rate -> the max is large and the claim fails.
+    assert by_arm.loc["skill_v1", "p_cost"] < 0.05
+    assert by_arm.loc["skill_v1", "p_rate"] > 0.5
+    assert by_arm.loc["skill_v1", "p"] == by_arm.loc["skill_v1", "p_rate"]
+    # Better on both axes, so the same rule passes it.
+    assert by_arm.loc["skill_v2", "p"] < 0.05
+
+
+def test_frontier_probability_agrees_with_the_plotted_frontier(runs_root: Path, model: str, make_result) -> None:
+    """An arm that dominates every resample is never off the frontier, and a dominated one never on."""
+    df = _arena(
+        runs_root,
+        model,
+        make_result,
+        {
+            "noskill": (1.00, [True, False, False, False, False]),
+            "skill_v1": (0.10, [True, True, True, True, True]),  # cheaper and better, always
+        },
+    )
+
+    tests = skill_tests(df, resamples=2000)
+    frontier = tests.arms.set_index("arm")["frontier"]
+    observed = _pareto_front(list(zip(tests.arms["cost"], tests.arms["rate"], strict=True)))
+
+    assert frontier["skill_v1"] == 1.0
+    assert frontier["noskill"] == 0.0
+    # The column and the plot's staircase must pick out the same arm on the observed data.
+    assert observed == [(pytest.approx(0.10), pytest.approx(1.0))]
+
+
+def test_skill_tests_compares_every_version_with_the_baseline_only(runs_root: Path, model: str, make_result) -> None:
+    """One family, one correction.
+
+    Version-against-version claims are deliberately absent: correcting them alongside the
+    baseline ones spends the budget on comparisons nobody makes and can bury the real result.
+    """
+    df = _arena(
+        runs_root,
+        model,
+        make_result,
+        {
+            "noskill": (1.00, [True, False, False, False, False]),
+            "skill_v1": (0.50, [True, True, False, False, False]),
+            "skill_v2": (0.10, [True, True, True, True, True]),
+        },
+    )
+
+    tests = skill_tests(df, resamples=2000)
+
+    assert tests.baseline == "noskill"
+    assert set(tests.comparisons["reference"]) == {"noskill"}
+    assert list(tests.comparisons["challenger"]) == ["skill_v1", "skill_v2"]
+    assert (tests.comparisons["p_adjusted"] >= tests.comparisons["p"]).all()  # adjusting only costs
+    assert tests.comparisons["p_adjusted"].notna().all()  # every row is covered by the correction
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # Smallest p times the family size, then one fewer, and so on.
+        ([0.01, 0.04, 0.30], [0.03, 0.08, 0.30]),
+        # Monotone: 0.021 alone would adjust to 0.021, but the running maximum lifts it to
+        # match the more significant result above it, so neither can overtake the other.
+        ([0.02, 0.021], [0.04, 0.04]),
+        ([0.5, 0.9], [1.0, 1.0]),  # clamped at 1
+    ],
+)
+def test_holm_is_monotone_and_scales_by_remaining_tests(raw: list[float], expected: list[float]) -> None:
+    assert _holm(raw) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    ("values", "highest", "expected"),
+    [
+        ([0.2, 0.9, 0.5], True, {1}),
+        ([0.2, 0.9, 0.5], False, {0}),
+        ([None, None, 0.8], True, set()),  # a lone value has beaten nothing, so no emphasis
+        ([0.3, 0.3, 0.8], False, {0, 1}),  # a tie marks both rather than crowning the first
+        ([None, 0.4, 0.1], False, {2}),  # the baseline's blank cells never win a column
+    ],
+)
+def test_best_cells_follows_each_column_own_direction(
+    values: list[float | None], highest: bool, expected: set[int]
+) -> None:
+    """Best means highest for the rates and lowest for cost and p, so the caller states which."""
+    assert _best_cells(values, highest=highest) == expected
+
+
+def test_tests_table_bolds_the_winner_in_each_column(runs_root: Path, model: str, make_result) -> None:
+    """The bold cells must track the column's direction, not simply the largest number."""
+    df = _arena(
+        runs_root,
+        model,
+        make_result,
+        {
+            "noskill": (1.00, [True, False, False, False, False]),
+            "skill_v1": (0.10, [True, True, True, True, True]),
+        },
+    )
+
+    html = _tests_table_html(skill_tests(df, resamples=2000))
+
+    assert "<strong>100.0%</strong>" in html  # highest success rate wins its column
+    assert "<strong>$0.100</strong>" in html  # *lowest* cost wins its own
+    assert "<strong>$1.000</strong>" not in html
+    # The comparison columns sit under one header, so it is clear they all refer to the baseline.
+    assert 'colspan="4">Compared with No skill' in html
+
+
+def test_skill_tests_is_deterministic(runs_root: Path, model: str, make_result) -> None:
+    """A rebuilt report must reach the same conclusion — a p-value that drifts is worse than none."""
+    df = _arena(
+        runs_root,
+        model,
+        make_result,
+        {"noskill": (1.00, [True, False, True, False, False]), "skill_v1": (0.20, [True, True, True, True, False])},
+    )
+
+    first, second = skill_tests(df, resamples=2000), skill_tests(df, resamples=2000)
+
+    assert first.comparisons["p"].tolist() == second.comparisons["p"].tolist()
+    assert first.arms["frontier"].tolist() == second.arms["frontier"].tolist()
+
+
+def test_skill_tests_declines_to_test_too_few_tasks(runs_root: Path, model: str, make_result) -> None:
+    """With one task every resample is identical, so p would be 0 or 1 by construction.
+
+    The fixture tree has a single task, which is exactly the case that must not silently produce
+    confident-looking numbers.
+    """
+    make_result(runs_root, RunKey(arm="skill_v1", split="test", model=model, task_id="example_task", rep=1))
+    df = load_results(runs_root)
+
+    tests = skill_tests(df)
+
+    assert tests.n_clusters == 1
+    assert not tests.usable
+    assert tests.comparisons.empty
+    assert "at least" in _tests_table_html(tests)  # a note, not a table of numbers
+
+
+def test_skill_tests_uses_the_test_split_only(runs_root: Path, model: str, make_result) -> None:
+    """Train runs feed the improver, so letting them into the test would be marking its own work."""
+    spec = {"noskill": (1.00, [True, False, True, False, False]), "skill_v1": (0.20, [True, True, True, True, False])}
+    before = skill_tests(_arena(runs_root, model, make_result, spec), resamples=2000)
+
+    for task in _TASKS:  # a pile of cheap, always-passing train runs for the baseline
+        make_result(runs_root, RunKey(arm="noskill", split="train", model=model, task_id=task, rep=9), cost_usd=0.001)
+    after = skill_tests(load_results(runs_root), resamples=2000)
+
+    assert after.comparisons["p"].tolist() == before.comparisons["p"].tolist()
+    assert after.arms["cost"].tolist() == before.arms["cost"].tolist()
 
 
 def test_arm_marker_widens_with_the_version() -> None:

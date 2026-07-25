@@ -25,6 +25,7 @@ dependencies = [
   "claude-agent-sdk>=0.2.116",
   "claude-code-log",
   "matplotlib",
+  "numpy",
   "pandas",
   "psutil>=5.9",
   "pyyaml",

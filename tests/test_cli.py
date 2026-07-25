@@ -121,8 +121,10 @@ def test_report_writes_html_and_csv(project: Path, runs_root: Path, capsys: pyte
 
     html = out_path.read_text()
     assert "noskill" in html
-    # The trade-off figure is present and reachable from the contents.
+    # Both overview figures and the significance section are present, and each is reachable
+    # from the contents.
     assert 'id="tradeoff"' in html and 'href="#tradeoff"' in html
+    assert 'id="dominance"' in html and 'href="#dominance"' in html
     # Self-contained: figures are inlined, so nothing is fetched from the network.
     assert "http://" not in html and "https://" not in html
     assert "aggregated 2 runs" in capsys.readouterr().out

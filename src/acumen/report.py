@@ -33,6 +33,7 @@ matplotlib.use("Agg")  # headless: we never open a window, we render straight to
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+import numpy as np
 import pandas as pd
 from matplotlib.colors import is_color_like
 from matplotlib.lines import Line2D
@@ -858,6 +859,319 @@ def figure_data_uri(fig: plt.Figure) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
+# ── Significance ─────────────────────────────────────────────────────────────────────
+
+#: Resamples behind every p-value and frontier share. Large enough that the resolution floor
+#: (1/resamples) sits far below any threshold anyone reads off the table.
+_BOOTSTRAP_RESAMPLES = 20_000
+
+#: Fixed, so regenerating a report never moves its p-values. A conclusion that changed because
+#: the report was rebuilt would be worse than no conclusion.
+_BOOTSTRAP_SEED = 0
+
+#: What a resample draws. Runs on the same task are correlated — some tasks are simply harder —
+#: so the task is the independent unit, not the run. Treating all runs as independent would be
+#: pseudoreplication and would understate every standard error. Models are deliberately *not*
+#: part of this: they are a fixed set that was chosen, not a sample to generalise over.
+_CLUSTER_COLUMN = "task_id"
+
+#: Below this many tasks the resamples repeat too often to say anything — with one task every
+#: resample is identical and p collapses to 0 or 1. The section says so rather than printing
+#: numbers it cannot support.
+_MIN_CLUSTERS = 3
+
+
+def _holm(pvalues: Sequence[float]) -> list[float]:
+    """Holm–Bonferroni adjusted p-values, returned in the order given.
+
+    Controls the probability of *any* false claim across the family — the right target when the
+    family feeds a single decision (ship this version or not), rather than the false-discovery
+    rate, which earns its keep over hundreds of tests. Holm is also valid under arbitrary
+    dependence, which matters here: every comparison reuses the baseline arm and the same
+    bootstrap draws, so the tests are far from independent.
+
+    The running maximum enforces monotonicity — a smaller raw p can never adjust to a larger
+    value than one above it in the ordering.
+    """
+    order = sorted(range(len(pvalues)), key=lambda i: pvalues[i])
+    adjusted = [0.0] * len(pvalues)
+    running = 0.0
+    for rank, index in enumerate(order):
+        running = max(running, min(1.0, pvalues[index] * (len(pvalues) - rank)))
+        adjusted[index] = running
+    return adjusted
+
+
+def _cluster_totals(df: pd.DataFrame, arms: Sequence[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Summed cost, successes and run counts per (task, arm) over the reported split.
+
+    These are the sufficient statistics for the bootstrap: both metrics are ratios of sums, so a
+    resample never has to touch an individual run again.
+    """
+    test = df[df["split"] == _REPORTED_SPLIT]
+    clusters = sorted(test[_CLUSTER_COLUMN].unique())
+    shape = (len(clusters), len(arms))
+    cost, successes, runs = np.zeros(shape), np.zeros(shape), np.zeros(shape)
+    for ci, cluster in enumerate(clusters):
+        for ai, arm in enumerate(arms):
+            rows = test[(test[_CLUSTER_COLUMN] == cluster) & (test["arm"] == arm)]
+            cost[ci, ai] = rows["cost_usd"].sum()
+            successes[ci, ai] = rows["success"].sum()
+            runs[ci, ai] = len(rows)
+    return cost, successes, runs
+
+
+def _bootstrap_arms(
+    cost: np.ndarray, successes: np.ndarray, runs: np.ndarray, *, resamples: int, seed: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resample whole tasks and recompute every arm's rate and cost per run.
+
+    Drawing ``n`` tasks with replacement *is* a multinomial over the tasks, so the cluster counts
+    come from one call and the whole bootstrap collapses to two matrix products — every arm and
+    every resample at once. Each resample reuses the same drawn tasks for every arm, which is
+    what makes the comparison paired: task difficulty cancels instead of adding noise.
+    """
+    n_clusters = len(cost)
+    rng = np.random.default_rng(seed)
+    counts = rng.multinomial(n_clusters, np.full(n_clusters, 1 / n_clusters), size=resamples).astype(float)
+    drawn = counts @ runs
+    # An arm absent from every drawn task divides by zero; the NaN is dropped downstream rather
+    # than being counted as evidence either way.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return (counts @ successes) / drawn, (counts @ cost) / drawn
+
+
+def _frontier_probability(rate: np.ndarray, cost_per_run: np.ndarray) -> np.ndarray:
+    """Share of resamples in which each arm is non-dominated.
+
+    The same rule as :func:`_pareto_front` — cheaper-or-equal and better-or-equal, strictly so on
+    one axis — broadcast over every pair of arms and every resample at once, so the column and
+    the plot's staircase cannot disagree. Read it as robustness, not as a test: it says how often
+    an arm survives a fresh draw of tasks, and has no null hypothesis to correct for.
+    """
+    cost, other_cost = cost_per_run[:, :, None], cost_per_run[:, None, :]
+    own, other = rate[:, :, None], rate[:, None, :]
+    dominated = (other_cost <= cost) & (other >= own) & ((other_cost < cost) | (other > own))
+    return (~dominated.any(axis=2)).mean(axis=0)
+
+
+def _dominance_p(
+    rate: np.ndarray, cost_per_run: np.ndarray, challenger: int, reference: int
+) -> tuple[float, float, float]:
+    """One-sided p per axis and their max: does ``challenger`` beat ``reference`` on *both*?
+
+    An intersection–union test. Dominance is a conjunction — cheaper *and* more accurate — so the
+    evidence for it is only as strong as its weakest half, and the max is the p-value. That the
+    two axes need no multiplicity correction is a property of the conjunction, not an oversight:
+    getting lucky on one axis buys nothing when the other must clear as well.
+
+    This is what stops a version buying its way in on price. An arm that is dramatically cheaper
+    but no more accurate scores overwhelming evidence on cost, none on rate, and fails.
+    """
+    d_rate = rate[:, challenger] - rate[:, reference]
+    d_cost = cost_per_run[:, challenger] - cost_per_run[:, reference]
+    usable = np.isfinite(d_rate) & np.isfinite(d_cost)
+    d_rate, d_cost = d_rate[usable], d_cost[usable]
+    if not len(d_rate):
+        return 1.0, 1.0, 1.0
+    floor = 1 / len(d_rate)  # the bootstrap cannot resolve below one resample
+    p_rate = max(float((d_rate <= 0).mean()), floor)
+    p_cost = max(float((d_cost >= 0).mean()), floor)
+    return p_rate, p_cost, max(p_rate, p_cost)
+
+
+@dataclass(frozen=True)
+class SkillTests:
+    """Whether the arms differ by more than noise, and how robustly.
+
+    Attributes
+    ----------
+    arms
+        One row per arm: its success rate, cost per run, and the share of resamples in which it
+        sits on the Pareto frontier.
+    comparisons
+        One row per claim "this version dominates the baseline", with the per-axis deltas, the
+        intersection–union p, and the Holm-adjusted p across them.
+    baseline
+        The arm everything is measured against — the noskill arm when there is one.
+    n_clusters
+        Tasks behind the resampling — the real sample size for every p-value here.
+    """
+
+    arms: pd.DataFrame
+    comparisons: pd.DataFrame
+    baseline: str
+    n_clusters: int
+
+    @property
+    def usable(self) -> bool:
+        """Whether there were enough tasks, and enough arms, to test anything."""
+        return self.n_clusters >= _MIN_CLUSTERS and not self.comparisons.empty
+
+
+def skill_tests(df: pd.DataFrame, *, resamples: int = _BOOTSTRAP_RESAMPLES, seed: int = _BOOTSTRAP_SEED) -> SkillTests:
+    """Test which skill versions beat which, on cost and success rate jointly.
+
+    Deliberately reports no single combined score. Folding rate and cost into one number picks an
+    exchange rate between them on the reader's behalf, and that choice decides the answer: a
+    version that is much cheaper while being *worse* at the task can come out ahead. The
+    dominance test in :func:`_dominance_p` requires both axes to improve, so it cannot be bought
+    off that way, and :func:`_frontier_probability` ranks the arms without needing a threshold.
+
+    Only the versus-baseline claims are tested — the question the benchmark exists to answer, and
+    the family the Holm adjustment covers. Testing every version against every other as well
+    would spend the correction budget on claims nobody makes (whether the *baseline* dominates a
+    skill) and can bury the real result: on a four-arm report it turns a Holm p of 0.03 into 0.15.
+
+    Parameters
+    ----------
+    df
+        Results from :func:`load_results`. Only the reported (test) split is used.
+    resamples, seed
+        Bootstrap size and its seed. The default seed is fixed so a rebuilt report reproduces
+        its own p-values exactly.
+    """
+    arms = _arms_in_order(df)
+    cost, successes, runs = _cluster_totals(df, arms)
+    n_clusters = len(cost)
+    baseline = arms[0] if arms else NOSKILL_ARM  # noskill sorts first when it is present
+    if n_clusters < _MIN_CLUSTERS or len(arms) < 2:
+        empty = pd.DataFrame(columns=["challenger", "reference", "d_rate", "d_cost", "p", "p_adjusted"])
+        return SkillTests(
+            arms=pd.DataFrame(columns=["arm", "rate", "cost", "frontier"]),
+            comparisons=empty,
+            baseline=baseline,
+            n_clusters=n_clusters,
+        )
+
+    rate, cost_per_run = _bootstrap_arms(cost, successes, runs, resamples=resamples, seed=seed)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        observed_rate = successes.sum(axis=0) / runs.sum(axis=0)
+        observed_cost = cost.sum(axis=0) / runs.sum(axis=0)
+    arm_rows = pd.DataFrame(
+        {
+            "arm": arms,
+            "rate": observed_rate,
+            "cost": observed_cost,
+            "frontier": _frontier_probability(rate, cost_per_run),
+        }
+    )
+
+    rows = []
+    for challenger in range(1, len(arms)):
+        p_rate, p_cost, p = _dominance_p(rate, cost_per_run, challenger, 0)
+        rows.append(
+            {
+                "challenger": arms[challenger],
+                "reference": baseline,
+                "d_rate": observed_rate[challenger] - observed_rate[0],
+                "d_cost": observed_cost[challenger] - observed_cost[0],
+                "p_rate": p_rate,
+                "p_cost": p_cost,
+                "p": p,
+            }
+        )
+    comparisons = pd.DataFrame(rows)
+    comparisons["p_adjusted"] = _holm(comparisons["p"].tolist())
+    return SkillTests(arms=arm_rows, comparisons=comparisons, baseline=baseline, n_clusters=n_clusters)
+
+
+def _fmt_delta_rate(value: float) -> str:
+    """A change in success rate, in percentage *points* — 77.8% to 73.3% is -4.4pp, not -4.4%."""
+    return f"{value * 100:+.1f}pp"
+
+
+def _fmt_delta_cost(value: float) -> str:
+    """A change in cost per run, with the sign outside the currency: ``-$0.083``."""
+    return f"{'+' if value >= 0 else '-'}${abs(value):.3f}"
+
+
+def _fmt_p(p: float) -> str:
+    """A p-value at the precision the bootstrap can actually resolve."""
+    if not math.isfinite(p):
+        return "&mdash;"
+    return "&lt;0.001" if p < 0.001 else f"{p:.3f}"
+
+
+#: The table's columns: (header, field, higher-is-better, formatter). The direction is per column
+#: because "best" does not point one way here — the strongest arm has the *highest* success rate
+#: and the *lowest* cost, and a reader scanning the bold cells for the winner should not have to
+#: keep track of which column runs which way. The first few describe an arm on its own; the rest
+#: compare it with the baseline.
+_TEST_COLUMNS = (
+    ("Success rate", "rate", True, lambda v: f"{v:.1%}"),
+    ("Cost / run", "cost", False, lambda v: f"${v:.3f}"),
+    ("On frontier", "frontier", True, lambda v: f"{v:.1%}"),
+    ("&Delta; rate", "d_rate", True, _fmt_delta_rate),
+    ("&Delta; cost", "d_cost", False, _fmt_delta_cost),
+    ("p", "p", False, _fmt_p),
+    ("Holm p", "p_adjusted", False, _fmt_p),
+)
+
+#: How many of the above describe the arm itself; the remainder are the comparison, and sit under
+#: a shared header so it is clear they all refer to the baseline rather than to each other.
+_ARM_COLUMNS = 3
+
+
+def _best_cells(values: Sequence[float | None], *, highest: bool) -> set[int]:
+    """Row indices holding the best value in one column, by that column's own direction.
+
+    A lone value has beaten nothing, so a column with fewer than two populated cells gets no
+    emphasis at all. Ties are all marked rather than arbitrarily crowning whichever came first.
+    """
+    present = [v for v in values if v is not None and math.isfinite(v)]
+    if len(present) < 2:
+        return set()
+    target = max(present) if highest else min(present)
+    return {i for i, v in enumerate(values) if v is not None and v == target}
+
+
+def _tests_table_html(tests: SkillTests) -> str:
+    """The significance table: one row per arm, with the best value in each column set bold."""
+    if not tests.usable:
+        return (
+            f'<div class="note">Not enough to test: a paired bootstrap needs at least {_MIN_CLUSTERS} '
+            f"tasks and two arms to compare (this report has {tests.n_clusters}). The figures above "
+            f"still describe what was measured.</div>"
+        )
+
+    by_arm = {row.challenger: row for row in tests.comparisons.itertuples()}
+    compared = [field for _title, field, _highest, _fmt in _TEST_COLUMNS[_ARM_COLUMNS:]]
+    records = []
+    for row in tests.arms.itertuples():
+        match = by_arm.get(row.arm)
+        # The baseline is not compared with itself: those cells stay empty, and take no part in
+        # deciding which value in the column is best.
+        records.append(
+            {f: getattr(row, f) for f in ("rate", "cost", "frontier")}
+            | {f: (None if match is None else getattr(match, f)) for f in compared}
+        )
+    best = [
+        _best_cells([record[field] for record in records], highest=highest)
+        for _title, field, highest, _fmt in _TEST_COLUMNS
+    ]
+
+    body = []
+    for index, (arm, record) in enumerate(zip(tests.arms["arm"], records, strict=True)):
+        cells = [f"<td>{_skill_label(arm)}</td>"]
+        for column, (_title, field, _highest, fmt) in enumerate(_TEST_COLUMNS):
+            value = record[field]
+            text = "&mdash;" if value is None else fmt(value)
+            cells.append(f"<td><strong>{text}</strong></td>" if index in best[column] else f"<td>{text}</td>")
+        body.append(f"<tr>{''.join(cells)}</tr>")
+
+    own = "".join(f'<th rowspan="2">{title}</th>' for title, *_ in _TEST_COLUMNS[:_ARM_COLUMNS])
+    versus = "".join(f"<th>{title}</th>" for title, *_ in _TEST_COLUMNS[_ARM_COLUMNS:])
+    span = len(_TEST_COLUMNS) - _ARM_COLUMNS
+    return f"""<table>
+<thead>
+<tr><th rowspan="2">Skill</th>{own}<th colspan="{span}">Compared with {_skill_label(tests.baseline)}</th></tr>
+<tr>{versus}</tr>
+</thead>
+<tbody>{"".join(body)}</tbody>
+</table>"""
+
+
 @dataclass(frozen=True)
 class Report:
     """A rendered report and the data behind it."""
@@ -1189,6 +1503,7 @@ def render_report(
     colors = resolve_palette(_models_in_order(df), palette)
     overview_uri = figure_data_uri(metrics_figure(df, split_hue=False, colors=colors))
     tradeoff_uri = figure_data_uri(tradeoff_figure(df, colors=colors))
+    tests = skill_tests(df)
     task_by_id = {t.id: t for t in tasks or []}
     skills_section, skills_toc = _skills_section_html(df, skills_root)
 
@@ -1211,7 +1526,8 @@ def render_report(
 <img class="toc-banner" src="{_asset_data_uri("banner.svg")}" alt="acumen">
 <div class="toc-title">acumen report</div>
 <ul>
-<li><a href="#overview">Overview</a><ul><li><a href="#tradeoff">Cost vs. success</a></li></ul></li>
+<li><a href="#overview">Overview</a><ul><li><a href="#tradeoff">Cost vs. success</a></li>
+<li><a href="#dominance">Is the difference real?</a></li></ul></li>
 <li><a href="#per-task">Per-task breakdown</a><ul>{"".join(toc_tasks)}</ul></li>
 {skills_toc}
 <li><a href="#runs">Runs</a></li>
@@ -1249,6 +1565,17 @@ def render_report(
  both axes. The staircase is the Pareto frontier: anything below and to the right of it is
  dominated, because something on the line costs less <em>and</em> succeeds more.</p>
 <figure><img alt="Cost per run against success rate, by model and skill version" src="{tradeoff_uri}"></figure>
+<h3 id="dominance">Is the difference real?</h3>
+<p class="task-desc">A version <em>dominates</em> the baseline when it is both cheaper and more
+ accurate by more than chance. The two axes are tested separately and the weaker of the two
+ p-values is reported, so a version cannot pass on price while being worse at the task.
+ Improving both numbers is not enough on its own: a gain the resampling cannot tell apart from
+ noise leaves the Holm p high, which says the evidence is thin rather than that the version is
+ bad. Best value in each column is <strong>bold</strong>, highest for the rates and lowest for
+ cost and for the p-values. <em>On frontier</em> is how often an arm holds the Pareto frontier
+ across resamples. Resampling is over the {tests.n_clusters} test tasks, paired across arms, so the
+ unit is the task rather than the run.</p>
+{_tests_table_html(tests)}
 </section>
 <section id="per-task">
 <h2>Per-task breakdown</h2>
