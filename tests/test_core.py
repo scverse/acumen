@@ -46,6 +46,8 @@ from acumen.report import (
     _integrity_notes,
     _pareto_front,
     _pareto_steps,
+    _skill_diff_html,
+    _split_diff_rows,
     _tests_table_html,
     load_results,
     metrics_figure,
@@ -1086,6 +1088,40 @@ def test_arm_marker_widens_with_the_version() -> None:
     """The baseline is off the ladder; each version adds a side, so the order is legible."""
     assert _arm_marker("noskill") == "X"
     assert [_arm_marker(f"skill_v{n}") for n in (1, 2, 3, 9)] == [(3, 0, 0), (4, 0, 0), (5, 0, 0), (11, 0, 0)]
+
+
+# --- split diff ------------------------------------------------------------------------
+
+
+def test_split_diff_pairs_a_rewrite_and_leaves_the_other_side_empty() -> None:
+    """A changed line sits opposite its replacement; where one side runs out, it faces nothing."""
+    rows = _split_diff_rows(["keep", "old"], ["keep", "new", "extra"])
+    assert [(r.left, r.right) for r in rows] == [("keep", "keep"), ("old", "new"), (None, "extra")]
+    assert [(r.left_no, r.right_no) for r in rows] == [(1, 1), (2, 2), (None, 3)]
+    assert [r.kind for r in rows[1:]] == ["replace", "replace"]  # one run, so both rows tint
+
+
+def test_split_diff_collapses_untouched_stretches_but_keeps_context() -> None:
+    """Three lines of context survive on each side of a change; the rest becomes one gap row."""
+    before = [f"line {n}" for n in range(20)]
+    after = [*before[:10], "inserted", *before[10:]]
+    rows = _split_diff_rows(before, after)
+    assert [r.kind for r in rows] == ["gap", *["equal"] * 3, "insert", *["equal"] * 3, "gap"]
+    assert [r.left for r in rows if r.kind == "equal"] == [f"line {n}" for n in (7, 8, 9, 10, 11, 12)]
+
+
+def test_skill_diff_marks_only_the_words_that_changed() -> None:
+    """Word-level highlighting inside a rewritten line, on both sides, without touching the rest."""
+    diff = _skill_diff_html({"SKILL.md": "use ulm here\n"}, {"SKILL.md": "use mlm here\n"}, ("v001", "v002"))
+    assert "<mark>ulm</mark>" in diff and "<mark>mlm</mark>" in diff
+    assert "<mark>here</mark>" not in diff
+
+
+def test_skill_diff_reports_an_unchanged_version_and_a_first_draft() -> None:
+    """Neither case has a diff to show, and each says which case it is."""
+    content = {"SKILL.md": "same\n"}
+    assert "No content change" in _skill_diff_html(content, content, ("v001", "v002"))
+    assert "no parent" in _skill_diff_html(None, content, ("", "v001"))
 
 
 # --- orphan reaping --------------------------------------------------------------------
