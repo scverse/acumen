@@ -37,7 +37,7 @@ from acumen.improve import _write_material, collect_train_runs, load_rates
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
 from acumen.procs import label_env, reap, supported, survivors
 from acumen.prompts import draft_prompt, feedback_block, improve_prompt
-from acumen.report import ReportError, load_results, metrics_figure, resolve_palette
+from acumen.report import ReportError, _integrity_notes, load_results, metrics_figure, resolve_palette
 from acumen.runner import StderrFilter, _skill_fired
 from acumen.ship import _ship_env
 from acumen.skills import SkillError, load_skill, read_meta, skill_hash, write_meta
@@ -636,6 +636,24 @@ def test_skill_loaded_column_counts_undetermined_runs_as_not_loaded(runs_root: P
         plt.close(figure)
 
     assert widths == [0.0, 0.5]  # the baseline loaded nothing; one of two skill runs is determined
+
+
+@pytest.mark.parametrize(("loads", "warned"), [((True, True, False), False), ((True, False, False), True)])
+def test_load_warning_needs_most_of_the_arm_to_miss(
+    runs_root: Path, model: str, make_result, loads: tuple[bool, ...], warned: bool
+) -> None:
+    """A skill arm is only flagged once fewer than half its runs loaded the skill.
+
+    Misses in a minority of runs are ordinary, and the per-run table already marks each one,
+    so warning about them at the top of the report would cry wolf on a healthy arm.
+    """
+    for rep, loaded in enumerate(loads, start=1):
+        key = RunKey(arm="skill_v1", split="test", model=model, task_id="example_task", rep=rep)
+        make_result(runs_root, key, skill_loaded=loaded)
+
+    notes = _integrity_notes(load_results(runs_root))
+
+    assert bool(notes) is warned
 
 
 # --- orphan reaping --------------------------------------------------------------------

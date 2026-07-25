@@ -596,10 +596,13 @@ class Report:
 def _integrity_notes(df: pd.DataFrame) -> list[str]:
     """Flag arms whose ``skill_loaded`` disagrees with what the arm name claims.
 
-    A skill arm that never loaded the skill under test is not measuring it; a noskill run
-    that did load it is not a clean baseline. Either makes the comparison a lie, so it is
-    surfaced in the report rather than left in the transcripts. Other skills the agent may
-    reach — the ones bundled with the CLI — do not count either way.
+    A skill arm that mostly failed to load the skill under test is not measuring it; a
+    noskill run that did load it is not a clean baseline. Either makes the comparison a lie,
+    so it is surfaced in the report rather than left in the transcripts. Other skills the
+    agent may reach — the ones bundled with the CLI — do not count either way.
+
+    Occasional misses are normal and the per-run table already marks them, so a skill arm is
+    only flagged once fewer than half its runs loaded the skill.
     """
     notes = []
     if "skill_loaded" not in df.columns:
@@ -610,7 +613,7 @@ def _integrity_notes(df: pd.DataFrame) -> list[str]:
         if arm == NOSKILL_ARM:
             if loaded:
                 notes.append(f"baseline arm '{arm}' loaded the skill under test in {loaded}/{len(group)} runs")
-        elif loaded < len(group):
+        elif loaded * 2 < len(group):
             notes.append(f"skill arm '{arm_label(arm)}' loaded the skill in only {loaded}/{len(group)} runs")
     return notes
 
