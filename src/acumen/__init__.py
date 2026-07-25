@@ -30,7 +30,15 @@ from acumen.improve import (
 )
 from acumen.logs import LiveLog
 from acumen.paths import RunKey, Split, arm_name, is_complete, parse_run_dir, run_dir, skill_from_arm
-from acumen.report import Report, ReportError, arm_metrics, build_report, load_results, resolve_palette
+from acumen.report import (
+    Report,
+    ReportError,
+    arm_metrics,
+    build_report,
+    load_results,
+    resolve_palette,
+    tradeoff_figure,
+)
 from acumen.runner import RunOutcome, run_once
 from acumen.sandbox import Sandbox, install_skill, sandbox
 from acumen.scaffold import InitError, scaffold
@@ -142,6 +150,7 @@ __all__ = [
     "skill_from_arm",
     "skill_hash",
     "summarize",
+    "tradeoff_figure",
 ]
 
 __version__ = version("acumen")

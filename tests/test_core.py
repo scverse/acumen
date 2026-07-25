@@ -37,7 +37,17 @@ from acumen.improve import _write_material, collect_train_runs, load_rates
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
 from acumen.procs import label_env, reap, supported, survivors
 from acumen.prompts import draft_prompt, feedback_block, improve_prompt
-from acumen.report import ReportError, _integrity_notes, load_results, metrics_figure, resolve_palette
+from acumen.report import (
+    ReportError,
+    _arm_marker,
+    _integrity_notes,
+    _pareto_front,
+    _pareto_steps,
+    load_results,
+    metrics_figure,
+    resolve_palette,
+    tradeoff_figure,
+)
 from acumen.runner import StderrFilter, _skill_fired
 from acumen.ship import _ship_env
 from acumen.skills import SkillError, load_skill, read_meta, skill_hash, write_meta
@@ -654,6 +664,231 @@ def test_load_warning_needs_most_of_the_arm_to_miss(
     notes = _integrity_notes(load_results(runs_root))
 
     assert bool(notes) is warned
+
+
+# --- the cost/success trade-off figure --------------------------------------------------
+
+#: The two markers matplotlib gives an error bar's caps; neither is a data point.
+_CAP_MARKERS = {"|", "_"}
+
+
+def _pooled_marks(figure: plt.Figure) -> list[tuple[float, float]]:
+    """``(cost, rate)`` of each pooled mark, in the order the arms are drawn.
+
+    The pooled marks are the only ones carrying error bars, so they are exactly the axes'
+    error-bar containers.
+    """
+    return [(float(c.lines[0].get_xdata()[0]), float(c.lines[0].get_ydata()[0])) for c in figure.axes[0].containers]
+
+
+def _model_marks(figure: plt.Figure) -> list[plt.Line2D]:
+    """Every per-model point mark — no pooled marks, no error-bar caps, no reference lines."""
+    ax = figure.axes[0]
+    pooled = {id(c.lines[0]) for c in ax.containers}
+    return [
+        line for line in ax.lines if str(line.get_marker()) not in _CAP_MARKERS | {"None"} and id(line) not in pooled
+    ]
+
+
+def _frontier(figure: plt.Figure) -> list[tuple[float, float]]:
+    """The vertices of the drawn Pareto staircase — the only marker-less line on the axes."""
+    (line,) = [ln for ln in figure.axes[0].lines if str(ln.get_marker()) == "None"]
+    return [(float(x), float(y)) for x, y in zip(*line.get_data(), strict=True)]
+
+
+def test_tradeoff_pooled_mark_averages_runs_not_per_model_means(runs_root: Path, model: str, make_result) -> None:
+    """The pooled mark sits where an average *run* lands, whichever model drew it.
+
+    Averaging the per-model points instead would let a model with two runs count for no more
+    than one with a single run — the same trap the grid's grey bar avoids.
+    """
+    other = "claude-opus-5"
+    key = RunKey(arm="noskill", split="test", model=other, task_id="example_task", rep=1)
+    make_result(runs_root, key, success=False, cost_usd=0.30)
+    make_result(runs_root, replace(key, rep=2), success=False, cost_usd=0.30)
+    df = load_results(runs_root)  # the fixture's one passing $0.12 run, plus two failing $0.30 ones
+
+    figure = tradeoff_figure(df)
+    try:
+        (pooled,) = _pooled_marks(figure)
+    finally:
+        plt.close(figure)
+
+    # Over runs: ($0.12 + $0.30 + $0.30)/3 and 1 of 3 passing. Over per-model means it would
+    # have been $0.21 and 50%.
+    assert pooled == pytest.approx((0.24, 1 / 3))
+
+
+def test_tradeoff_shape_carries_the_arm_and_colour_carries_the_model(runs_root: Path, model: str, make_result) -> None:
+    """Two channels, two meanings: an ✕ then a widening polygon per version, hue left to the model."""
+    for arm in ("skill_v1", "skill_v2"):
+        make_result(runs_root, RunKey(arm=arm, split="test", model=model, task_id="example_task", rep=1))
+    df = load_results(runs_root)
+
+    figure = tradeoff_figure(df, colors=resolve_palette([model], {model: "#3b7ea1"}))
+    try:
+        markers = {str(line.get_marker()) for line in _model_marks(figure)}
+        colors = {to_hex(line.get_color()) for line in _model_marks(figure)}
+    finally:
+        plt.close(figure)
+
+    # noskill is off the ladder; v1 and v2 are the 3- and 4-sided polygons.
+    assert markers == {"X", "(3, 0, 0)", "(4, 0, 0)"}
+    assert colors == {"#3b7ea1"}  # the override reaches the marks, not just the legend
+
+
+def test_tradeoff_frontier_steps_between_the_marks_nothing_beats(runs_root: Path, model: str, make_result) -> None:
+    """The staircase holds each rate until the next frontier point's price, then steps up.
+
+    A dominated arm — dearer *and* worse — must leave no trace on the line, and the path must
+    never cut a diagonal between two points, which would claim a result nobody measured.
+    """
+    other = "claude-opus-5"
+    # Cheap and good, dear and bad, dear and best: only the first and last are non-dominated.
+    make_result(runs_root, RunKey(arm="skill_v1", split="test", model=other, task_id="example_task", rep=1))
+    make_result(
+        runs_root,
+        RunKey(arm="skill_v2", split="test", model=other, task_id="example_task", rep=1),
+        cost_usd=0.50,
+        success=False,
+    )
+    df = load_results(runs_root)  # plus the fixture's $0.12 passing baseline run
+
+    figure = tradeoff_figure(df)
+    try:
+        vertices = _frontier(figure)
+        y_min = figure.axes[0].get_ylim()[0]
+    finally:
+        plt.close(figure)
+
+    # Both $0.12 runs pass, so the cheapest 100% mark alone survives; the $0.50 failure is
+    # dominated and the riser starts at the axis floor.
+    assert vertices == [(pytest.approx(0.12), pytest.approx(y_min)), (pytest.approx(0.12), pytest.approx(1.0))]
+
+
+def test_tradeoff_handles_an_arm_where_nothing_succeeded(runs_root: Path, model: str, make_result) -> None:
+    """A 0% rate is a real result, not a hole: the mark is plotted and the frontier still draws."""
+    make_result(
+        runs_root,
+        RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=1),
+        success=False,
+    )
+    df = load_results(runs_root)
+
+    figure = tradeoff_figure(df)
+    try:
+        assert _pooled_marks(figure) == [(pytest.approx(0.12), 0.0)]
+        assert _frontier(figure)  # degenerate but drawn, rather than crashing on the empty case
+    finally:
+        plt.close(figure)
+
+
+def test_tradeoff_plots_the_test_split_only(runs_root: Path, model: str, make_result) -> None:
+    """Train runs feed the improver; a report measures held-out performance and must not mix them."""
+    make_result(
+        runs_root,
+        RunKey(arm="noskill", split="train", model=model, task_id="example_task", rep=2),
+        cost_usd=99.0,
+    )
+    df = load_results(runs_root)
+
+    figure = tradeoff_figure(df)
+    try:
+        (pooled,) = _pooled_marks(figure)
+    finally:
+        plt.close(figure)
+
+    assert pooled == pytest.approx((0.12, 1.0))  # the fixture's test run alone
+
+
+def test_tradeoff_keeps_the_two_corner_tick_labels_apart(runs_root: Path, model: str, make_result) -> None:
+    """The cost label at the origin is centred on the corner the rate floor label also sits on.
+
+    Left to itself that puts half of one under the other, which is unreadable exactly where the
+    reader looks to learn the rate axis is truncated.
+    """
+    make_result(
+        runs_root,
+        RunKey(arm="skill_v1", split="test", model=model, task_id="example_task", rep=1),
+        success=False,
+    )
+    df = load_results(runs_root)
+
+    figure = tradeoff_figure(df)
+    try:
+        figure.canvas.draw()  # tick labels have no position until the figure has been laid out
+        ax = figure.axes[0]
+        # The locators run past the view, so the corner pair are the innermost *visible* labels.
+        x_lo, x_hi = ax.get_xlim()
+        y_lo, y_hi = ax.get_ylim()
+        cost = min(
+            (t for t in ax.get_xticklabels() if x_lo <= t.get_position()[0] <= x_hi),
+            key=lambda t: t.get_position()[0],
+        )
+        rate = min(
+            (t for t in ax.get_yticklabels() if y_lo <= t.get_position()[1] <= y_hi),
+            key=lambda t: t.get_position()[1],
+        )
+        renderer = figure.canvas.get_renderer()
+        overlaps = cost.get_window_extent(renderer).overlaps(rate.get_window_extent(renderer))
+    finally:
+        plt.close(figure)
+
+    assert not overlaps
+
+
+def test_tradeoff_skill_key_is_unfilled_and_the_model_key_is_not(runs_root: Path, model: str, make_result) -> None:
+    """Only one of the two keys is about colour, and the other must not look like it is."""
+    make_result(runs_root, RunKey(arm="skill_v1", split="test", model=model, task_id="example_task", rep=1))
+    df = load_results(runs_root)
+
+    figure = tradeoff_figure(df, colors=resolve_palette([model], {model: "#3b7ea1"}))
+    try:
+        keys = {legend.get_title().get_text(): legend.legend_handles for legend in figure.legends}
+        skill = {handle.get_markerfacecolor() for handle in keys["skill"]}
+        models = {to_hex(handle.get_markerfacecolor()) for handle in keys["model"]}
+    finally:
+        plt.close(figure)
+
+    assert skill == {"none"}  # shape is the channel, so an outline is the whole handle
+    assert models == {"#3b7ea1"}  # the model key is the colour key, and keeps its fill
+
+
+@pytest.mark.parametrize(
+    ("points", "expected"),
+    [
+        # Dearer and worse than (0.1, 0.8), so nothing would make you pick it.
+        ([(0.1, 0.8), (0.2, 0.7)], [(0.1, 0.8)]),
+        # Dearer but better: a real choice, so both stay.
+        ([(0.1, 0.8), (0.2, 0.9)], [(0.1, 0.8), (0.2, 0.9)]),
+        # Cheaper and better at once — one point dominates the whole set.
+        ([(0.2, 0.7), (0.1, 0.9), (0.3, 0.5)], [(0.1, 0.9)]),
+        # Same price, so only the better rate survives.
+        ([(0.1, 0.8), (0.1, 0.6)], [(0.1, 0.8)]),
+        ([], []),
+    ],
+)
+def test_pareto_front_keeps_only_what_nothing_beats_on_both_counts(
+    points: list[tuple[float, float]], expected: list[tuple[float, float]]
+) -> None:
+    """Cheapest first, and a point survives only when nothing is both no dearer and no worse."""
+    assert _pareto_front(points) == expected
+
+
+def test_pareto_steps_never_cuts_a_diagonal() -> None:
+    """Between frontier points the best rate on offer is the cheaper one's, so the path holds it.
+
+    Sloping straight from one point to the next would assert results at prices nobody ran.
+    """
+    xs, ys = _pareto_steps([(0.1, 0.8), (0.2, 0.9)], y_min=0.5)
+
+    assert list(zip(xs, ys, strict=True)) == [(0.1, 0.5), (0.1, 0.8), (0.2, 0.8), (0.2, 0.9)]
+
+
+def test_arm_marker_widens_with_the_version() -> None:
+    """The baseline is off the ladder; each version adds a side, so the order is legible."""
+    assert _arm_marker("noskill") == "X"
+    assert [_arm_marker(f"skill_v{n}") for n in (1, 2, 3, 9)] == [(3, 0, 0), (4, 0, 0), (5, 0, 0), (11, 0, 0)]
 
 
 # --- orphan reaping --------------------------------------------------------------------

@@ -35,6 +35,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import pandas as pd
 from matplotlib.colors import is_color_like
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
 from acumen.paths import NOSKILL_ARM, RESULT_FILE, TRANSCRIPT_HTML, skill_from_arm
@@ -137,6 +138,29 @@ def _skill_label(arm: str) -> str:
         return "No skill"
     version = skill_from_arm(arm)
     return f"Skill {version}" if version else arm
+
+
+def _arm_marker(arm: str) -> str | tuple[int, int, int]:
+    """Scatter marker for an arm — an ✕ for the baseline, then a widening polygon per version.
+
+    The trade-off figure spends hue on the *model*, the same as every other figure here, so
+    the arm needs a second channel: shape. Arms are ordinal, and most shape sets are not, so
+    the versions walk a polygon ladder — v1 a triangle, v2 a square, v3 a pentagon — where the
+    side count rises with the version and the progression reads in order. matplotlib takes the
+    ``(numsides, style, angle)`` form, so the ladder is arithmetic rather than a lookup table
+    that eventually runs out of shapes.
+
+    The baseline sits deliberately off the ladder: it is not a version of anything, and an ✕
+    says so at a glance. Past roughly v6 the polygons start converging on a circle; there the
+    legend and the labelled pooled marks carry the identity instead.
+
+    Each polygon is drawn point-up, so v1 reads as a triangle and v2 as a diamond rather than
+    a square — the side count is what carries the order, not the orientation.
+    """
+    if arm == NOSKILL_ARM:
+        return "X"
+    version = skill_from_arm(arm)
+    return (int(version[1:]) + 2, 0, 0) if version else "o"
 
 
 def _arm_sort_key(arm: str) -> int:
@@ -565,6 +589,247 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, st
     return fig
 
 
+def _pareto_front(points: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
+    """The non-dominated ``(cost, rate)`` points, cheapest first.
+
+    A point is dominated when another costs no more *and* succeeds no less — nothing would make
+    you pick it. What survives is the frontier: the best rate available at each price.
+
+    Sorting by cost ascending and rate descending lets one pass do it. Walking that order, a
+    point is on the frontier exactly when it beats the best rate seen so far, since everything
+    already passed costs no more. The tie-break on rate matters: at equal cost the better rate
+    comes first and knocks out its twin.
+    """
+    front: list[tuple[float, float]] = []
+    best = -math.inf
+    for cost, rate in sorted(points, key=lambda p: (p[0], -p[1])):
+        if rate > best:
+            front.append((cost, rate))
+            best = rate
+    return front
+
+
+def _pareto_steps(front: Sequence[tuple[float, float]], y_min: float) -> tuple[list[float], list[float]]:
+    """The frontier as a staircase: x and y for a path tracing the edge of what was achieved.
+
+    Between two frontier points the best rate available is the cheaper one's, so the path holds
+    that rate until the price of the next one is reached and then steps up — a curve through the
+    points would claim results between them that nobody measured. The path drops to the floor at
+    the cheapest point, closing the region off: to its left, nothing was achieved at any rate.
+    """
+    xs: list[float] = []
+    ys: list[float] = []
+    held = y_min  # the rate carried forward from the previous step, or the floor at the first
+    for cost, rate in front:
+        xs += [cost, cost]
+        ys += [held, rate]
+        held = rate
+    return xs, ys
+
+
+def tradeoff_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None) -> plt.Figure:
+    """Cost per run against success rate — where each skill version buys what, and at what price.
+
+    The metrics grid reports every measure on its own axis, which answers "how much?" but never
+    "was it worth it?". This plots the two headline measures against each other, so the reader
+    can see whether a version bought accuracy, saved money, or both. Up and to the left is better.
+
+    Each model gets its own mark per arm, in the model's colour; each arm also gets a larger grey
+    mark pooling every model, carrying standard errors on both axes — the same statistic the
+    grid's grey bar reports. Only the pooled marks are labelled; labelling every point would
+    collide. Hue stays the *model*, as in every other figure here, so the arm rides a second
+    channel: marker shape (see :func:`_arm_marker`). Identity therefore never rests on colour alone.
+
+    A staircase traces the **Pareto frontier** over every mark shown — the combinations nothing
+    else beats on both counts at once. Anything below and to the right of it is dominated:
+    something on the line costs less *and* succeeds more, so there is no reason to choose it.
+    The frontier is drawn over the pooled marks as well as the per-model ones, so it really is
+    the outer edge of the whole plot and no mark can float above it.
+
+    Cost is anchored at zero, but the rate axis starts just below the lowest mark rather than at
+    zero. Anchoring it too would strand every point in the top third of an otherwise empty panel,
+    close enough together to hide the differences the figure exists to show. That is safe here in
+    a way it would not be on the grid's bars: position carries the value, not the length of
+    anything, the axis is labelled in percent throughout, and the pooled marks show their error
+    bars — so a small gap cannot read as a large one.
+
+    Parameters
+    ----------
+    df
+        Results from :func:`load_results`. Only the reported (test) split is plotted.
+    colors
+        Mark colour per model id, as returned by :func:`resolve_palette`; models missing from it
+        fall back to their tier default, and ``None`` uses the defaults throughout.
+    """
+    arms = _arms_in_order(df)
+    models = _models_in_order(df)
+    resolved = colors or {}
+    colors = {model: resolved.get(model, _model_color(model)) for model in models}
+    colors[_ALL_MODELS] = _ALL_MODELS_COLOR
+
+    # (arm, model, cost, cost_err, rate, rate_err) for every cell with runs behind it. Both
+    # coordinates come from _cell_value, so these marks cannot drift from the grid's bars.
+    points = []
+    for arm in arms:
+        for model in [*models, _ALL_MODELS]:
+            cost, cost_err, present = _cell_value(df, arm, model, _REPORTED_SPLIT, "cost")
+            if not present:
+                continue
+            rate, rate_err, _ = _cell_value(df, arm, model, _REPORTED_SPLIT, "rate")
+            points.append((arm, model, cost, cost_err, rate, rate_err))
+
+    x_max = max((cost + err for _a, _m, cost, err, _r, _re in points), default=0.0) * 1.15 or 1.0
+    # The pooled marks carry error bars and the per-model ones do not, so only the pooled ones
+    # reach below their own value. Round down to a tenth so the ticks land on whole percents.
+    floors = [rate - err if model == _ALL_MODELS else rate for _a, model, _c, _ce, rate, err in points]
+    y_min = max(0.0, math.floor((min(floors, default=0.0) - 0.02) * 10) / 10)
+    y_max = 1.04  # a little air over a perfect score, without a tick past 100%
+    front = _pareto_front([(cost, rate) for _a, _m, cost, _e, rate, _re in points])
+
+    with plt.rc_context(_RC):
+        fig, ax = plt.subplots(figsize=(5.0, 3.5))
+        ax.set_xlim(0, x_max)
+        ax.set_ylim(y_min, y_max)
+        steps_x, steps_y = _pareto_steps(front, y_min)
+        ax.plot(steps_x, steps_y, color=INK, alpha=0.38, linewidth=1.1, zorder=2)
+        if front:
+            # Named at the foot of its first riser — the cheap-and-poor corner, which by
+            # construction has nothing plotted in it.
+            ax.annotate(
+                "Pareto frontier",
+                (front[0][0], y_min),
+                textcoords="offset points",
+                xytext=(5, 4),
+                ha="left",
+                va="bottom",
+                fontsize=7,
+                color=INK,
+                alpha=0.6,
+            )
+
+        for arm, model, cost, _err, rate, _rate_err in points:
+            if model == _ALL_MODELS:
+                continue
+            ax.plot(
+                cost,
+                rate,
+                marker=_arm_marker(arm),
+                color=colors[model],
+                markersize=7,
+                # An ink edge, not the page colour: the lighter tiers of the model ramp are pale
+                # enough that a white outline on a white page dissolves the mark's own shape,
+                # which is the channel carrying the arm.
+                markeredgecolor=INK,
+                markeredgewidth=0.7,
+                linestyle="none",
+                zorder=3,
+            )
+        # The pooled marks go on last so they sit above the per-model cloud they summarise.
+        for arm, model, cost, cost_err, rate, rate_err in points:
+            if model != _ALL_MODELS:
+                continue
+            ax.errorbar(
+                cost,
+                rate,
+                xerr=cost_err,
+                yerr=rate_err,
+                marker=_arm_marker(arm),
+                color=_ALL_MODELS_COLOR,
+                markersize=10,
+                markeredgecolor=INK,
+                markeredgewidth=0.9,
+                linestyle="none",
+                capsize=3,
+                ecolor=INK,
+                elinewidth=1,
+                zorder=4,
+            )
+            ax.annotate(
+                _skill_label(arm),
+                (cost, rate),
+                textcoords="offset points",
+                xytext=(10, 6),
+                fontsize=8,
+                fontweight="bold",
+                color=INK,
+                zorder=5,
+            )
+
+        ax.yaxis.set_major_locator(mticker.MultipleLocator(0.1))
+        ax.yaxis.set_major_formatter(mticker.PercentFormatter(1.0, decimals=0))
+        ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _p: f"${v:.3f}"))
+        ax.set_xlabel("Cost / run")
+        ax.set_ylabel("Success rate")
+        ax.grid(color=INK, alpha=0.14, linewidth=0.8)
+        ax.set_axisbelow(True)
+        # The ticks have no length, so by default the labels sit tight against the spines and
+        # the pair nearest the origin collide: the first cost label is centred on the corner,
+        # which puts half of it under the rate label sitting at the same height. Dropping the
+        # cost labels clears the rate label by height instead, which holds however wide either
+        # label runs — unlike nudging them sideways, which depends on the numbers' width.
+        ax.tick_params(length=0, pad=4)
+        ax.tick_params(axis="x", pad=9)
+
+        rows = _bar_rows(models)
+        model_handles = [
+            Line2D(
+                [],
+                [],
+                linestyle="none",
+                marker="o",
+                color=colors[m],
+                markersize=7,
+                markeredgecolor=INK,
+                label=_row_label(m),
+            )
+            for m in rows
+        ]
+        fig.legend(
+            model_handles,
+            [_row_label(m) for m in rows],
+            title="model",
+            frameon=False,
+            loc="upper left",
+            bbox_to_anchor=(1.0, 1.0),
+            fontsize=8,
+            title_fontsize=9,
+            labelspacing=0.35,
+            handletextpad=0.4,
+            borderaxespad=0.0,
+        )
+        # Shape is the channel on show here, so these proxies are drawn as outlines only: any
+        # fill would read as a model colour, and there is no model to name in a key about shape.
+        arm_handles = [
+            Line2D(
+                [],
+                [],
+                linestyle="none",
+                marker=_arm_marker(a),
+                markerfacecolor="none",
+                markersize=7,
+                markeredgecolor=INK,
+                markeredgewidth=1.1,
+                label=_skill_label(a),
+            )
+            for a in arms
+        ]
+        fig.legend(
+            arm_handles,
+            [_skill_label(a) for a in arms],
+            title="skill",
+            frameon=False,
+            loc="upper left",
+            bbox_to_anchor=(1.0, 0.52),
+            fontsize=8,
+            title_fontsize=9,
+            labelspacing=0.35,
+            handletextpad=0.4,
+            borderaxespad=0.0,
+        )
+        fig.tight_layout()
+    return fig
+
+
 #: Pixel width every figure is rendered to, whatever its width in inches. Roughly twice the
 #: widest the text column ever gets, so the marks stay sharp on high-density screens and after
 #: the browser scales the image down to the column.
@@ -923,6 +1188,7 @@ def render_report(
     """
     colors = resolve_palette(_models_in_order(df), palette)
     overview_uri = figure_data_uri(metrics_figure(df, split_hue=False, colors=colors))
+    tradeoff_uri = figure_data_uri(tradeoff_figure(df, colors=colors))
     task_by_id = {t.id: t for t in tasks or []}
     skills_section, skills_toc = _skills_section_html(df, skills_root)
 
@@ -945,7 +1211,7 @@ def render_report(
 <img class="toc-banner" src="{_asset_data_uri("banner.svg")}" alt="acumen">
 <div class="toc-title">acumen report</div>
 <ul>
-<li><a href="#overview">Overview</a></li>
+<li><a href="#overview">Overview</a><ul><li><a href="#tradeoff">Cost vs. success</a></li></ul></li>
 <li><a href="#per-task">Per-task breakdown</a><ul>{"".join(toc_tasks)}</ul></li>
 {skills_toc}
 <li><a href="#runs">Runs</a></li>
@@ -977,6 +1243,12 @@ def render_report(
 <h2>Overview</h2>
 <p class="task-desc">Per-run means over test runs; error bars are standard errors.</p>
 <figure><img alt="Success rate, tokens, cost and time per skill" src="{overview_uri}"></figure>
+<h3 id="tradeoff">Cost vs. success</h3>
+<p class="task-desc">One mark per model and skill version, where colour is the model and shape is
+ the skill version. The grey mark pools every model for that version, with standard errors on
+ both axes. The staircase is the Pareto frontier: anything below and to the right of it is
+ dominated, because something on the line costs less <em>and</em> succeeds more.</p>
+<figure><img alt="Cost per run against success rate, by model and skill version" src="{tradeoff_uri}"></figure>
 </section>
 <section id="per-task">
 <h2>Per-task breakdown</h2>
