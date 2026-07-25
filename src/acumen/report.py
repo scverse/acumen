@@ -240,6 +240,10 @@ def arm_metrics(df: pd.DataFrame) -> pd.DataFrame:
     The caller filters ``df`` first — to the test split, and optionally to one task. Each
     row is one arm, in report order.
 
+    The resource columns here are **totals** — the budget view, "what did this arm cost to
+    run" — which is deliberately not what the figures show: those are per-run means (see
+    :func:`metrics_figure`). Divide by ``n`` to get from one to the other.
+
     Returns
     -------
     Columns ``arm``, ``arm_label``, ``rate``, ``stderr``, ``tokens``, ``cost``, ``time``,
@@ -269,20 +273,25 @@ def arm_metrics(df: pd.DataFrame) -> pd.DataFrame:
 
 #: The metric columns: (title, key, x-axis formatter, bar-label fn). The key selects the
 #: value; the proportion keys below are special-cased for binomial error bars.
+#:
+#: Every column is a **per-run mean**, so all five are on one footing: a bar answers "what
+#: does one run of this arm look like?", and none of them moves just because an arm happens
+#: to have been run more times. Cost carries three decimals — the same precision as the runs
+#: table, which is now the same unit — because a per-run mean can sit well under a cent.
 _COLUMNS = [
     ("Success rate", "rate", mticker.PercentFormatter(1.0), lambda v: f"{v:.0%}"),
     ("Skill loaded", "loaded", mticker.PercentFormatter(1.0), lambda v: f"{v:.0%}"),
-    ("Total tokens", "tokens", mticker.FuncFormatter(lambda v, _p: _fmt_tokens(v)), _fmt_tokens),
-    ("Total cost", "cost", mticker.FuncFormatter(lambda v, _p: f"${v:.2f}"), lambda v: f"${v:.2f}"),
-    ("Total time", "time", mticker.FuncFormatter(lambda v, _p: _fmt_seconds(v)), _fmt_seconds),
+    ("Tokens / run", "tokens", mticker.FuncFormatter(lambda v, _p: _fmt_tokens(v)), _fmt_tokens),
+    ("Cost / run", "cost", mticker.FuncFormatter(lambda v, _p: f"${v:.3f}"), lambda v: f"${v:.3f}"),
+    ("Time / run", "time", mticker.FuncFormatter(lambda v, _p: _fmt_seconds(v)), _fmt_seconds),
 ]
 
-#: Metric key → the boolean column it averages. These are proportions of runs, drawn on a
-#: fixed 0–1 axis with a binomial error bar; every other key sums a resource column.
+#: Metric key → the boolean column it averages. A proportion is the mean of a 0/1 column, so
+#: it is a per-run mean like the rest; it differs only in being drawn on a fixed 0–1 axis.
 _PROPORTION_COLUMN = {"rate": "success", "loaded": "skill_loaded"}
 
-#: Metric key → the column that is summed for it (the proportions are handled separately).
-_SUM_COLUMN = {"tokens": "total_tokens", "cost": "cost_usd", "time": "duration_s"}
+#: Metric key → the resource column it averages (the proportions are handled separately).
+_MEAN_COLUMN = {"tokens": "total_tokens", "cost": "cost_usd", "time": "duration_s"}
 
 
 def _model_tier(model: str) -> str:
@@ -388,15 +397,17 @@ def _row_label(model: str) -> str:
 def _cell_value(df: pd.DataFrame, arm: str, model: str, split: str, key: str) -> tuple[float, float, bool]:
     """One (arm, model, split) cell's metric value, its error bar, and whether it has runs.
 
-    For the proportions (``rate``, ``loaded``) it is the fraction of runs and its binomial
-    standard error. For the resource totals it is the sum and the standard deviation of that
-    sum — ``sqrt(n) * std`` over the per-run values, i.e. how much the total would vary run
-    to run (0 with <2 runs).
+    Every metric is a **mean over runs**, with the standard error of that mean as the error
+    bar — so all five columns are read the same way and none of them is inflated by an arm
+    simply having more runs behind it. For the proportions (``rate``, ``loaded``) that mean
+    is the fraction of runs and the error is the binomial standard error; for the resources
+    it is the per-run average and ``std / sqrt(n)`` (0 with <2 runs, which have no spread to
+    report). A proportion is just the mean of a 0/1 column, so the two cases agree.
 
-    ``model`` may be the :data:`_ALL_MODELS` sentinel, which pools every model in the arm —
-    so the proportions read as the overall rate across all runs (not a mean of per-model
-    rates, which would weight an under-sampled model as heavily as the rest), and the
-    resource totals as the arm's grand total.
+    ``model`` may be the :data:`_ALL_MODELS` sentinel, which pools every model in the arm.
+    Pooling is over *runs*, not over the per-model bars: an under-sampled model must not
+    weigh as much as a well-sampled one. So the grey bar sits among the model bars rather
+    than above them — it is where an average run lands, whichever model drew it.
 
     The third element distinguishes a genuine zero (e.g. a 0% success rate) from a cell with
     no runs at all: a model not run in this arm reserves its slot but draws no bar.
@@ -409,10 +420,10 @@ def _cell_value(df: pd.DataFrame, arm: str, model: str, split: str, key: str) ->
         flags = _loaded_flags(group) if key == "loaded" else group[_PROPORTION_COLUMN[key]]
         rate, error = _rate_and_error(flags)
         return rate, error, True
-    values = group[_SUM_COLUMN[key]]
-    total = float(values.sum())
-    error = float(values.std(ddof=1)) * math.sqrt(len(values)) if len(values) > 1 else 0.0
-    return total, error, True
+    values = group[_MEAN_COLUMN[key]]
+    mean = float(values.mean())
+    error = float(values.std(ddof=1)) / math.sqrt(len(values)) if len(values) > 1 else 0.0
+    return mean, error, True
 
 
 def _draw_cell(
@@ -468,15 +479,18 @@ def _draw_cell(
 def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, str] | None = None) -> plt.Figure:
     """The metrics grid: one subplot row per skill, one column per metric.
 
-    Columns (success rate and skill-load rate, both with binomial error bars, then total
-    tokens, cost and time) share an x-axis so skills are comparable within a metric. The
-    load rate is the share of runs that loaded the skill under test — the baseline arm is
-    drawn too, where a bar above zero means the baseline is not clean.
+    Every bar is a mean over runs — success rate, skill-load rate, then tokens, cost and
+    time per run — each with the standard error of that mean. Reporting the resources per
+    run rather than as totals keeps them comparable with the two rates and with each other:
+    an arm covering more tasks or more reps no longer looks more expensive for it. Columns
+    share an x-axis so skills are comparable within a metric. The load rate is the share of
+    runs that loaded the skill under test — the baseline arm is drawn too, where a bar above
+    zero means the baseline is not clean.
 
     Inside each cell, bars are coloured by model, with a final grey bar pooling every model
-    at once — where the evaluated models sit overall. When ``split_hue`` is set, train and
-    test are shown as two textures (test solid, train hatched) rather than two colours,
-    leaving the model hue intact.
+    at once — where an average run lands overall. When ``split_hue`` is set, train and test
+    are shown as two textures (test solid, train hatched) rather than two colours, leaving
+    the model hue intact.
 
     Parameters
     ----------
@@ -945,7 +959,7 @@ def render_report(
 {notes}
 <section id="overview">
 <h2>Overview</h2>
-<p class="task-desc">Values for test runs.</p>
+<p class="task-desc">Per-run means over test runs; error bars are standard errors.</p>
 <figure><img alt="Success rate, tokens, cost and time per skill" src="{overview_uri}"></figure>
 </section>
 <section id="per-task">
