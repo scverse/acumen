@@ -1163,13 +1163,13 @@ def _tests_table_html(tests: SkillTests) -> str:
     own = "".join(f'<th rowspan="2">{title}</th>' for title, *_ in _TEST_COLUMNS[:_ARM_COLUMNS])
     versus = "".join(f"<th>{title}</th>" for title, *_ in _TEST_COLUMNS[_ARM_COLUMNS:])
     span = len(_TEST_COLUMNS) - _ARM_COLUMNS
-    return f"""<table>
+    return f"""<div class="table-center"><table class="tests">
 <thead>
 <tr><th rowspan="2">Skill</th>{own}<th colspan="{span}">Compared with {_skill_label(tests.baseline)}</th></tr>
 <tr>{versus}</tr>
 </thead>
 <tbody>{"".join(body)}</tbody>
-</table>"""
+</table></div>"""
 
 
 @dataclass(frozen=True)
@@ -1311,6 +1311,10 @@ figure {{ margin: 0.6rem 0 1.6rem; text-align: center; }}
 img {{ max-width: 100%; height: auto; }}
 table {{ border-collapse: collapse; width: 100%; font-size: 0.88rem; margin: 1rem 0; display: block;
         overflow-x: auto; }}
+/* The significance table is narrower than the text column, so it sits centred in a scroll
+   box of its own rather than hugging the left margin. */
+.table-center {{ overflow-x: auto; margin: 1rem 0; }}
+table.tests {{ display: table; width: auto; margin: 0 auto; overflow-x: visible; }}
 th, td {{ border: 1px solid {INK}22; padding: 0.3rem 0.55rem; text-align: right; white-space: nowrap; }}
 th:first-child, td:first-child {{ text-align: left; }}
 thead th {{ background: {BAR}1a; }}
