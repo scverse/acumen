@@ -565,8 +565,20 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, st
     return fig
 
 
+#: Pixel width every figure is rendered to, whatever its width in inches. Roughly twice the
+#: widest the text column ever gets, so the marks stay sharp on high-density screens and after
+#: the browser scales the image down to the column.
+_FIGURE_WIDTH_PX = 1800
+
+
 def figure_data_uri(fig: plt.Figure) -> str:
     """Render a figure to a base64 PNG ``data:`` URI, then close it.
+
+    The dpi is derived from the figure's own width rather than fixed, so every figure lands at
+    :data:`_FIGURE_WIDTH_PX` whatever its size in inches. The page scales images to fit one text
+    column, so a fixed dpi renders the narrow figures at fewer pixels than the wide ones and
+    leaves the browser to upscale them — which is visible as soft, pixelated marks next to a
+    crisp one on the same page.
 
     The figure background is saved **transparent** (``facecolor="none"``) so the margins
     between subplots pick up the page colour in the HTML but export blank — the axes
@@ -574,7 +586,8 @@ def figure_data_uri(fig: plt.Figure) -> str:
     it would also blank the axes patches.
     """
     buffer = io.BytesIO()
-    fig.savefig(buffer, format="png", dpi=130, bbox_inches="tight", facecolor="none")
+    dpi = _FIGURE_WIDTH_PX / fig.get_figwidth()
+    fig.savefig(buffer, format="png", dpi=dpi, bbox_inches="tight", facecolor="none")
     plt.close(fig)
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
     return f"data:image/png;base64,{encoded}"
