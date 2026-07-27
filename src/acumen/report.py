@@ -1227,6 +1227,20 @@ def _loaded_cell(row: pd.Series) -> str:
     return "yes" if bool(raw) else '<span class="skill-miss">no</span>'
 
 
+def _loaded_rank(row: pd.Series) -> float:
+    """Sort key for the 'skill loaded' column, ordered by how much it wants attention.
+
+    Sorting descending brings the runs worth looking at to the top: a skill run that did not
+    load its skill outranks one that did, and both outrank the cells with nothing to say.
+    """
+    if row["arm"] == NOSKILL_ARM:
+        return -2.0
+    raw = row.get("skill_loaded")
+    if raw is None or (not isinstance(raw, bool) and pd.isna(raw)):
+        return -1.0
+    return 0.0 if bool(raw) else 1.0
+
+
 def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
     """Per-run table with resource use and a link to each run's ``transcript.html``.
 
@@ -1234,6 +1248,11 @@ def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
     text that would blow out the table width — and neither is the input/output token split,
     since the total is what readers compare on. All of them remain columns in the sidecar CSV
     for anyone inspecting individual runs.
+
+    Columns are click-to-sort. A cell whose displayed text does not order the way the value
+    does carries the value in ``data-sort``: thousands separators, a formatted duration and a
+    padded cost all sort wrongly as text, and ``skill loaded`` is words standing in for a
+    ranking. Everything else compares as the string the reader can see.
     """
     headers = [
         "arm",
@@ -1249,7 +1268,13 @@ def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
         "time",
         "transcript",
     ]
-    head = "".join(f"<th>{html.escape(h)}</th>" for h in headers)
+    head = "".join(
+        # The transcript column is a link, so there is no ordering to give it.
+        f"<th>{html.escape(h)}</th>"
+        if h == "transcript"
+        else f'<th data-sortable tabindex="0" aria-sort="none">{html.escape(h)}</th>'
+        for h in headers
+    )
     body = []
     for _, row in df.iterrows():
         transcript: Path = row["transcript_path"]
@@ -1262,22 +1287,25 @@ def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
         else:
             link = "&mdash;"
         status = "pass" if row["success"] else "fail"
-        cells = [
-            html.escape(str(row["arm_label"])),
-            html.escape(str(row["split"])),
-            html.escape(str(row["task_id"])),
-            html.escape(str(row["model"])),
-            str(int(row["rep"])),
-            _loaded_cell(row),
-            html.escape(str(row["reason"])),
-            str(int(row["turns"])),
-            f"{int(row['total_tokens']):,}",
-            f"{float(row['cost_usd']):.3f}",
-            _fmt_seconds(float(row["duration_s"])),
-            link,
+        cells: list[tuple[str, float | None]] = [
+            (html.escape(str(row["arm_label"])), None),
+            (html.escape(str(row["split"])), None),
+            (html.escape(str(row["task_id"])), None),
+            (html.escape(str(row["model"])), None),
+            (str(int(row["rep"])), float(row["rep"])),
+            (_loaded_cell(row), _loaded_rank(row)),
+            (html.escape(str(row["reason"])), None),
+            (str(int(row["turns"])), float(row["turns"])),
+            (f"{int(row['total_tokens']):,}", float(row["total_tokens"])),
+            (f"{float(row['cost_usd']):.3f}", float(row["cost_usd"])),
+            (_fmt_seconds(float(row["duration_s"])), float(row["duration_s"])),
+            (link, None),
         ]
-        body.append(f'<tr class="{status}">' + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
-    return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table>"
+        tds = "".join(
+            f"<td>{text}</td>" if key is None else f'<td data-sort="{key}">{text}</td>' for text, key in cells
+        )
+        body.append(f'<tr class="{status}">{tds}</tr>')
+    return f'<table class="runs"><thead><tr>{head}</tr></thead><tbody>{"".join(body)}</tbody></table>'
 
 
 _STYLE = f"""
@@ -1317,6 +1345,18 @@ th:first-child, td:first-child {{ text-align: left; }}
 thead th {{ background: {BAR}1a; }}
 tbody tr:nth-child(even) td {{ background: {INK}08; }}
 tr.fail td {{ background: {ACCENT}66; }}
+/* Sorting affordances appear only once the script has wired the table up, so with JS off
+   nothing invites a click that would do nothing. The arrow is padded for, not floated over
+   the label, so the heading does not shift when the column becomes the sorted one. */
+table.sortable thead th[data-sortable] {{ cursor: pointer; user-select: none;
+        position: relative; padding-right: 1.3rem; }}
+table.sortable thead th[data-sortable]:hover {{ background: {BAR}33; }}
+table.sortable thead th[data-sortable]:focus-visible {{ outline: 2px solid var(--bar);
+        outline-offset: -2px; }}
+table.sortable thead th[data-sortable]::after {{ content: "\\2195"; position: absolute;
+        right: 0.4rem; opacity: 0.3; }}
+table.sortable thead th[aria-sort="ascending"]::after {{ content: "\\2191"; opacity: 1; }}
+table.sortable thead th[aria-sort="descending"]::after {{ content: "\\2193"; opacity: 1; }}
 .skill-miss {{ color: #a4432b; font-weight: 700; }}
 .note {{ background: {ACCENT}55; border-left: 3px solid var(--bar); padding: 0.5rem 0.8rem;
         margin: 0.5rem 0; border-radius: 3px; }}
@@ -1369,6 +1409,46 @@ const observer = new IntersectionObserver((entries) => {
   });
 }, { rootMargin: '0px 0px -75% 0px' });
 document.querySelectorAll('[id]').forEach(el => { if (links.has(el.id)) observer.observe(el); });
+"""
+
+#: Click-to-sort for the runs table. Progressive enhancement, like the scrollspy above: the
+#: table is already in a sensible order and fully readable with JS disabled, and the class
+#: this adds is what turns on the pointer and arrow affordances in the stylesheet.
+#:
+#: Rows are sorted from a snapshot of the original order, and that order breaks ties, so
+#: sorting on a coarse column (arm, split) leaves the rows within a group where they started
+#: instead of shuffling them differently on every click.
+_SORT_JS = """
+document.querySelectorAll('table.runs').forEach(table => {
+  const body = table.tBodies[0];
+  const rows = [...body.rows];
+  rows.forEach((row, i) => { row.dataset.seq = i; });
+  const headers = [...table.tHead.rows[0].cells];
+  const value = (row, i) => {
+    const cell = row.cells[i];
+    return 'sort' in cell.dataset ? Number(cell.dataset.sort) : cell.textContent.trim().toLowerCase();
+  };
+  headers.forEach((th, i) => {
+    if (!th.hasAttribute('data-sortable')) return;
+    const sort = () => {
+      const dir = th.getAttribute('aria-sort') === 'ascending' ? -1 : 1;
+      headers.forEach(h => { if (h.hasAttribute('data-sortable')) h.setAttribute('aria-sort', 'none'); });
+      th.setAttribute('aria-sort', dir === 1 ? 'ascending' : 'descending');
+      const sorted = rows.slice().sort((x, y) => {
+        const a = value(x, i), b = value(y, i);
+        const cmp = typeof a === 'number' ? a - b : a.localeCompare(b);
+        return dir * (cmp || (x.dataset.seq - y.dataset.seq));
+      });
+      body.append(...sorted);
+    };
+    th.addEventListener('click', sort);
+    th.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); sort(); }
+    });
+  });
+  table.classList.add('sortable');
+  document.querySelectorAll('.sort-hint').forEach(hint => hint.removeAttribute('hidden'));
+});
 """
 
 
@@ -1709,10 +1789,14 @@ def render_report(
 <section id="runs">
 <h2>Runs</h2>
 {f'<p class="task-desc">Full data: <a href="{html.escape(data_href)}">{html.escape(data_href)}</a></p>' if data_href else ""}
+<p class="task-desc sort-hint" hidden>Click a column heading to sort by it, again to reverse.</p>
 {_runs_table_html(df, out_dir)}
 </section>
 </main>
+<!-- Separate tags on purpose: the two enhancements are independent, and one throwing on an
+     old browser must not take the other down with it. -->
 <script>{_SCROLLSPY_JS}</script>
+<script>{_SORT_JS}</script>
 </body>
 </html>
 """

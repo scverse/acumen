@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -44,8 +45,10 @@ from acumen.report import (
     _best_cells,
     _holm,
     _integrity_notes,
+    _loaded_rank,
     _pareto_front,
     _pareto_steps,
+    _runs_table_html,
     _skill_diff_html,
     _split_diff_rows,
     _tests_table_html,
@@ -1088,6 +1091,60 @@ def test_arm_marker_widens_with_the_version() -> None:
     """The baseline is off the ladder; each version adds a side, so the order is legible."""
     assert _arm_marker("noskill") == "X"
     assert [_arm_marker(f"skill_v{n}") for n in (1, 2, 3, 9)] == [(3, 0, 0), (4, 0, 0), (5, 0, 0), (11, 0, 0)]
+
+
+# --- the runs table --------------------------------------------------------------------
+
+
+def test_runs_table_marks_every_column_sortable_but_the_transcript_link(runs_root: Path, tmp_path: Path) -> None:
+    """The link column has no ordering, so offering to sort on it would be a dead control."""
+    table = _runs_table_html(load_results(runs_root), tmp_path)
+    headings = re.findall(r"<th([^>]*)>([^<]+)</th>", table)
+
+    sortable = {text for attrs, text in headings if "data-sortable" in attrs}
+    inert = {text for attrs, text in headings if "data-sortable" not in attrs}
+    assert inert == {"transcript"}
+    assert "cost $" in sortable and "total tok" in sortable
+
+
+def test_runs_table_sorts_formatted_numbers_by_their_value(
+    runs_root: Path, model: str, make_result, tmp_path: Path
+) -> None:
+    """Displayed text is formatted for reading, so the sort key has to carry the raw number.
+
+    Sorting on the text would put 9 above 10 and a 3-minute run above a 40-second one.
+    """
+    make_result(
+        runs_root,
+        RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=2),
+        turns=9,
+        input_tokens=1_200_000,
+        output_tokens=34_567,
+        cost_usd=12.5,
+        duration_s=185.0,
+    )
+    table = _runs_table_html(load_results(runs_root), tmp_path)
+    (row,) = [r for r in table.split("<tr") if "1,234,567" in r]
+
+    keys = {text: key for key, text in re.findall(r'<td data-sort="([^"]+)">([^<]*)</td>', row)}
+    # The separators, the padded cost and the humanised duration all read differently to
+    # the values they stand for.
+    assert keys["1,234,567"] == "1234567.0"
+    assert keys["12.500"] == "12.5"
+    assert float(keys["3.1m"]) == 185.0
+    assert keys["9"] == "9.0"
+
+
+def test_runs_table_ranks_a_skill_that_failed_to_load_above_one_that_loaded() -> None:
+    """Sorting on 'skill loaded' is how you find the runs that did not measure their skill."""
+    baseline = pd.Series({"arm": "noskill", "skill_loaded": None})
+    loaded = pd.Series({"arm": "skill_v1", "skill_loaded": True})
+    missed = pd.Series({"arm": "skill_v1", "skill_loaded": False})
+    unknown = pd.Series({"arm": "skill_v1", "skill_loaded": None})
+
+    ranks = [_loaded_rank(r) for r in (missed, loaded, unknown, baseline)]
+
+    assert ranks == sorted(ranks, reverse=True)
 
 
 # --- split diff ------------------------------------------------------------------------
