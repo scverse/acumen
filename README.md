@@ -90,10 +90,12 @@ pip install acumen
 ```
 -->
 
-And to install the acumen skills needed to run acumen:
+And to install the acumen skill that ships with the package into your agent's skills directory,
+run `acumen-install-skills --agent {claude,codex,agents,claude-science}` (or `--dest <dir>` to
+choose the directory yourself):
 
 ```bash
-pip install acumen
+acumen-install-skills --agent claude
 ```
 
 ## Release notes
