@@ -1231,7 +1231,8 @@ def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
     """Per-run table with resource use and a link to each run's ``transcript.html``.
 
     ``answer`` and ``expected`` are deliberately **not** shown here — they can be long free
-    text that would blow out the table width — but they remain columns in the sidecar CSV
+    text that would blow out the table width — and neither is the input/output token split,
+    since the total is what readers compare on. All of them remain columns in the sidecar CSV
     for anyone inspecting individual runs.
     """
     headers = [
@@ -1243,8 +1244,6 @@ def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
         "skill loaded",
         "reason",
         "turns",
-        "in tok",
-        "out tok",
         "total tok",
         "cost $",
         "time",
@@ -1272,8 +1271,6 @@ def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
             _loaded_cell(row),
             html.escape(str(row["reason"])),
             str(int(row["turns"])),
-            f"{int(row['input_tokens']):,}",
-            f"{int(row['output_tokens']):,}",
             f"{int(row['total_tokens']):,}",
             f"{float(row['cost_usd']):.3f}",
             _fmt_seconds(float(row["duration_s"])),
