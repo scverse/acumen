@@ -33,8 +33,17 @@ and this project adheres to [Semantic Versioning][].
   stopped at the cap. `max_usd` can only mark the outcome: Codex reports usage when a turn
   ends, so an over-budget run is recorded as a `budget` failure after the spend.
 
+- Allow `acumen bench --auth {auto,session,api}`, defaulting to the provider's subscription
+  like every other command. The old API-only rule existed because a per-run `cost_usd` needed
+  metered billing; cost is now derived from token counts, which a subscription run reports
+  just as fully. `result.json` records the run's `auth_mode`, since under `session` the figure
+  is what the run would have cost at API rates rather than metered spend.
+
 ### Fixed
 
+- Let `acumen tasks` generate over the untouched `tasks.yaml` placeholder that `acumen init`
+  writes, instead of demanding `--force` — the two documented first steps of the loop
+  contradicted each other. A file the user has edited is still protected.
 - Stop feeding Codex transcripts to `claude-code-log`, which reads the SDK-native format
   only: it skipped every line, exited 0, and wrote an empty page that was then recorded as a
   successfully rendered transcript.

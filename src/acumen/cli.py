@@ -30,7 +30,7 @@ from acumen.pricefeed import (
 from acumen.prices import DEFAULT_RATES, RATES_AS_OF, Rates, resolve_rates
 from acumen.report import ReportError, build_report
 from acumen.runner import RunOutcome, StderrFilter
-from acumen.scaffold import InitError, scaffold
+from acumen.scaffold import InitError, is_scaffold_tasks, scaffold
 from acumen.ship import ShipError, ship_skill
 from acumen.skills import SkillError, available_versions, latest_version, load_skill
 from acumen.taskgen import TaskGenError, generate_tasks
@@ -54,6 +54,7 @@ def _add_bench_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     parser.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
     parser.add_argument("--dry-run", action="store_true", help="print the matrix and exit without running agents")
+    _add_auth_arg(parser)
 
 
 def _add_log_args(parser: argparse.ArgumentParser) -> None:
@@ -76,11 +77,11 @@ def _add_feedback_arg(parser: argparse.ArgumentParser, *, extra: str = "") -> No
 
 
 def _add_auth_arg(parser: argparse.ArgumentParser) -> None:
-    """Add the ``--auth`` flag to a single-agent subcommand.
+    """Add the ``--auth`` flag to a command that spawns agents.
 
-    These commands spawn one agent, so they default to the provider subscription ("session")
-    when a login is present and fall back to the API key otherwise. ``bench`` has
-    no such flag — it always bills the API so its recorded ``cost_usd`` is real.
+    Every agentic command defaults to the provider subscription ("session") when a login is
+    present and falls back to the API key otherwise — ``bench`` included, since it prices runs
+    from their token counts rather than from a billed figure only the API reports.
     """
     parser.add_argument(
         "--auth",
@@ -242,12 +243,19 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     if not todo:
         return 0
 
-    # bench records real per-run cost, so it must bill the API — never the subscription.
+    # One resolved mode per provider in the matrix, so a mixed pass bills each side correctly.
     providers = {provider_for_model(item.model) for item in todo}
-    auth_modes = {provider: resolve_auth_mode("api", allow_session=False, provider=provider) for provider in providers}
+    auth_modes = {provider: resolve_auth_mode(args.auth, provider=provider) for provider in providers}
     for provider in sorted(providers):
         check_agent_cli(provider)
+        _print_auth(auth_modes[provider], provider)
         _warn_codex_accounting(provider)
+    if "session" in auth_modes.values():
+        print(
+            "note: cost_usd for session-billed runs is what they would have cost at API "
+            "rates, not metered spend; each run records its auth_mode",
+            file=sys.stderr,
+        )
     _warn_unpriced({item.model for item in todo}, cfg.prices)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
@@ -316,7 +324,7 @@ def _cmd_draft(args: argparse.Namespace) -> int:
 
     provider = provider_for_model(cfg.draft_model)
     check_agent_cli(provider)
-    auth_mode = resolve_auth_mode(args.auth, allow_session=True, provider=provider)
+    auth_mode = resolve_auth_mode(args.auth, provider=provider)
     _print_auth(auth_mode, provider)
     _warn_codex_accounting(provider)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
@@ -373,7 +381,7 @@ def _cmd_improve(args: argparse.Namespace) -> int:
 
     provider = provider_for_model(cfg.improve_model)
     check_agent_cli(provider)
-    auth_mode = resolve_auth_mode(args.auth, allow_session=True, provider=provider)
+    auth_mode = resolve_auth_mode(args.auth, provider=provider)
     _print_auth(auth_mode, provider)
     _warn_codex_accounting(provider)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
@@ -423,17 +431,22 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
         cfg = replace(cfg, tasks_model=args.model)
 
     out = args.out
-    # Fail before the (costly) target prep and agent run if we'd have to clobber.
-    if out.exists() and not args.force:
+    # `acumen init` writes a placeholder here, and generating over it is the documented next
+    # step — so the untouched placeholder is not something to protect. Anything the user has
+    # actually edited still needs --force, and that is checked before the costly target prep.
+    overwrite = args.force or is_scaffold_tasks(out)
+    if out.exists() and not overwrite:
         print(
-            f"{out} already exists — pass --force to overwrite it (e.g. the placeholder from `acumen init`)",
+            f"{out} already exists — pass --force to overwrite it",
             file=sys.stderr,
         )
         return 2
+    if out.exists() and not args.force:
+        print(f"replacing the untouched placeholder at {out}")
 
     provider = provider_for_model(cfg.tasks_model)
     check_agent_cli(provider)
-    auth_mode = resolve_auth_mode(args.auth, allow_session=True, provider=provider)
+    auth_mode = resolve_auth_mode(args.auth, provider=provider)
     _print_auth(auth_mode, provider)
     _warn_codex_accounting(provider)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
@@ -455,7 +468,7 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
                 auth_mode=auth_mode,
                 max_turns=args.max_turns,
                 max_usd=args.max_usd,
-                force=args.force,
+                force=overwrite,
                 feedback=args.feedback,
                 log=log,
             )
@@ -484,7 +497,7 @@ def _cmd_ship(args: argparse.Namespace) -> int:
     print(f"shipping {args.version} of {cfg.skill_name} into {cfg.repo} ({where})")
     provider = provider_for_model(cfg.ship_model)
     check_agent_cli(provider)
-    auth_mode = resolve_auth_mode(args.auth, allow_session=True, provider=provider)
+    auth_mode = resolve_auth_mode(args.auth, provider=provider)
     _print_auth(auth_mode, provider)
     _warn_codex_accounting(provider)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)

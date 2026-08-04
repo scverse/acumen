@@ -70,10 +70,13 @@ a command.
 - The target (`repo`: a GitHub URL or a local path) must be pip-installable and declare
   `[project].name` in `pyproject.toml`. A local `repo` path is resolved **relative to
   `config.yaml`**.
-- Credentials: `bench` **always bills the selected provider API** and has no `--auth`
-  flag. Claude needs `ANTHROPIC_API_KEY` (or Anthropic provider credentials); Codex
-  needs `CODEX_API_KEY` or `OPENAI_API_KEY`. `tasks`/`draft`/`improve`/`ship` default
-  to the selected provider's logged-in subscription (`--auth {auto,session,api}`).
+- Credentials: every agentic command takes `--auth {auto,session,api}` and defaults to the
+  selected provider's logged-in subscription, falling back to its API key. Claude uses
+  `ANTHROPIC_API_KEY` (or Anthropic provider credentials) / a `claude` login; Codex uses
+  `CODEX_API_KEY` or `OPENAI_API_KEY` / a `codex login`. `bench` included: cost comes from
+  token counts, which both billing modes report, so a subscription run prices as accurately
+  as a metered one — but under `session` `cost_usd` is what the run *would* have cost at API
+  rates, not metered spend. Each run records its `auth_mode`.
   Both backends are optional: `pip install acumen[claude]` for Claude, plain `acumen` plus
   the `codex` CLI for Codex. A model whose backend is missing fails preflight with the
   install command.

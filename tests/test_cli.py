@@ -73,6 +73,38 @@ def test_init_refuses_to_clobber_without_force(tmp_path: Path, capsys: pytest.Ca
     assert "example_task" in (tmp_path / "tasks.yaml").read_text()
 
 
+def test_tasks_generates_over_the_untouched_scaffold_placeholder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """`acumen init` then `acumen tasks` is the documented start of the loop.
+
+    The placeholder `init` writes is not user content, so refusing to generate over it made
+    the first two steps of the quickstart contradict each other.
+    """
+    assert main(["init", "--dir", str(tmp_path)]) == 0
+    out = tmp_path / "tasks.yaml"
+    args = ["tasks", "--config", str(tmp_path / "config.yaml"), "--out", str(out)]
+
+    # Stop at the first step past the clobber check, so no target is prepared and nothing spent.
+    monkeypatch.setattr("acumen.cli.check_agent_cli", _boom)
+    with pytest.raises(RuntimeError, match="reached preflight"):
+        main(args)
+    assert "replacing the untouched placeholder" in capsys.readouterr().out
+
+    # An edited file is the user's, and is still protected.
+    out.write_text(out.read_text() + "\n# mine now\n")
+    assert main(args) == 2
+    assert "pass --force to overwrite" in capsys.readouterr().err
+
+    # …until --force, which reaches preflight again.
+    with pytest.raises(RuntimeError, match="reached preflight"):
+        main([*args, "--force"])
+
+
+def _boom(*_: object, **__: object) -> None:
+    raise RuntimeError("reached preflight")
+
+
 def test_bench_dry_run_plans_the_matrix(project: Path, model: str, capsys: pytest.CaptureFixture) -> None:
     assert main(bench_args(project, "--dry-run")) == 0
 

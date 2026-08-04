@@ -336,6 +336,9 @@ async def run_once(
         "arm": key.arm,
         "model": model,
         "agent": provider,
+        # Which credential paid for the run. Cost is derived from tokens either way, but under
+        # "session" it is what the run would have cost at API rates rather than metered spend.
+        "auth_mode": auth_mode,
         "rep": key.rep,
         "success": success,
         "reason": reason,

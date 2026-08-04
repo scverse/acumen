@@ -91,8 +91,14 @@ install command, before acumen prepares a target or spends anything.
 
 Claude API runs use `ANTHROPIC_API_KEY`; Codex API runs use `CODEX_API_KEY` (or
 `OPENAI_API_KEY`). The meta-agent commands also accept a Codex model through their
-`*_model` config keys or `--model`, and `--auth auto` prefers that provider's logged-in
-subscription.
+`*_model` config keys or `--model`.
+
+Every agentic command — `bench` included — takes `--auth {auto,session,api}` and defaults to
+the provider's logged-in subscription, falling back to its API key. Since `cost_usd` is
+derived from token counts, which both billing modes report, a subscription run prices exactly
+as accurately as a metered one; what changes is the meaning. Under `session`, `cost_usd` is
+what the run *would* have cost at API rates, not money billed — so each run records its
+`auth_mode` alongside the figure.
 
 `max_turns` and `max_usd` apply to both providers, but they are not equally strict for Codex,
 which has no cap of its own — acumen enforces both against its event stream:

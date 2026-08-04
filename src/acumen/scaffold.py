@@ -81,6 +81,20 @@ class InitError(ValueError):
     """Raised when scaffolding cannot proceed — e.g. files exist and ``force`` is unset."""
 
 
+def is_scaffold_tasks(path: Path) -> bool:
+    """Whether ``path`` is still the untouched ``tasks.yaml`` placeholder from :func:`scaffold`.
+
+    ``acumen init`` writes a placeholder and ``acumen tasks`` generates the real thing, so the
+    documented first two steps of the loop collide: the generator would refuse to overwrite a
+    file the user never wrote. A byte-identical match to the template is the safe test — edit
+    one character and the file is yours again, and refusing to clobber it is correct.
+    """
+    try:
+        return path.read_text() == TASKS_TEMPLATE
+    except OSError:
+        return False
+
+
 def scaffold(directory: Path, *, force: bool = False) -> list[Path]:
     """Write starter ``config.yaml`` and ``tasks.yaml`` into ``directory``.
 

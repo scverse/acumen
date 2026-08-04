@@ -346,48 +346,31 @@ def api_auth_available(provider: AgentProvider = "claude") -> bool:
 def resolve_auth_mode(
     requested: str,
     *,
-    allow_session: bool,
     provider: AgentProvider = "claude",
 ) -> AuthMode:
     """Resolve a requested auth choice to the concrete mode a run will use, or fail loudly.
 
-    A preflight guard that replaces :func:`check_auth` on the agentic commands: it both
-    validates that the chosen credential is actually reachable and reports which mode the
-    run will bill, so the choice is never silent.
+    A preflight guard for every agentic command: it both validates that the chosen credential
+    is actually reachable and reports which mode the run will bill, so the choice is never
+    silent.
+
+    ``bench`` used to be barred from ``"session"`` on the grounds that only metered API billing
+    yields a real per-run ``cost_usd``. That stopped being true when cost became a function of
+    the token counts both billing modes report (:mod:`acumen.prices`): a subscription run prices
+    exactly as accurately as a metered one. What the figure *means* does change — under
+    ``"session"`` it is what the run would have cost at API rates, not money billed — so the
+    mode is recorded in each ``result.json`` rather than the choice being taken away.
 
     Parameters
     ----------
     requested
         The user's choice: ``"auto"`` (prefer the subscription, else the API), ``"session"``
         (force the subscription), or ``"api"`` (force the API).
-    allow_session
-        Whether the subscription is a permitted mode. ``bench`` passes ``False`` because it
-        records real per-run ``cost_usd``, which only means anything under metered API
-        billing — so bench always resolves to ``"api"`` and rejects ``"session"``.
 
     Returns
     -------
     ``"session"`` or ``"api"``.
     """
-    if not allow_session:
-        if requested == "session":
-            raise EnvError(
-                "bench records real per-run cost and must bill the API, so --auth session is "
-                "not available for it — the Claude subscription does not meter per-run spend. "
-                "Run the single-agent commands (draft/improve/tasks/ship) on the session instead."
-            )
-        if not api_auth_available(provider):
-            if provider == "codex":
-                raise EnvError(
-                    "no API credential found — Codex bench must bill the API. Set CODEX_API_KEY (or OPENAI_API_KEY)."
-                )
-            raise EnvError(
-                "no API credential found — bench must bill the API. Set ANTHROPIC_API_KEY (or "
-                "ANTHROPIC_AUTH_TOKEN), or enable a provider with CLAUDE_CODE_USE_BEDROCK / "
-                "CLAUDE_CODE_USE_VERTEX."
-            )
-        return "api"
-
     if requested == "session":
         if not session_auth_available(provider):
             if provider == "codex":
