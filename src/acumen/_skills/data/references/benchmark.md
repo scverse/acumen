@@ -18,8 +18,8 @@ acumen bench [--no-skill | --skill v1] [--split train|test]... [--task ID]...
 - `--replicates` / `--max-concurrency` override the config for this pass only.
 - `--auth auto` (default) prefers a stored account/subscription login, then falls back to
   metered API credentials. Use `--auth session` or `--auth api` to require one explicitly.
-  Each run records the resolved mode; under `session`, `cost_usd` is the equivalent API-rate
-  cost computed from tokens, not money charged to the subscription.
+  Each run records the resolved mode; under `session`, `inferred_cost_usd` is the equivalent
+  API-rate cost computed from tokens, not money charged to the subscription.
 - Ctrl-C is safe: completed runs are preserved and the next invocation resumes.
 
 **Arm parity is the whole point.** Both arms get an identical prompt, tools, caps, and
@@ -58,9 +58,16 @@ both exist. Claude's SDK total is API-equivalent (not necessarily an invoice cha
 session authentication); Codex reports no dollars, so it uses inference. Token classes and the
 rates frozen into `price_rates` remain available for reproduction, including Claude's separate
 five-minute and one-hour cache writes plus the legacy aggregate. A model with neither provider
-cost nor rates leaves `cost_available` false and `cost_usd` null, so reports cannot mistake it
-for a free run. Inspect or re-check the rate table with `acumen prices` / `acumen prices
---refresh`, and set `prices:` in `config.yaml` to price an unlisted model.
+cost nor rates leaves `cost_available` false and `cost_usd` null. A run without rates leaves
+`inferred_cost_usd` null even when the provider supplied a value, so reports cannot mistake it
+for a free or cross-provider-comparable run. Inspect or re-check the rate table with `acumen
+prices` / `acumen prices --refresh`, and set `prices:` in `config.yaml` to price an unlisted
+model.
+
+Reports deliberately use `inferred_cost_usd` for every cost-per-run value and comparison, so
+Claude and Codex stay on the same pricing basis even when Claude supplies an SDK estimate. The
+sidecar CSV preserves the two values separately as `recorded_cost_usd` and
+`inferred_cost_usd`; `cost_usd` remains present as the provider-first compatibility field.
 
 `codex exec` has no cap of its own, so acumen enforces both from its event stream, at
 different resolutions. `max_turns` really does stop the run — counted in completed model

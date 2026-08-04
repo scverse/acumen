@@ -71,6 +71,7 @@ from acumen.prices import (
 from acumen.procs import label_env, reap, supported, survivors
 from acumen.prompts import draft_prompt, feedback_block, improve_prompt
 from acumen.report import (
+    _REPORT_COST_COLUMN,
     ReportError,
     _arm_marker,
     _best_cells,
@@ -84,6 +85,7 @@ from acumen.report import (
     _split_diff_rows,
     _tests_table_html,
     arm_metrics,
+    build_report,
     load_results,
     loaded_only_rates,
     metrics_figure,
@@ -1712,6 +1714,58 @@ def test_unpriced_runs_are_unknown_in_reports_not_zero_cost(
         plt.close(figure)
 
 
+def test_reports_use_inferred_cost_and_csv_keeps_recorded_cost(
+    runs_root: Path, model: str, make_result, tmp_path: Path
+) -> None:
+    """Provider cost remains auditable without changing cross-provider comparisons."""
+    key = RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=1)
+    make_result(
+        runs_root,
+        key,
+        cost_usd=0.90,
+        cost_available=True,
+        cost_source="provider",
+        provider_cost_usd=0.90,
+        inferred_cost_usd=0.20,
+    )
+
+    df = load_results(runs_root)
+    test = df[df["split"] == "test"]
+    assert test.iloc[0]["cost_usd"] == pytest.approx(0.90)
+    assert test.iloc[0][_REPORT_COST_COLUMN] == pytest.approx(0.20)
+    assert arm_metrics(test).loc[0, "cost"] == pytest.approx(0.20)
+    assert "0.200" in _runs_table_html(test, tmp_path)
+    assert "0.900" not in _runs_table_html(test, tmp_path)
+
+    out_path = tmp_path / "results.html"
+    build_report(runs_root, out_path)
+    exported = pd.read_csv(out_path.with_suffix(".csv"))
+    test_row = exported[exported["split"] == "test"].iloc[0]
+    assert test_row["recorded_cost_usd"] == pytest.approx(0.90)
+    assert test_row["inferred_cost_usd"] == pytest.approx(0.20)
+    assert "provider_cost_usd" not in exported.columns
+    assert _REPORT_COST_COLUMN not in exported.columns
+
+
+def test_modern_result_without_inferred_cost_stays_unpriced_in_report(runs_root: Path, model: str, make_result) -> None:
+    """A recorded provider estimate must never substitute for missing inference."""
+    key = RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=1)
+    make_result(
+        runs_root,
+        key,
+        cost_usd=0.90,
+        cost_available=True,
+        cost_source="provider",
+        provider_cost_usd=0.90,
+        inferred_cost_usd=None,
+    )
+
+    test = load_results(runs_root).query("split == 'test'")
+    assert test.iloc[0]["cost_usd"] == pytest.approx(0.90)
+    assert pd.isna(test.iloc[0][_REPORT_COST_COLUMN])
+    assert pd.isna(arm_metrics(test).loc[0, "cost"])
+
+
 # --- the cost/success trade-off figure --------------------------------------------------
 
 #: The two markers matplotlib gives an error bar's caps; neither is a data point.
@@ -2140,7 +2194,7 @@ def test_runs_table_marks_every_column_sortable_but_the_transcript_link(runs_roo
     sortable = {text for attrs, text in headings if "data-sortable" in attrs}
     inert = {text for attrs, text in headings if "data-sortable" not in attrs}
     assert inert == {"transcript"}
-    assert "cost $" in sortable and "total tok" in sortable
+    assert "cost / run $" in sortable and "total tok" in sortable
 
 
 def test_runs_table_sorts_formatted_numbers_by_their_value(

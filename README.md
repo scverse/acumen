@@ -94,11 +94,10 @@ Claude API runs use `ANTHROPIC_API_KEY`; Codex API runs use `CODEX_API_KEY` (or
 `*_model` config keys or `--model`.
 
 Every agentic command — `bench` included — takes `--auth {auto,session,api}` and defaults to
-the provider's logged-in subscription, falling back to its API key. Since `cost_usd` is
-derived from token counts, which both billing modes report, a subscription run prices exactly
-as accurately as a metered one; what changes is the meaning. Under `session`, `cost_usd` is
-what the run *would* have cost at API rates, not money billed — so each run records its
-`auth_mode` alongside the figure.
+the provider's logged-in subscription, falling back to its API key. Both billing modes report
+tokens, so Acumen can calculate the same API-rate estimate for either. Under `session`, that
+estimate is what the run *would* have cost at API rates, not money billed — so each run records
+its `auth_mode` alongside the figure.
 
 `max_turns` and `max_usd` apply to both providers, but they are not equally strict for Codex,
 which has no cap of its own — acumen enforces both against its event stream:
@@ -110,12 +109,14 @@ which has no cap of its own — acumen enforces both against its event stream:
   visible after the money is spent. The run is recorded as a budget failure — the same outcome
   Claude gives it — but bound Codex spend with `max_turns`. acumen prints this before the pass.
 
-**Cost is computed from tokens, not taken from the provider.** Only one of the two
-providers reports a billed dollar figure, so a mixed matrix would be comparing a real
-number against a zero. Every run instead records its token breakdown — fresh input, cache
-reads, cache writes, output, which are priced up to 10x apart — and `cost_usd` is derived
-from a rate table, identical arithmetic for both providers. The rates used are frozen into
-each `result.json`, so a pass benchmarked in January is not silently re-priced in July.
+**Reports compare inferred cost per run.** Every run records its token breakdown — fresh
+input, cache reads, cache writes, and output — and Acumen prices it with the frozen rate table
+stored in `result.json`. That gives Claude and Codex one comparable basis and prevents an old
+benchmark from being silently re-priced. The result itself retains both
+`provider_cost_usd` (when the backend supplies one) and `inferred_cost_usd`; its compatibility
+field `cost_usd` remains provider-first. The report's sidecar CSV calls the former
+`recorded_cost_usd` and keeps it separate from `inferred_cost_usd`, while every displayed cost
+and comparison uses the inferred value.
 
 ```bash
 acumen prices              # the rates in use, and where each came from
@@ -126,8 +127,8 @@ acumen prices --refresh    # re-check them against the providers' pricing pages
 it never rewrites anything, because picking the wrong tier or context band would silently
 misprice every future run. Adopt changes by pasting the emitted block into `config.yaml`
 under `prices:`, which is also how you price a model acumen doesn't ship a rate for, or
-override rates for a gateway. A model with no rate records its tokens and leaves `cost_usd`
-unset — never zero, which would read as free.
+override rates for a gateway. A model with no rate records its tokens and leaves inferred
+report cost unavailable — never zero, which would read as free.
 
 `draft`, `improve`, `tasks`, and `ship` each drive a long autonomous agent. Every run writes a
 live `logs/acumen-<command>-<datetime>.jsonl` (one event per step, flushed as it goes — so you
