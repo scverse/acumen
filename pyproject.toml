@@ -79,6 +79,9 @@ envs.docs.scripts.build = "sphinx-build -M html docs docs/_build -W {args}"
 envs.docs.scripts.clean = "git clean -fdX -- {args:docs}"
 envs.docs.scripts.open = "python -m webbrowser -t docs/_build/html/index.html"
 envs.docs.dependency-groups = [ "doc" ]
+# The test suite covers both backends, so it installs every optional one. The Codex-only and
+# Claude-only import paths are covered from within the suite, by hiding a backend at import time.
+envs.hatch-test.features = [ "all" ]
 envs.hatch-test.matrix = [
   # Test the lowest and highest supported Python versions with normal deps
   { deps = [ "stable" ], python = [ "3.12", "3.14" ] },
@@ -91,9 +94,6 @@ envs.hatch-test.overrides.matrix.deps.env-vars = [
   { value = "allow", key = "UV_PRERELEASE", if = [ "pre" ] },
 ]
 envs.hatch-test.dependency-groups = [ "dev", "test" ]
-# The test suite covers both backends, so it installs every optional one. The Codex-only and
-# Claude-only import paths are covered from within the suite, by hiding a backend at import time.
-envs.hatch-test.features = [ "all" ]
 
 [tool.ruff]
 line-length = 120
