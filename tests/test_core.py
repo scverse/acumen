@@ -601,7 +601,10 @@ def test_backends_are_optional_at_import_time() -> None:
     alone; the SDK may only be reached inside a function or under ``TYPE_CHECKING``.
     """
     offenders: list[str] = []
-    for path in sorted(Path(acumen.__file__).parent.rglob("*.py")):
+    package_root = Path(acumen.__file__).parent
+    for path in sorted(package_root.rglob("*.py")):
+        if any(part.startswith(".") for part in path.relative_to(package_root).parts):
+            continue  # editor caches and other hidden paths are not package source
         for node in ast.parse(path.read_text()).body:
             if isinstance(node, ast.If) and ast.unparse(node.test) == "TYPE_CHECKING":
                 continue  # annotations only — never executed
