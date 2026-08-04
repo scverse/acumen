@@ -26,7 +26,7 @@ from acumen.paths import (
     TRANSCRIPT_JSONL,
     RunKey,
 )
-from acumen.prices import Rates, normalize_usage, price_run, pricer, rates_payload, resolve_rates
+from acumen.prices import Rates, normalize_usage, price_run, pricer, rates_payload, resolve_cost, resolve_rates
 from acumen.prompts import benchmark_prompt
 from acumen.sandbox import Sandbox, sandbox
 from acumen.skills import Skill
@@ -162,6 +162,7 @@ def _build_options(
     model: str,
     max_turns: int,
     max_usd: float,
+    read_dirs: tuple[Path, ...] = (),
     price_overrides: dict[str, Rates] | None = None,
     stderr: Callable[[str], None] | None = None,
 ) -> AgentOptions:
@@ -191,6 +192,7 @@ def _build_options(
         max_usd=max_usd,
         discover_skills=True,
         price_usd=pricer(model, price_overrides),
+        read_dirs=read_dirs,
         stderr=stderr,
     )
 
@@ -229,7 +231,8 @@ async def run_once(
         Already resolved against per-task overrides by the caller.
     auth_mode
         Which credential the benchmark run authenticates with. Under ``"session"``, recorded
-        ``cost_usd`` is the equivalent API-rate cost derived from tokens, not metered spend.
+        Claude's SDK cost is API-equivalent rather than necessarily an invoice charge;
+        Codex falls back to frozen-table token inference.
     skill
         The skill to install, or ``None`` for the baseline arm. Must agree with
         ``key.arm``, else the run would be filed under an arm it doesn't belong to.
@@ -287,6 +290,7 @@ async def run_once(
             model=model,
             max_turns=max_turns,
             max_usd=max_usd,
+            read_dirs=(target.venv_dir,),
             price_overrides=price_overrides,
             stderr=stderr,
         )
@@ -323,12 +327,13 @@ async def run_once(
             success, reason = grade.success, grade.reason
 
     usage = normalize_usage(result.usage if result else None, provider=provider)
-    # Tokens are the measurement; cost is derived from them at a frozen rate, so the two
-    # providers are priced by one arithmetic path and old runs stay reproducible when the
-    # rate table moves. The provider's own figure is kept alongside as a cross-check.
+    # Preserve frozen-table inference for both providers, but prefer the SDK's value when it
+    # exists. For session authentication that provider figure is API-equivalent, not
+    # necessarily money charged on an invoice.
     rates = resolve_rates(model, price_overrides)
-    computed = price_run(usage, rates)
+    inferred = price_run(usage, rates)
     provider_cost = result.total_cost_usd if result else None
+    cost = resolve_cost(provider_cost, inferred)
     payload = {
         "task_id": key.task_id,
         "split": key.split,
@@ -336,21 +341,29 @@ async def run_once(
         "arm": key.arm,
         "model": model,
         "agent": provider,
-        # Which credential paid for the run. Cost is derived from tokens either way, but under
-        # "session" it is what the run would have cost at API rates rather than metered spend.
+        "provider": "anthropic" if provider == "claude" else "openai",
+        "backend": "claude_agent_sdk" if provider == "claude" else "codex_cli",
+        # Which credential paid for the run. Under "session", provider cost is an
+        # API-equivalent SDK estimate rather than necessarily metered spend.
         "auth_mode": auth_mode,
         "rep": key.rep,
         "success": success,
         "reason": reason,
         "turns": result.num_turns if result else 0,
-        "cost_usd": computed,
-        "cost_available": computed is not None,
-        "provider_cost_usd": provider_cost,
+        "cost_usd": cost.cost_usd,
+        "cost_available": cost.available,
+        "cost_source": cost.cost_source,
+        "provider_cost_usd": cost.provider_cost_usd,
+        "inferred_cost_usd": cost.inferred_cost_usd,
+        "cost_delta_usd": cost.cost_delta_usd,
+        "cost_delta_pct": cost.cost_delta_pct,
         "price_rates": rates_payload(rates),
         "input_tokens": usage.input,
         "output_tokens": usage.output,
         "cache_read_tokens": usage.cache_read,
         "cache_write_tokens": usage.cache_write,
+        "cache_write_5m_tokens": usage.cache_write_5m,
+        "cache_write_1h_tokens": usage.cache_write_1h,
         "duration_s": round((result.duration_ms if result else 0) / 1000, 2),
         "answer": grade.answer,
         "expected": split.answer.strip(),

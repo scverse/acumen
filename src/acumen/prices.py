@@ -1,10 +1,9 @@
-"""Per-model token rates, and the cost of one run computed from its token counts.
+"""Per-model token rates and provider-first cost resolution.
 
-The provider-reported dollar figure is not a usable benchmark metric: the Claude SDK
-returns one, ``codex exec`` returns none at all, so a mixed matrix would compare a real
-number against a zero. Tokens, by contrast, are reported by both. So acumen records the
-token breakdown as the primary measurement and derives cost from a rate table here —
-one arithmetic path, identical for every provider, and reproducible after the fact.
+The Claude SDK reports an API-equivalent dollar cost while ``codex exec`` reports none.
+Acumen therefore preserves two measurements: the provider value when one exists and a
+reproducible inference from this frozen rate table. The provider value is canonical;
+inference is the fallback and remains alongside it for comparison.
 
 Two properties this design depends on:
 
@@ -41,15 +40,17 @@ RATE_SOURCES = (
 class Rates:
     """What one model costs, in USD per million tokens.
 
-    ``cached_input`` and ``cache_write`` are absolute rates, not multipliers — both
-    providers happen to price them at 0.1x and 1.25x of ``input``, but that is their
-    convention to change, not an invariant worth encoding.
+    All cache fields are absolute rates, not multipliers. ``cache_write`` is the legacy
+    aggregate rate; the optional duration-specific fields retain Claude's distinct
+    five-minute and one-hour write prices.
     """
 
     input: float
     cached_input: float
     cache_write: float
     output: float
+    cache_write_5m: float | None = None
+    cache_write_1h: float | None = None
 
     @classmethod
     def from_mapping(cls, value: Any, *, model: str) -> Rates:
@@ -61,7 +62,14 @@ class Rates:
         """
         if not isinstance(value, dict):
             raise ValueError(f"prices for {model!r} must be a mapping, got {type(value).__name__}")
-        unknown = set(value) - {"input", "cached_input", "cache_write", "output"}
+        unknown = set(value) - {
+            "input",
+            "cached_input",
+            "cache_write",
+            "cache_write_5m",
+            "cache_write_1h",
+            "output",
+        }
         if unknown:
             raise ValueError(f"prices for {model!r} has unknown keys: {sorted(unknown)}")
         for key in ("input", "output"):
@@ -72,11 +80,14 @@ class Rates:
             if isinstance(raw, bool) or not isinstance(raw, int | float) or raw < 0:
                 raise ValueError(f"prices for {model!r}: {key!r} must be a non-negative number, got {raw!r}")
             numbers[key] = float(raw)
+        cache_write = numbers.get("cache_write", round(numbers["input"] * 1.25, _CENTS))
         return cls(
             input=numbers["input"],
             cached_input=numbers.get("cached_input", round(numbers["input"] * 0.1, _CENTS)),
-            cache_write=numbers.get("cache_write", round(numbers["input"] * 1.25, _CENTS)),
+            cache_write=cache_write,
             output=numbers["output"],
+            cache_write_5m=numbers.get("cache_write_5m", cache_write),
+            cache_write_1h=numbers.get("cache_write_1h", round(numbers["input"] * 2, _CENTS)),
         )
 
 
@@ -86,13 +97,23 @@ class Rates:
 _CENTS = 6
 
 
-def _rates(input_: float, output: float, *, cached: float | None = None, write: float | None = None) -> Rates:
+def _rates(
+    input_: float,
+    output: float,
+    *,
+    cached: float | None = None,
+    write: float | None = None,
+    split_writes: bool = False,
+) -> Rates:
     """Both providers price cache reads at 0.1x input and writes at 1.25x."""
+    write_rate = round(input_ * 1.25, _CENTS) if write is None else write
     return Rates(
         input=input_,
         cached_input=round(input_ * 0.1, _CENTS) if cached is None else cached,
-        cache_write=round(input_ * 1.25, _CENTS) if write is None else write,
+        cache_write=write_rate,
         output=output,
+        cache_write_5m=write_rate if split_writes else None,
+        cache_write_1h=round(input_ * 2, _CENTS) if split_writes else None,
     )
 
 
@@ -102,13 +123,13 @@ def _rates(input_: float, output: float, *, cached: float | None = None, write: 
 DEFAULT_RATES: dict[str, Rates] = {
     # Anthropic. Sonnet 5 carries an introductory rate through 2026-08-31; the standard
     # $3/$15 resumes after it, so re-verify this row rather than trusting it past then.
-    "claude-opus-5": _rates(5.00, 25.00),
-    "claude-opus-4-8": _rates(5.00, 25.00),
-    "claude-opus-4-7": _rates(5.00, 25.00),
-    "claude-sonnet-5": _rates(2.00, 10.00),
-    "claude-sonnet-4-6": _rates(3.00, 15.00),
-    "claude-haiku-4-5": _rates(1.00, 5.00),
-    "claude-haiku-4-5-20251001": _rates(1.00, 5.00),
+    "claude-opus-5": _rates(5.00, 25.00, split_writes=True),
+    "claude-opus-4-8": _rates(5.00, 25.00, split_writes=True),
+    "claude-opus-4-7": _rates(5.00, 25.00, split_writes=True),
+    "claude-sonnet-5": _rates(2.00, 10.00, split_writes=True),
+    "claude-sonnet-4-6": _rates(3.00, 15.00, split_writes=True),
+    "claude-haiku-4-5": _rates(1.00, 5.00, split_writes=True),
+    "claude-haiku-4-5-20251001": _rates(1.00, 5.00, split_writes=True),
     # OpenAI.
     "gpt-5.6-sol": _rates(5.00, 30.00),
     "gpt-5.6-terra": _rates(2.00, 12.00),
@@ -142,6 +163,8 @@ class Usage:
     cache_read: int
     cache_write: int
     output: int
+    cache_write_5m: int = 0
+    cache_write_1h: int = 0
 
     @property
     def total(self) -> int:
@@ -196,12 +219,21 @@ def normalize_usage(usage: dict | None, *, provider: str = "claude") -> Usage:
             output=output,
         )
     cache_read = _int(usage, "cache_read_input_tokens")
+    cache_detail = usage.get("cache_creation")
+    if not isinstance(cache_detail, dict):
+        cache_detail = {}
+    cache_write_5m = _int(cache_detail, "ephemeral_5m_input_tokens") or _int(usage, "cache_creation_5m_input_tokens")
+    cache_write_1h = _int(cache_detail, "ephemeral_1h_input_tokens") or _int(usage, "cache_creation_1h_input_tokens")
     cache_write = _int(usage, "cache_creation_input_tokens")
+    if cache_write == 0:
+        cache_write = cache_write_5m + cache_write_1h
     return Usage(
         input=_int(usage, "input_tokens") + cache_read + cache_write,
         cache_read=cache_read,
         cache_write=cache_write,
         output=output,
+        cache_write_5m=cache_write_5m,
+        cache_write_1h=cache_write_1h,
     )
 
 
@@ -237,12 +269,59 @@ def price_run(usage: Usage, rates: Rates | None) -> float | None:
     if rates is None:
         return None
     per_token = 1_000_000
+    classified_writes = min(usage.cache_write, usage.cache_write_5m + usage.cache_write_1h)
+    aggregate_writes = usage.cache_write - classified_writes
+    write_5m_rate = rates.cache_write_5m if rates.cache_write_5m is not None else rates.cache_write
+    write_1h_rate = rates.cache_write_1h if rates.cache_write_1h is not None else rates.cache_write
     return (
         usage.fresh_input * rates.input
         + usage.cache_read * rates.cached_input
-        + usage.cache_write * rates.cache_write
+        + aggregate_writes * rates.cache_write
+        + usage.cache_write_5m * write_5m_rate
+        + usage.cache_write_1h * write_1h_rate
         + usage.output * rates.output
     ) / per_token
+
+
+@dataclass(frozen=True)
+class CostResolution:
+    """Canonical and comparative costs for one completed agent run."""
+
+    cost_usd: float | None
+    cost_source: str
+    provider_cost_usd: float | None
+    inferred_cost_usd: float | None
+    cost_delta_usd: float | None
+    cost_delta_pct: float | None
+
+    @property
+    def available(self) -> bool:
+        """Whether this run has any canonical dollar cost."""
+        return self.cost_usd is not None
+
+
+def resolve_cost(provider_cost_usd: float | None, inferred_cost_usd: float | None) -> CostResolution:
+    """Prefer a provider-reported cost while retaining reproducible inference."""
+    canonical = provider_cost_usd if provider_cost_usd is not None else inferred_cost_usd
+    source = (
+        "provider"
+        if provider_cost_usd is not None
+        else ("inferred" if inferred_cost_usd is not None else "unavailable")
+    )
+    delta = None
+    pct = None
+    if provider_cost_usd is not None and inferred_cost_usd is not None:
+        delta = inferred_cost_usd - provider_cost_usd
+        if provider_cost_usd != 0:
+            pct = delta / provider_cost_usd
+    return CostResolution(
+        cost_usd=canonical,
+        cost_source=source,
+        provider_cost_usd=provider_cost_usd,
+        inferred_cost_usd=inferred_cost_usd,
+        cost_delta_usd=delta,
+        cost_delta_pct=pct,
+    )
 
 
 def rates_payload(rates: Rates | None) -> dict[str, float] | None:

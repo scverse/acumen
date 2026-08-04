@@ -9,7 +9,7 @@ benchmark is worthless. This is enforced two ways, not one:
 
 1. **Structurally.** The agent's ``cwd`` is a throwaway work dir and its readable material
    is a *curated copy* of train-split runs. The real ``runs/`` tree is not on its ``cwd``,
-   not in ``add_dirs``, and not in scope — so there is no test directory to reach in the
+   not in the read-only roots, and not in scope — so there is no test directory to reach in the
    first place.
 2. **Belt-and-braces.** A ``PreToolUse`` hook denies any tool call whose path resolves under
    a ``runs/*/test/`` subtree, so even a call that names an absolute path back into the
@@ -43,7 +43,7 @@ from acumen.paths import (
     arm_name,
     parse_run_dir,
 )
-from acumen.prices import price_usage, pricer
+from acumen.prices import price_usage, pricer, resolve_cost
 from acumen.procs import label_env, reap
 from acumen.prompts import improve_prompt
 from acumen.skills import (
@@ -526,6 +526,8 @@ async def improve_skill(
             max_usd=max_usd,
             # Codex reports no billed figure, so a budget cap needs the run's own rate table.
             price_usd=pricer(selected_model, cfg.prices),
+            read_dirs=(target.venv_dir,),
+            write_dirs=(work,),
             discover_skills=True,
             # Belt-and-braces over the structural isolation: refuse any call that reaches a
             # held-out test result, wherever the agent points it. Built only for Claude — the
@@ -572,12 +574,10 @@ async def improve_skill(
         return ImproveResult(
             skill=skill,
             parent=parent.version,
-            cost_usd=price_usage(
-                result.usage,
-                model=selected_model,
-                provider=result.provider,
-                overrides=cfg.prices,
-            ),
+            cost_usd=resolve_cost(
+                result.total_cost_usd,
+                price_usage(result.usage, model=selected_model, provider=result.provider, overrides=cfg.prices),
+            ).cost_usd,
             turns=result.num_turns,
             n_train_runs=len(train_runs),
             n_train_failures=n_failures,

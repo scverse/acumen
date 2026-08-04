@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -29,6 +30,8 @@ from acumen.agents import (
     AgentError,
     AgentOptions,
     AgentResult,
+    _claude_settings,
+    _codex_command,
     _codex_terminal,
     _install_codex_guard,
     check_agent_cli,
@@ -54,7 +57,17 @@ from acumen.improve import _write_material, collect_train_runs, load_rates
 from acumen.logs import LiveLog
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
 from acumen.pricefeed import PriceFeedError, diff_rates, parse_anthropic, parse_openai
-from acumen.prices import DEFAULT_RATES, Rates, Usage, normalize_usage, price_run, price_usage, pricer, resolve_rates
+from acumen.prices import (
+    DEFAULT_RATES,
+    Rates,
+    Usage,
+    normalize_usage,
+    price_run,
+    price_usage,
+    pricer,
+    resolve_cost,
+    resolve_rates,
+)
 from acumen.procs import label_env, reap, supported, survivors
 from acumen.prompts import draft_prompt, feedback_block, improve_prompt
 from acumen.report import (
@@ -391,6 +404,86 @@ printf '%s\\n' \\
     assert len(seen) == 4
 
 
+def test_agent_sandbox_policies_are_fail_closed_and_workspace_scoped(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    home = tmp_path / "home"
+    venv = tmp_path / "venv"
+    source = tmp_path / "source"
+    for path in (work, home / "tmp", home / ".codex", venv, source):
+        path.mkdir(parents=True)
+    options = AgentOptions(
+        cwd=work,
+        env={"PATH": os.environ["PATH"], "HOME": str(home), "CODEX_HOME": str(home / ".codex")},
+        model="gpt-5.6-sol",
+        read_dirs=(venv, source),
+    )
+
+    claude = _claude_settings(options)
+    assert claude["sandbox"]["enabled"] is True
+    assert claude["sandbox"]["failIfUnavailable"] is True
+    assert claude["sandbox"]["allowUnsandboxedCommands"] is False
+    assert claude["sandbox"]["filesystem"]["denyRead"] == ["/"]
+    assert str(venv.resolve()) in claude["sandbox"]["filesystem"]["allowRead"]
+    assert str(work.resolve()) in claude["sandbox"]["filesystem"]["allowWrite"]
+    assert str(source.resolve()) not in claude["sandbox"]["filesystem"]["allowWrite"]
+    assert "localhost" in claude["sandbox"]["network"]["deniedDomains"]
+    assert "127.*" in claude["sandbox"]["network"]["deniedDomains"]
+    assert claude["sandbox"]["network"]["allowLocalBinding"] is False
+
+    command = _codex_command(options, "do it")
+    overrides = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "-c"]
+    assert 'default_permissions="acumen"' in overrides
+    assert 'web_search="disabled"' in overrides
+    assert "tools.web_search=false" in overrides
+    assert "features.browser_use=false" in overrides
+    assert "features.apps=false" in overrides
+    assert "features.network_proxy=true" in overrides
+    filesystem = next(value for value in overrides if value.startswith("permissions.acumen.filesystem="))
+    assert '":root"="deny"' in filesystem
+    assert '":minimal"="read"' in filesystem
+    assert f'{json.dumps(str(work.resolve()))}="write"' in filesystem
+    assert f'{json.dumps(str(venv.resolve()))}="read"' in filesystem
+    codex_dir = Path(shutil.which("codex", path=options.env["PATH"])).resolve().parent
+    assert f'{json.dumps(str(codex_dir))}="read"' in filesystem
+    assert '"/bin"="read"' in filesystem
+    assert "permissions.acumen.network.enabled=true" in overrides
+    assert 'permissions.acumen.network.mode="limited"' in overrides
+    domains = next(value for value in overrides if value.startswith("permissions.acumen.network.domains="))
+    assert '"*"="allow"' in domains
+    assert '"localhost"="deny"' in domains
+    assert '"127.0.0.1"="deny"' in domains
+    assert '"metadata.google.internal"="deny"' in domains
+    assert "permissions.acumen.network.allow_local_binding=false" in overrides
+    assert "--ignore-user-config" in command and "--ignore-rules" in command
+    assert str(Path.home() / ".codex" / "config.toml") not in "\n".join(command)
+    assert str(Path.home() / ".codex" / "rules") not in "\n".join(command)
+
+
+def test_claude_options_write_run_local_settings_file(tmp_path: Path) -> None:
+    pytest.importorskip("claude_agent_sdk")
+    from acumen.agents import _claude_options
+
+    work = tmp_path / "work"
+    config_dir = tmp_path / "claude-config"
+    work.mkdir()
+    options = AgentOptions(
+        cwd=work,
+        env={
+            "PATH": os.environ["PATH"],
+            "HOME": str(tmp_path / "home"),
+            "CLAUDE_CONFIG_DIR": str(config_dir),
+        },
+        model="claude-haiku-4-5",
+    )
+
+    sdk_options = _claude_options(options)
+
+    settings_path = Path(sdk_options.settings)
+    assert settings_path == config_dir / "acumen-settings.json"
+    settings = json.loads(settings_path.read_text())
+    assert settings == _claude_settings(options)
+
+
 def test_codex_guard_denies_isolated_paths(tmp_path: Path) -> None:
     denied = tmp_path / "runs"
     denied.mkdir()
@@ -705,6 +798,51 @@ def test_usage_normalizes_both_providers_without_collapsing_the_cache_split() ->
     assert (empty.input, empty.output, empty.total) == (0, 0, 0)
 
 
+def test_claude_cache_writes_retain_five_minute_and_one_hour_classes() -> None:
+    usage = normalize_usage(
+        {
+            "input_tokens": 100,
+            "cache_creation_input_tokens": 3_000,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 1_000,
+                "ephemeral_1h_input_tokens": 2_000,
+            },
+        }
+    )
+    rates = Rates(
+        input=4,
+        cached_input=0.4,
+        cache_write=5,
+        output=20,
+        cache_write_5m=5,
+        cache_write_1h=8,
+    )
+
+    assert usage.cache_write == 3_000
+    assert (usage.cache_write_5m, usage.cache_write_1h) == (1_000, 2_000)
+    assert price_run(usage, rates) == pytest.approx((100 * 4 + 1_000 * 5 + 2_000 * 8) / 1_000_000)
+
+
+def test_provider_cost_is_canonical_while_inference_and_nested_agent_delta_survive() -> None:
+    # The SDK total includes nested agents while the parent usage block can be smaller.
+    cost = resolve_cost(provider_cost_usd=1.25, inferred_cost_usd=0.40)
+    assert cost.cost_usd == 1.25
+    assert cost.cost_source == "provider"
+    assert cost.inferred_cost_usd == 0.40
+    assert cost.cost_delta_usd == pytest.approx(-0.85)
+    assert cost.cost_delta_pct == pytest.approx(-0.68)
+
+
+def test_cost_falls_back_to_inference_and_never_turns_unavailable_into_free() -> None:
+    inferred = resolve_cost(None, 0.40)
+    assert (inferred.cost_usd, inferred.cost_source, inferred.available) == (0.40, "inferred", True)
+
+    unavailable = resolve_cost(None, None)
+    assert unavailable.cost_usd is None
+    assert unavailable.cost_source == "unavailable"
+    assert unavailable.available is False
+
+
 def test_price_run_bills_each_cache_class_at_its_own_rate() -> None:
     """Collapsing the split and billing it all at the base input rate overcharges ~3.6x.
 
@@ -800,6 +938,86 @@ def test_benchmark_persists_unavailable_cost_as_null(tmp_path: Path, monkeypatch
     assert outcome.payload["cost_usd"] is None
     assert persisted["cost_usd"] is None
     assert persisted["cost_available"] is False
+    assert persisted["cost_source"] == "unavailable"
+    assert persisted["provider_cost_usd"] is None
+    assert persisted["inferred_cost_usd"] is None
+    assert persisted["provider"] == "openai"
+    assert persisted["backend"] == "codex_cli"
+    assert persisted["agent"] == "codex"
+
+
+def test_benchmark_persists_provider_first_cost_for_nested_claude_agents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    box_root = tmp_path / "box"
+    box_root.mkdir()
+    box = Sandbox(
+        root=box_root,
+        home=tmp_path / "home",
+        config_dir=tmp_path / "claude-home",
+        env={},
+        authenticated=True,
+        provider="claude",
+    )
+
+    @contextmanager
+    def fake_sandbox(*_args, **_kwargs):
+        yield box
+
+    async def fake_run_agent(*_args, **_kwargs) -> AgentResult:
+        return AgentResult(
+            provider="claude",
+            is_error=False,
+            subtype="success",
+            errors=None,
+            session_id=None,
+            result="done",
+            num_turns=3,
+            # SDK totals include nested agents; the parent usage block below does not.
+            total_cost_usd=1.25,
+            duration_ms=100,
+            usage={"input_tokens": 1_000, "output_tokens": 0},
+        )
+
+    def collect(_box: Sandbox, directory: Path) -> None:
+        (directory / "answer.md").write_text("OK")
+
+    monkeypatch.setattr("acumen.runner.sandbox", fake_sandbox)
+    monkeypatch.setattr("acumen.runner.run_agent", fake_run_agent)
+    monkeypatch.setattr("acumen.runner._collect_artifacts", collect)
+    monkeypatch.setattr("acumen.runner.agent_version", lambda _provider: "test")
+
+    run_dir = tmp_path / "run"
+    asyncio.run(
+        run_once(
+            key=RunKey(arm="noskill", split="test", model="claude-opus-5", task_id="task", rep=1),
+            task=Task(id="task", train=TaskSplit("prompt", "OK"), test=TaskSplit("prompt", "OK")),
+            target=Target(
+                source="target",
+                ref="main",
+                src_dir=tmp_path / "src",
+                venv_dir=tmp_path / "venv",
+                commit="abc",
+                pkg_name="target",
+                pkg_version="1",
+            ),
+            run_dir=run_dir,
+            model="claude-opus-5",
+            max_turns=5,
+            max_usd=2.0,
+        )
+    )
+
+    persisted = json.loads((run_dir / "result.json").read_text())
+    assert persisted["cost_usd"] == 1.25
+    assert persisted["cost_source"] == "provider"
+    assert persisted["provider_cost_usd"] == 1.25
+    assert persisted["inferred_cost_usd"] == pytest.approx(0.005)
+    assert persisted["cost_delta_usd"] == pytest.approx(-1.245)
+    assert persisted["cost_delta_pct"] == pytest.approx(-0.996)
+    assert persisted["provider"] == "anthropic"
+    assert persisted["backend"] == "claude_agent_sdk"
+    assert persisted["agent"] == "claude"
 
 
 def test_resolve_rates_accepts_provider_qualified_ids_and_config_overrides() -> None:
@@ -861,10 +1079,24 @@ _OPENAI_MD = """
 def test_price_feed_picks_the_rate_in_effect_on_a_dated_row() -> None:
     """A promotional rate is published as two rows; taking the first would misprice runs."""
     intro = parse_anthropic(_ANTHROPIC_MD, today=date(2026, 8, 3))
-    assert intro["claude-sonnet-5"] == Rates(input=2.0, cached_input=0.2, cache_write=2.5, output=10.0)
+    assert intro["claude-sonnet-5"] == Rates(
+        input=2.0,
+        cached_input=0.2,
+        cache_write=2.5,
+        output=10.0,
+        cache_write_5m=2.5,
+        cache_write_1h=4.0,
+    )
 
     after = parse_anthropic(_ANTHROPIC_MD, today=date(2026, 9, 1))
-    assert after["claude-sonnet-5"] == Rates(input=3.0, cached_input=0.3, cache_write=3.75, output=15.0)
+    assert after["claude-sonnet-5"] == Rates(
+        input=3.0,
+        cached_input=0.3,
+        cache_write=3.75,
+        output=15.0,
+        cache_write_5m=3.75,
+        cache_write_1h=6.0,
+    )
 
     # Display names become API model IDs, and the batch table is not mistaken for the base one.
     assert intro["claude-haiku-4-5"].input == 1.0

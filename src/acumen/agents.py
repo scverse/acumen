@@ -31,6 +31,19 @@ if TYPE_CHECKING:
 
 AgentProvider = Literal["claude", "codex"]
 
+_PRIVATE_NETWORK_HOSTS = (
+    "localhost",
+    "*.localhost",
+    "127.*",
+    "0.0.0.0",
+    "10.*",
+    "169.254.*",
+    "192.168.*",
+    *(f"172.{second}.*" for second in range(16, 32)),
+    "::1",
+    "metadata.google.internal",
+)
+
 
 class AgentError(RuntimeError):
     """Raised when an agent model or provider cannot be resolved."""
@@ -103,7 +116,8 @@ class AgentOptions:
     model: str
     max_turns: int | None = None
     max_usd: float | None = None
-    add_dirs: tuple[Path, ...] = ()
+    read_dirs: tuple[Path, ...] = ()
+    write_dirs: tuple[Path, ...] = ()
     discover_skills: bool = True
     claude_hooks: dict[str, Any] | None = None
     deny_paths: tuple[Path, ...] = ()
@@ -113,18 +127,98 @@ class AgentOptions:
     #: means pricing its usage ourselves — pass the caller's rate table in as this hook.
     #: Without it ``max_usd`` cannot be enforced for a Codex run.
     price_usd: Callable[[dict[str, Any]], float | None] | None = None
-    #: Codex's own sandbox mode. ``"workspace-write"`` is right nearly everywhere, but it needs
-    #: unprivileged user namespaces, which some hosts refuse — Ubuntu 24.04 restricts them by
-    #: AppArmor default, and containers often lack the capability. There bubblewrap cannot start
-    #: and every file write fails, so ``"danger-full-access"`` is the way to run at all. It is
-    #: less reckless than it sounds here: acumen already gives each run a throwaway ``HOME``, a
-    #: scrubbed env allowlist, a temp working directory and the ``deny_paths`` hook, so Codex's
-    #: sandbox is a second layer rather than the only one.
-    codex_sandbox: str = "workspace-write"
+
+
+def _dedupe_paths(paths: Sequence[Path]) -> list[Path]:
+    result: list[Path] = []
+    for path in paths:
+        resolved = path.expanduser().resolve()
+        if resolved.exists() and resolved not in result:
+            result.append(resolved)
+    return result
+
+
+def _runtime_read_dirs() -> list[Path]:
+    """Host paths required to start ordinary Python and shell subprocesses."""
+    candidates = [
+        Path(sys.base_prefix),
+        Path(sys.prefix),
+        Path(sys.executable).resolve().parent,
+        Path("/bin"),
+        Path("/usr"),
+        Path("/lib"),
+        Path("/lib64"),
+        Path("/etc/ssl"),
+        Path("/etc/hosts"),
+        Path("/etc/resolv.conf"),
+        Path("/System"),
+        Path("/Library"),
+    ]
+    return _dedupe_paths(candidates)
+
+
+def _access_roots(options: AgentOptions) -> tuple[list[Path], list[Path]]:
+    env_paths = [
+        Path(value)
+        for key in ("HOME", "TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME")
+        if (value := options.env.get(key))
+    ]
+    writes = _dedupe_paths([options.cwd, *options.write_dirs, *env_paths])
+    reads = _dedupe_paths([*_runtime_read_dirs(), *options.read_dirs, *writes])
+    return reads, writes
+
+
+def _claude_path_rule(tool: str, path: Path) -> str:
+    return f"{tool}(//{str(path).lstrip('/')}/**)"
+
+
+def _claude_settings(options: AgentOptions) -> dict[str, Any]:
+    """Build strict run-local Claude settings for unattended execution."""
+    reads, writes = _access_roots(options)
+    return {
+        "permissions": {
+            "allow": [
+                "Bash",
+                "WebFetch",
+                "WebSearch",
+                "Skill",
+                *(_claude_path_rule("Read", path) for path in reads),
+                *(_claude_path_rule("Edit", path) for path in writes),
+            ],
+            "deny": [f"WebFetch(domain:{host})" for host in _PRIVATE_NETWORK_HOSTS],
+        },
+        "sandbox": {
+            "enabled": True,
+            "failIfUnavailable": True,
+            "autoAllowBashIfSandboxed": True,
+            "allowUnsandboxedCommands": False,
+            "excludedCommands": [],
+            "filesystem": {
+                "denyRead": ["/"],
+                "allowRead": [str(path) for path in reads],
+                "denyWrite": ["/"],
+                "allowWrite": [str(path) for path in writes],
+            },
+            "network": {
+                "allowedDomains": ["*"],
+                "deniedDomains": list(_PRIVATE_NETWORK_HOSTS),
+                "strictAllowlist": True,
+                "allowLocalBinding": False,
+                "allowAllUnixSockets": False,
+            },
+        },
+    }
 
 
 def _claude_options(options: AgentOptions) -> ClaudeAgentOptions:
     from claude_agent_sdk import ClaudeAgentOptions
+
+    config_dir_value = options.env.get("CLAUDE_CONFIG_DIR")
+    if not config_dir_value:
+        raise AgentError("Claude sandboxing requires a run-local CLAUDE_CONFIG_DIR")
+    settings_path = Path(config_dir_value) / "acumen-settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(_claude_settings(options)), encoding="utf-8")
 
     return ClaudeAgentOptions(
         cwd=str(options.cwd),
@@ -132,9 +226,14 @@ def _claude_options(options: AgentOptions) -> ClaudeAgentOptions:
         model=options.model,
         max_turns=options.max_turns,
         max_budget_usd=options.max_usd,
-        add_dirs=[str(path) for path in options.add_dirs],
+        add_dirs=[],
         setting_sources=["project"] if options.discover_skills else [],
-        permission_mode="bypassPermissions",
+        permission_mode="dontAsk",
+        # The SDK's ``settings`` field is a path passed to Claude Code's
+        # ``--settings`` flag, not an in-memory settings object.  Keeping this
+        # file in the isolated config directory also prevents user settings
+        # from being inherited by the run.
+        settings=str(settings_path),
         system_prompt={"type": "preset", "preset": "claude_code"},
         hooks=options.claude_hooks,
         stderr=options.stderr,
@@ -186,17 +285,35 @@ def _codex_command(options: AgentOptions, prompt: str) -> list[str]:
         "--ephemeral",
         "--ignore-user-config",
         "--ignore-rules",
+        "--strict-config",
         "--skip-git-repo-check",
         "--color",
         "never",
-        "--sandbox",
-        options.codex_sandbox,
         "-c",
         "project_doc_max_bytes=0",
         "-c",
         "project_doc_fallback_filenames=[]",
+        # Built-in web/browser/app surfaces do not run under local permission
+        # profiles. Disable them so every network request made by an isolated
+        # run goes through the profile-controlled command proxy.
         "-c",
-        "sandbox_workspace_write.network_access=true",
+        'web_search="disabled"',
+        "-c",
+        "tools.web_search=false",
+        "-c",
+        "features.browser_use=false",
+        "-c",
+        "features.browser_use_external=false",
+        "-c",
+        "features.browser_use_full_cdp_access=false",
+        "-c",
+        "features.apps=false",
+        "-c",
+        "features.remote_plugin=false",
+        "-c",
+        "features.network_proxy=true",
+        "-c",
+        'approval_policy="never"',
         "--cd",
         str(options.cwd),
         "--model",
@@ -204,8 +321,41 @@ def _codex_command(options: AgentOptions, prompt: str) -> list[str]:
     ]
     if options.deny_paths:
         command.append("--dangerously-bypass-hook-trust")
-    for path in options.add_dirs:
-        command.extend(("--add-dir", str(path)))
+    reads, writes = _access_roots(options)
+    # The Linux command sandbox re-executes the Codex binary through bubblewrap.
+    # Its resolved standalone install is outside the usual /usr runtime roots,
+    # so make the containing directory visible without exposing user config.
+    reads = [*reads, Path(cli).resolve().parent]
+    # Keep lexical system aliases as well as their resolved targets.  Landlock
+    # evaluates the command path it is given, so allowing /usr/bin does not make
+    # an invocation through the /bin -> /usr/bin symlink readable.
+    reads.extend(path for path in (Path("/bin"), Path("/lib"), Path("/lib64")) if path.exists())
+    reads = list(dict.fromkeys(reads))
+    command.extend(("-c", 'default_permissions="acumen"'))
+    filesystem = {":root": "deny", ":minimal": "read"}
+    for path in reads:
+        filesystem[str(path)] = "read"
+    for path in writes:
+        filesystem[str(path)] = "write"
+    # One inline TOML table keeps paths opaque. Passing each path as a dotted
+    # ``-c`` key misparses versioned and hidden directories (for example
+    # ``0.146.0/...`` or ``.venv``) as nested configuration keys.
+    filesystem_toml = ",".join(f"{json.dumps(path)}={json.dumps(access)}" for path, access in filesystem.items())
+    command.extend(("-c", f"permissions.acumen.filesystem={{{filesystem_toml}}}"))
+    command.extend(("-c", "permissions.acumen.network.enabled=true"))
+    command.extend(("-c", 'permissions.acumen.network.mode="limited"'))
+    domains = {
+        "*": "allow",
+        "localhost": "deny",
+        "*.localhost": "deny",
+        "127.0.0.1": "deny",
+        "0.0.0.0": "deny",
+        "::1": "deny",
+        "metadata.google.internal": "deny",
+    }
+    domains_toml = ",".join(f"{json.dumps(host)}={json.dumps(access)}" for host, access in domains.items())
+    command.extend(("-c", f"permissions.acumen.network.domains={{{domains_toml}}}"))
+    command.extend(("-c", "permissions.acumen.network.allow_local_binding=false"))
     command.append(prompt)
     return command
 
@@ -332,15 +482,20 @@ _SANDBOX_SUBTYPE = "error_sandbox"
 _SANDBOX_FAILURES = (
     "fs sandbox helper failed",
     "bwrap:",
-    "Failed to write file",
+    "failed to write file",
     "sandbox helper",
+    "sandbox setup failed",
+    "failed to apply sandbox",
+    "landlock",
+    "unprivileged user namespace",
 )
 
 
 def _sandbox_failure(lines: Sequence[str]) -> str | None:
     """Return the first stderr line showing a sandbox failure, or ``None``."""
     for line in lines:
-        if any(marker in line for marker in _SANDBOX_FAILURES):
+        lowered = line.lower()
+        if any(marker in lowered for marker in _SANDBOX_FAILURES):
             return line.strip()
     return None
 

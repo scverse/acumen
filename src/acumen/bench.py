@@ -136,7 +136,8 @@ async def run_matrix(
         Ceiling on simultaneous agents.
     auth_mode
         Which credential every run authenticates with. Under ``"session"``, the recorded
-        ``cost_usd`` is the equivalent API-rate cost derived from tokens, not metered spend.
+        Claude's SDK value is API-equivalent rather than necessarily metered spend;
+        Codex uses frozen-table token inference.
     skill
         The skill every run in this matrix installs, or ``None`` for the baseline. One
         matrix is one arm, so this is a property of the pass rather than of a run.

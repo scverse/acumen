@@ -46,7 +46,7 @@ from acumen.agents import AgentOptions, AgentResult, provider_for_model, run_age
 from acumen.config import Config
 from acumen.env import AuthMode, Target, build_agent_env
 from acumen.logs import LiveLog
-from acumen.prices import price_usage, pricer
+from acumen.prices import price_usage, pricer, resolve_cost
 from acumen.procs import label_env, reap
 from acumen.prompts import taskgen_prompt
 from acumen.tasks import Task, TaskError, load_tasks
@@ -116,7 +116,7 @@ def _copy_ignore(root: Path):
 def build_filtered_source(src: Path, dest: Path) -> Path:
     """Copy ``src`` to ``dest`` with skills and agent-guidance stripped out.
 
-    This is the structural half of the skill-bias isolation: the generator's ``add_dirs`` points
+    This is the structural half of the skill-bias isolation: the generator's read policy points
     at the returned copy, not the real checkout, so existing skills are simply absent from what
     it can read.
 
@@ -384,7 +384,8 @@ async def generate_tasks(
             price_usd=pricer(selected_model, cfg.prices),
             # The generator reads the target source, like the drafter; benchmark agents
             # never do. It points at the *filtered* copy, not the real checkout.
-            add_dirs=(source_copy,),
+            read_dirs=(source_copy, target.venv_dir),
+            write_dirs=(work,),
             # No skill discovery at all — the generator must not load a skill that would bias it.
             discover_skills=False,
             # Belt-and-braces over the filtered copy: deny any call that reaches an existing
@@ -428,12 +429,10 @@ async def generate_tasks(
         return TaskGenResult(
             tasks=generated,
             out_path=out_path,
-            cost_usd=price_usage(
-                result.usage,
-                model=selected_model,
-                provider=result.provider,
-                overrides=cfg.prices,
-            ),
+            cost_usd=resolve_cost(
+                result.total_cost_usd,
+                price_usage(result.usage, model=selected_model, provider=result.provider, overrides=cfg.prices),
+            ).cost_usd,
             turns=result.num_turns,
             log_jsonl=log.jsonl_path if log is not None else None,
             log_html=log.html_path if log is not None and log.html_rendered else None,

@@ -52,14 +52,15 @@ resume safe. Useful fields: `success`, `reason`, `answer`, `expected`, `model`, 
 `cost_usd`, `input_tokens`, `output_tokens`, `duration_s`, `skill_hash`, `skill_name`,
 `skill_loaded`, `pkg_version`, `commit`, `session_id`, `subtype`, `error`.
 
-**`cost_usd` is computed from tokens, not reported by the provider.** Each run records
-`input_tokens` (the total), `cache_read_tokens`, `cache_write_tokens`, and `output_tokens`;
-cost is those counts times the model's rates, which are frozen into the run as
-`price_rates` so old runs are never re-priced. The provider's own figure, where it exists,
-is kept alongside as `provider_cost_usd` for cross-checking. A model with no rate leaves
-`cost_available` false and `cost_usd` null, so reports cannot mistake it for a free run. Inspect or
-re-check the rate table with `acumen prices` / `acumen prices --refresh`, and set
-`prices:` in `config.yaml` to price an unlisted model.
+**`cost_usd` prefers the provider's value and falls back to token inference.** Each run records
+`provider_cost_usd`, `inferred_cost_usd`, `cost_source`, and the absolute/relative delta when
+both exist. Claude's SDK total is API-equivalent (not necessarily an invoice charge under
+session authentication); Codex reports no dollars, so it uses inference. Token classes and the
+rates frozen into `price_rates` remain available for reproduction, including Claude's separate
+five-minute and one-hour cache writes plus the legacy aggregate. A model with neither provider
+cost nor rates leaves `cost_available` false and `cost_usd` null, so reports cannot mistake it
+for a free run. Inspect or re-check the rate table with `acumen prices` / `acumen prices
+--refresh`, and set `prices:` in `config.yaml` to price an unlisted model.
 
 `codex exec` has no cap of its own, so acumen enforces both from its event stream, at
 different resolutions. `max_turns` really does stop the run — counted in completed model

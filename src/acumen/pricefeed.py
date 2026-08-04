@@ -130,9 +130,9 @@ def parse_anthropic(markdown: str, *, today: date) -> dict[str, Rates]:
             continue
         columns = {
             "input": next(i for i, c in enumerate(lowered) if "base input" in c),
-            # The 5-minute TTL is what an agent run actually uses; the 1h column is a
-            # different product, not a better estimate of the same one.
             "cache_write": next(i for i, c in enumerate(lowered) if "5m cache" in c),
+            "cache_write_5m": next(i for i, c in enumerate(lowered) if "5m cache" in c),
+            "cache_write_1h": next(i for i, c in enumerate(lowered) if "1h cache" in c),
             "cached_input": next(i for i, c in enumerate(lowered) if "cache hits" in c),
             "output": next(i for i, c in enumerate(lowered) if "output" in c),
         }
@@ -212,7 +212,14 @@ class RateChange:
         # and on a cached workload that is most of the bill.
         moved = [
             f"{field} ${getattr(self.before, field)}→${getattr(self.after, field)}"
-            for field in ("input", "cached_input", "cache_write", "output")
+            for field in (
+                "input",
+                "cached_input",
+                "cache_write",
+                "cache_write_5m",
+                "cache_write_1h",
+                "output",
+            )
             if getattr(self.before, field) != getattr(self.after, field)
         ]
         return f"  ~ {self.model}: {', '.join(moved)}"
@@ -246,6 +253,10 @@ def to_yaml_block(rates: dict[str, Rates]) -> str:
         lines.append(f"    input: {rate.input}")
         lines.append(f"    cached_input: {rate.cached_input}")
         lines.append(f"    cache_write: {rate.cache_write}")
+        if rate.cache_write_5m is not None:
+            lines.append(f"    cache_write_5m: {rate.cache_write_5m}")
+        if rate.cache_write_1h is not None:
+            lines.append(f"    cache_write_1h: {rate.cache_write_1h}")
         lines.append(f"    output: {rate.output}")
     return "\n".join(lines) + "\n"
 

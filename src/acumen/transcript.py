@@ -40,7 +40,7 @@ def locate_transcript(config_dir: Path, work_dir: Path, session_id: str) -> Path
     ----------
     config_dir
         The ``CLAUDE_CONFIG_DIR`` the agent ran under (throwaway, for isolated agents; the
-        user's real one for the unisolated ship agent).
+        run-local one used by the agent).
     work_dir
         The agent's ``cwd`` — what the project key is computed from.
     session_id

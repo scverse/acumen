@@ -103,7 +103,8 @@ def sandbox(
     auth_mode
         Which credential the run authenticates with (see :func:`acumen.env.build_agent_env`).
         Benchmark runs pass their resolved ``--auth`` mode. Under ``"session"``, recorded
-        ``cost_usd`` is the equivalent API-rate cost derived from tokens, not metered spend.
+        Claude's SDK value is API-equivalent rather than necessarily metered spend;
+        Codex uses frozen-table token inference.
     base
         Parent directory for the sandbox. Defaults to the system temp dir.
     keep

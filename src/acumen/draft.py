@@ -21,7 +21,7 @@ from acumen.agents import AgentOptions, AgentResult, provider_for_model, run_age
 from acumen.config import Config
 from acumen.env import AuthMode, Target, build_agent_env
 from acumen.logs import LiveLog
-from acumen.prices import price_usage, pricer
+from acumen.prices import price_usage, pricer, resolve_cost
 from acumen.procs import label_env, reap
 from acumen.prompts import draft_prompt
 from acumen.skills import (
@@ -158,7 +158,8 @@ async def draft_skill(
             # Codex reports no billed figure, so a budget cap needs the run's own rate table.
             price_usd=pricer(selected_model, cfg.prices),
             # The drafter reads the target source; benchmark agents never do.
-            add_dirs=(target.src_dir,),
+            read_dirs=(target.src_dir, target.venv_dir),
+            write_dirs=(work,),
             discover_skills=True,
         )
 
@@ -194,12 +195,10 @@ async def draft_skill(
         skill = load_skill(skills_root, version, expect_name=cfg.skill_name)
         return DraftResult(
             skill=skill,
-            cost_usd=price_usage(
-                result.usage,
-                model=selected_model,
-                provider=result.provider,
-                overrides=cfg.prices,
-            ),
+            cost_usd=resolve_cost(
+                result.total_cost_usd,
+                price_usage(result.usage, model=selected_model, provider=result.provider, overrides=cfg.prices),
+            ).cost_usd,
             turns=result.num_turns,
             log_jsonl=log.jsonl_path if log is not None else None,
             log_html=log.html_path if log is not None and log.html_rendered else None,

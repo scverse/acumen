@@ -28,7 +28,7 @@ Only `repo` is required; delete a line to take its default.
 | `max_usd` | `3.0` | **Benchmark agents only.** |
 | `draft_model` / `improve_model` / `tasks_model` / `ship_model` | `models[0]` | Meta-agent models; overridable per command with `--model`. |
 | `skill_name` | repo basename, slugified + lowercased | Must equal the `name:` in the skill's frontmatter. |
-| `prices` | built-in table | Per-model token rates (USD per million): `{model: {input, output, cached_input?, cache_write?}}`. Overrides or extends acumen's table — needed for a model it doesn't ship a rate for, a gateway, or negotiated rates. Cache rates default to 0.1x / 1.25x of input. See `acumen prices`. |
+| `prices` | built-in table | Per-model token rates (USD per million): `{model: {input, output, cached_input?, cache_write?, cache_write_5m?, cache_write_1h?}}`. Overrides or extends acumen's table — needed for a model it doesn't ship a rate for, a gateway, or negotiated rates. See `acumen prices`. |
 
 **`extras` vs `dependency_groups` — pick the wrong one and the packages are missing.** Extras
 are published in package metadata, so they are what `pip install pkg[name]` resolves. PEP 735
