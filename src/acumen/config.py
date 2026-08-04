@@ -23,7 +23,17 @@ class Config:
     repo: str
     skill_name: str
     ref: str = "main"
+    #: Extras from the target's ``[project.optional-dependencies]``. These are published in
+    #: package metadata, so they are what ``pip install pkg[name]`` resolves against.
     extras: list[str] = field(default_factory=list)
+    #: PEP 735 groups from the target's ``[dependency-groups]``. Unlike extras these never
+    #: reach package metadata — they exist only in the source tree — so they need uv's
+    #: ``--group`` rather than the ``pkg[name]`` syntax.
+    dependency_groups: list[str] = field(default_factory=list)
+    #: Packages the target's own ``pyproject.toml`` declares nowhere, installed into the
+    #: target venv alongside it. Passed to ``uv pip install`` verbatim, so PEP 508
+    #: specifiers (``numpy<2``) work.
+    pip_packages: list[str] = field(default_factory=list)
     python: str = "3.12"
     #: Names of environment variables to carry from the operator's shell into isolated
     #: agents (bench sandboxes and the draft/improve/tasks meta-agents), on top of the
@@ -61,6 +71,8 @@ _KNOWN = {
     "repo",
     "ref",
     "extras",
+    "dependency_groups",
+    "pip_packages",
     "python",
     "env_passthrough",
     "models",
@@ -189,6 +201,8 @@ def parse_config(raw: Any) -> Config:
         skill_name=skill_name,
         ref=_optional_str(raw, "ref", "main"),
         extras=_str_list(raw, "extras", []),
+        dependency_groups=_str_list(raw, "dependency_groups", []),
+        pip_packages=_str_list(raw, "pip_packages", []),
         python=_optional_str(raw, "python", "3.12"),
         env_passthrough=_str_list(raw, "env_passthrough", []),
         models=models,

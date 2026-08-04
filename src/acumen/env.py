@@ -4,7 +4,8 @@ Two jobs:
 
 * :func:`prepare_target` — clone (or adopt a local path), build one venv with the target
   package installed, and record the resolved commit and package version. Cached by
-  (repo, ref) so a pass doesn't re-clone.
+  (repo, ref, dependency selection) so a pass doesn't re-clone, but changing what gets
+  installed does rebuild.
 * :func:`scrubbed_env` — the filtered environment benchmark agents run under: auth and
   PATH only, a throwaway ``HOME`` and ``CLAUDE_CONFIG_DIR``, and nothing that could leak
   the user's own settings or memories into a run.
@@ -106,9 +107,23 @@ def _run(cmd: list[str], *, cwd: Path | None = None) -> str:
     return proc.stdout.strip()
 
 
-def cache_key(repo: str, ref: str) -> str:
-    """Return the cache directory name for a (repo, ref) pair."""
-    digest = hashlib.sha256(f"{repo}\n{ref}".encode()).hexdigest()[:12]
+def cache_key(
+    repo: str,
+    ref: str,
+    *,
+    extras: Sequence[str] = (),
+    dependency_groups: Sequence[str] = (),
+    pip_packages: Sequence[str] = (),
+) -> str:
+    """Return the cache directory name for a target and its dependency selection.
+
+    The selection is part of the key because it changes what lands in the venv: editing
+    ``extras`` or ``dependency_groups`` has to rebuild rather than silently reuse a venv
+    built from the previous selection. Each list is sorted first, so reordering a config
+    list is not a rebuild.
+    """
+    selection = "\n".join(",".join(sorted(names)) for names in (extras, dependency_groups, pip_packages))
+    digest = hashlib.sha256(f"{repo}\n{ref}\n{selection}".encode()).hexdigest()[:12]
     stem = slugify(Path(repo.rstrip("/")).name.removesuffix(".git") or "target")
     return f"{stem}-{digest}"
 
@@ -128,18 +143,56 @@ def _resolve_commit(src_dir: Path) -> str:
         return "local"  # a local path that isn't a git checkout is still a valid target
 
 
-def _package_name(src_dir: Path) -> str:
+def _load_pyproject(src_dir: Path) -> dict:
     pyproject = src_dir / "pyproject.toml"
     if not pyproject.is_file():
         raise EnvError(f"{src_dir} has no pyproject.toml — acumen needs an installable package")
     try:
-        data = tomllib.loads(pyproject.read_text())
+        return tomllib.loads(pyproject.read_text())
     except (OSError, tomllib.TOMLDecodeError) as err:
         raise EnvError(f"cannot parse {pyproject}: {err}") from err
+
+
+def _package_name(src_dir: Path) -> str:
+    data = _load_pyproject(src_dir)
     name = data.get("project", {}).get("name")
     if not name:
-        raise EnvError(f"{pyproject} does not declare [project].name")
+        raise EnvError(f"{src_dir / 'pyproject.toml'} does not declare [project].name")
     return str(name)
+
+
+def _validate_deps(src_dir: Path, cfg: Config) -> None:
+    """Reject extras and dependency groups the target does not declare.
+
+    Both mechanisms fail quietly otherwise: uv only *warns* about an extra that a package
+    does not provide and still exits 0, so a typo — or an extra that is really a PEP 735
+    group — silently yields a venv missing everything that was asked for. The two are easy
+    to confuse, so when a name is declared as the other kind the error says which key to use.
+    """
+    data = _load_pyproject(src_dir)
+    extras = set(data.get("project", {}).get("optional-dependencies", {}))
+    groups = set(data.get("dependency-groups", {}))
+
+    def _available(declared: set[str], label: str) -> str:
+        return f"available {label}: {', '.join(sorted(declared))}" if declared else f"the target declares no {label}"
+
+    for name in cfg.extras:
+        if name in extras:
+            continue
+        if name in groups:
+            raise EnvError(
+                f"{name!r} is a dependency group, not an extra — use dependency_groups: [{name}]. "
+                "Extras live in [project.optional-dependencies] and are published in package "
+                "metadata; PEP 735 groups live in [dependency-groups] and never leave the source tree."
+            )
+        raise EnvError(f"{name!r} is not an extra of the target; {_available(extras, 'extras')}")
+
+    for name in cfg.dependency_groups:
+        if name in groups:
+            continue
+        if name in extras:
+            raise EnvError(f"{name!r} is an extra, not a dependency group — use extras: [{name}].")
+        raise EnvError(f"{name!r} is not a dependency group of the target; {_available(groups, 'dependency groups')}")
 
 
 def _installed_version(python: Path, pkg_name: str) -> str:
@@ -156,9 +209,10 @@ def prepare_target(cfg: Config, cache_root: Path, *, refresh: bool = False) -> T
     Parameters
     ----------
     cfg
-        The pass config; supplies ``repo``, ``ref``, ``extras`` and ``python``.
+        The pass config; supplies ``repo``, ``ref``, ``python`` and the dependency
+        selection (``extras``, ``dependency_groups``, ``pip_packages``).
     cache_root
-        Directory to hold checkouts and venvs, keyed by (repo, ref).
+        Directory to hold checkouts and venvs, keyed by (repo, ref, dependency selection).
     refresh
         Rebuild even if a ready-marked cache entry exists.
 
@@ -168,7 +222,13 @@ def prepare_target(cfg: Config, cache_root: Path, *, refresh: bool = False) -> T
     """
     if shutil.which("uv") is None:
         raise EnvError("uv is not on PATH — acumen uses it to build the target venv")
-    entry = cache_root / cache_key(cfg.repo, cfg.ref)
+    entry = cache_root / cache_key(
+        cfg.repo,
+        cfg.ref,
+        extras=cfg.extras,
+        dependency_groups=cfg.dependency_groups,
+        pip_packages=cfg.pip_packages,
+    )
     venv_dir = entry / "venv"
     marker = entry / READY_MARKER
 
@@ -201,6 +261,9 @@ def prepare_target(cfg: Config, cache_root: Path, *, refresh: bool = False) -> T
     if not cfg.is_local:
         _clone(cfg.repo, cfg.ref, src_dir)
 
+    # Before the venv, so an unsatisfiable selection costs nothing but the checkout.
+    _validate_deps(src_dir, cfg)
+
     entry.mkdir(parents=True, exist_ok=True)
     if venv_dir.exists():
         shutil.rmtree(venv_dir)
@@ -211,7 +274,12 @@ def prepare_target(cfg: Config, cache_root: Path, *, refresh: bool = False) -> T
     if cfg.extras:
         spec = f"{src_dir}[{','.join(cfg.extras)}]"
     python = venv_dir / ("Scripts" if os.name == "nt" else "bin") / ("python.exe" if os.name == "nt" else "python")
-    _run(["uv", "pip", "install", "--python", str(python), spec])
+    install = ["uv", "pip", "install", "--python", str(python), spec, *cfg.pip_packages]
+    # Groups must be path-qualified: a bare --group resolves against the *cwd's* pyproject,
+    # and _run does not set one.
+    for group in cfg.dependency_groups:
+        install += ["--group", f"{src_dir / 'pyproject.toml'}:{group}"]
+    _run(install)
 
     target = Target(
         source=cfg.repo,

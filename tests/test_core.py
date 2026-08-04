@@ -36,13 +36,15 @@ from acumen.agents import (
     run_agent,
 )
 from acumen.bench import build_matrix, pending
-from acumen.config import ConfigError, derive_skill_name, load_config, parse_config
+from acumen.config import Config, ConfigError, derive_skill_name, load_config, parse_config
 from acumen.env import (
     AUTH_ENV_VARS,
     EnvError,
     Target,
+    _validate_deps,
     api_auth_available,
     build_agent_env,
+    cache_key,
     resolve_auth_mode,
     scrubbed_env,
     session_auth_available,
@@ -150,6 +152,86 @@ def test_config_defaults_and_derived_skill_name() -> None:
 def test_config_rejects_unknown_keys() -> None:
     with pytest.raises(ConfigError, match="unknown keys"):
         parse_config({"repo": "https://example.com/pkg", "modles": ["x"]})
+
+
+def test_config_dependency_selection() -> None:
+    cfg = parse_config({"repo": "https://example.com/pkg"})
+    assert cfg.dependency_groups == []
+    assert cfg.pip_packages == []
+
+    cfg2 = parse_config({"repo": "https://example.com/pkg", "dependency_groups": ["full"], "pip_packages": ["numpy<2"]})
+    assert cfg2.dependency_groups == ["full"]
+    assert cfg2.pip_packages == ["numpy<2"]
+
+    with pytest.raises(ConfigError, match="list of non-empty strings"):
+        parse_config({"repo": "https://example.com/pkg", "dependency_groups": "full"})
+
+
+# --- target dependency selection -------------------------------------------------------
+
+
+def _target(tmp_path: Path, body: str) -> Path:
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "pyproject.toml").write_text(f'[project]\nname = "pkg"\n{body}')
+    return src
+
+
+def _cfg(**kwargs: list[str]) -> Config:
+    return parse_config({"repo": "https://example.com/pkg", **kwargs})
+
+
+def test_validate_deps_points_at_the_right_key(tmp_path: Path) -> None:
+    """A group asked for as an extra is the failure that silently empties the venv."""
+    src = _target(tmp_path, '\n[dependency-groups]\nfull = ["scanpy"]\n')
+
+    _validate_deps(src, _cfg(dependency_groups=["full"]))  # the correct spelling passes
+
+    with pytest.raises(EnvError, match=r"'full' is a dependency group, not an extra"):
+        _validate_deps(src, _cfg(extras=["full"]))
+
+
+def test_validate_deps_reports_what_is_declared(tmp_path: Path) -> None:
+    src = _target(tmp_path, '\n[project.optional-dependencies]\ntest = ["pytest"]\n')
+
+    with pytest.raises(EnvError, match="the target declares no dependency groups"):
+        _validate_deps(src, _cfg(dependency_groups=["nope"]))
+    with pytest.raises(EnvError, match="available extras: test"):
+        _validate_deps(src, _cfg(extras=["nope"]))
+    with pytest.raises(EnvError, match=r"'test' is an extra, not a dependency group"):
+        _validate_deps(src, _cfg(dependency_groups=["test"]))
+
+
+def test_validate_deps_ignores_pip_packages(tmp_path: Path) -> None:
+    """Arbitrary package names can't be checked against the source tree; uv rejects bad ones."""
+    src = _target(tmp_path, "")
+
+    _validate_deps(src, _cfg(pip_packages=["harmonypy", "numpy<2"]))
+
+
+def test_cache_key_tracks_the_dependency_selection() -> None:
+    base = cache_key("https://example.com/pkg", "main")
+
+    assert cache_key("https://example.com/pkg", "main", extras=["test"]) != base
+    assert cache_key("https://example.com/pkg", "main", dependency_groups=["test"]) != base
+    assert cache_key("https://example.com/pkg", "main", pip_packages=["test"]) != base
+    # ... and the three are distinct from each other, not just from the base
+    assert (
+        len(
+            {
+                cache_key("https://example.com/pkg", "main", extras=["x"]),
+                cache_key("https://example.com/pkg", "main", dependency_groups=["x"]),
+                cache_key("https://example.com/pkg", "main", pip_packages=["x"]),
+            }
+        )
+        == 3
+    )
+
+
+def test_cache_key_is_stable_under_reordering() -> None:
+    assert cache_key("https://example.com/pkg", "main", extras=["a", "b"]) == cache_key(
+        "https://example.com/pkg", "main", extras=["b", "a"]
+    )
 
 
 def test_load_config_resolves_a_local_repo(project: Path) -> None:

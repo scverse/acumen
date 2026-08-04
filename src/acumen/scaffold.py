@@ -20,7 +20,9 @@ CONFIG_TEMPLATE = """\
 
 repo: https://github.com/OWNER/REPO   # GitHub URL, or a local path to an installable package
 ref: main                             # branch, tag, or commit (ignored for local paths)
-extras: []                            # optional pip extras, e.g. [dev, test]
+extras: []                            # pip extras the target publishes, e.g. [test]
+dependency_groups: []                 # PEP 735 groups from the target's pyproject, e.g. [full]
+pip_packages: []                      # packages the target declares nowhere, e.g. [harmonypy]
 python: "3.12"                        # interpreter for the target's throwaway venv
 env_passthrough: []                   # extra env vars agents may keep (e.g. [OMP_NUM_THREADS]); the agent env is otherwise a clean allowlist
 
