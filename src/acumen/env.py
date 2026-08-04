@@ -265,9 +265,9 @@ AUTH_ENV_VARS = (
     "CLAUDE_CODE_USE_VERTEX",
 )
 
-#: A resolved authentication mode for an agent run. ``"session"`` bills the user's Claude
-#: subscription via an OAuth login; ``"api"`` bills the Anthropic API (or a cloud provider)
-#: per token — the only mode that yields the real ``cost_usd`` the benchmark records.
+#: A resolved authentication mode for an agent run. ``"session"`` uses the provider's stored
+#: account/subscription login; ``"api"`` uses a metered API credential. Acumen derives
+#: ``cost_usd`` from tokens in either mode, and records the mode so its meaning stays explicit.
 AuthMode = Literal["session", "api"]
 
 #: Allowlisted variables that carry *metered* (API/cloud) authentication, as distinct from a
@@ -303,6 +303,29 @@ def _codex_credentials_path() -> Path:
     return _codex_home() / "auth.json"
 
 
+def _codex_persisted_auth_mode() -> AuthMode | None:
+    """Classify the credential stored by ``codex login``, without exposing its value.
+
+    Both account and API-key logins write ``auth.json``. The file's existence therefore
+    cannot distinguish subscription usage from metered API usage: recent Codex versions
+    identify API-key login with ``auth_mode: apikey`` and account login with
+    ``auth_mode: chatgpt``. The payload shapes are retained as compatibility fallbacks.
+    Unknown or unreadable files are not guessed at.
+    """
+    try:
+        data = json.loads(_codex_credentials_path().read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    mode = data.get("auth_mode")
+    if mode == "apikey" or data.get("OPENAI_API_KEY"):
+        return "api"
+    if mode == "chatgpt" or isinstance(data.get("tokens"), dict):
+        return "session"
+    return None
+
+
 def _has_oauth_credentials() -> bool:
     """Whether the user's credentials file holds a Claude subscription (OAuth) login.
 
@@ -321,11 +344,12 @@ def _has_oauth_credentials() -> bool:
 def session_auth_available(provider: AgentProvider = "claude") -> bool:
     """Whether an agent run could bill the Claude subscription ("session usage").
 
-    True when a portable ``CLAUDE_CODE_OAUTH_TOKEN`` is set, or the user has a subscription
-    OAuth login on disk (:func:`_has_oauth_credentials`). An empty variable does not count.
+    For Claude, true when a portable ``CLAUDE_CODE_OAUTH_TOKEN`` is set or a subscription
+    OAuth login is on disk. For Codex, true only for an account login in ``auth.json``; a
+    persisted API-key login is deliberately not a session. An empty variable does not count.
     """
     if provider == "codex":
-        return _codex_credentials_path().is_file()
+        return _codex_persisted_auth_mode() == "session"
     if os.environ.get(SESSION_AUTH_ENV_VAR):
         return True
     return _has_oauth_credentials()
@@ -336,11 +360,12 @@ def api_auth_available(provider: AgentProvider = "claude") -> bool:
 
     True when any metered auth variable is set (:data:`API_AUTH_ENV_VARS`): a direct
     Anthropic key/token, or a Bedrock/Vertex routing flag whose own cloud credentials then
-    apply. The subscription OAuth token is deliberately excluded — it bills the plan, not
-    the API. An empty variable does not count.
+    apply. A Codex API key persisted by ``codex login --with-api-key`` also counts. The
+    subscription OAuth token is deliberately excluded — it bills the plan, not the API.
     """
     variables = API_AUTH_ENV_VARS if provider == "claude" else CODEX_API_AUTH_ENV_VARS
-    return any(os.environ.get(var) for var in variables)
+    available = any(os.environ.get(var) for var in variables)
+    return available or (provider == "codex" and _codex_persisted_auth_mode() == "api")
 
 
 def resolve_auth_mode(
@@ -595,22 +620,22 @@ def build_agent_env(
 ) -> dict[str, str]:
     """Prepare an isolated agent's environment for a resolved auth mode.
 
-    Pairs the two steps that must agree: in ``"session"`` mode the subscription OAuth login is
-    seeded into ``config_dir`` (only ``.credentials.json`` is copied — never settings, memories,
-    or skills, so isolation is unchanged), and the API/cloud variables are stripped from the
-    env; in ``"api"`` mode nothing is seeded and the OAuth token is stripped instead. Either
-    way exactly one credential reaches the run, so billing is deterministic.
+    Pairs the two steps that must agree. Claude seeds its subscription OAuth login only in
+    ``"session"`` mode. Codex stores both account and API-key logins in ``auth.json``, so the
+    file is seeded only when its classified mode matches ``auth_mode``. Environment credentials
+    for the other mode are stripped either way, keeping billing deterministic.
 
     Every isolated agent (bench sandboxes and the draft/improve/tasks meta-agents) builds its
     env through here, so the seed-and-scrub pairing lives in one place. ``extra_allow`` (the
     operator's ``env_passthrough``) names variables to carry through on top of the built-in
     allowlist, for a target that needs one at runtime.
     """
-    if auth_mode == "session":
-        if provider == "claude":
-            seed_credentials(config_dir)
-        else:
-            seed_codex_credentials(config_dir)
+    if provider == "claude" and auth_mode == "session":
+        seed_credentials(config_dir)
+    elif provider == "codex" and _codex_persisted_auth_mode() == auth_mode:
+        # Codex stores either account tokens or an API key in auth.json. Copy only the
+        # credential matching the resolved mode into the isolated CODEX_HOME.
+        seed_codex_credentials(config_dir)
     return scrubbed_env(
         config_dir=config_dir,
         home=home,

@@ -220,7 +220,15 @@ class LiveLog:
             return {"type": "system", "subtype": "turn.started"}
         if kind == "turn.completed":
             usage = message.get("usage")
-            return {"type": "result", "turns": 1, "cost_usd": None, "usage": usage}
+            return {
+                "type": "result",
+                "is_error": False,
+                "subtype": "turn.completed",
+                "turns": 1,
+                "cost_usd": None,
+                "duration_s": None,
+                "usage": usage,
+            }
         if kind in {"error", "turn.failed"}:
             return {
                 "type": "result",
@@ -333,9 +341,14 @@ class LiveLog:
                 name = res.get("name") or "tool"
                 lines.append(f"  {mark} {name} ({res['chars']} chars)")
         elif kind == "result":
-            mark = "✗ error" if event["is_error"] else "● done"
-            lines.append(
-                f"{mark}: {event['subtype']} · {event['turns']} turns · "
-                f"${event['cost_usd']:.2f} · {event['duration_s']}s"
-            )
+            is_error = bool(event.get("is_error"))
+            mark = "✗ error" if is_error else "● done"
+            parts = [str(event.get("subtype") or ("error" if is_error else "completed"))]
+            if event.get("turns") is not None:
+                parts.append(f"{event['turns']} turns")
+            cost = event.get("cost_usd")
+            parts.append(f"${cost:.2f}" if isinstance(cost, int | float) else "cost n/a")
+            if event.get("duration_s") is not None:
+                parts.append(f"{event['duration_s']}s")
+            lines.append(f"{mark}: {' · '.join(parts)}")
         return lines

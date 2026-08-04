@@ -205,6 +205,17 @@ def normalize_usage(usage: dict | None, *, provider: str = "claude") -> Usage:
     )
 
 
+def price_usage(
+    usage: dict | None,
+    *,
+    model: str,
+    provider: str = "claude",
+    overrides: dict[str, Rates] | None = None,
+) -> float | None:
+    """Price a provider usage payload through the shared model-rate table."""
+    return price_run(normalize_usage(usage, provider=provider), resolve_rates(model, overrides))
+
+
 def pricer(model: str, overrides: dict[str, Rates] | None = None) -> Callable[[dict], float | None]:
     """A usage→USD hook for a provider that reports no billed figure of its own.
 
@@ -213,8 +224,7 @@ def pricer(model: str, overrides: dict[str, Rates] | None = None) -> Callable[[d
     could be stopped at a budget it is not billed against. Returns ``None`` for an unpriced
     model, which callers must read as "no cap can be enforced", never as "free".
     """
-    rates = resolve_rates(model, overrides)
-    return lambda usage: price_run(normalize_usage(usage, provider="codex"), rates)
+    return lambda usage: price_usage(usage, model=model, provider="codex", overrides=overrides)
 
 
 def price_run(usage: Usage, rates: Rates | None) -> float | None:

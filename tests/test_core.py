@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
@@ -27,6 +28,7 @@ import acumen
 from acumen.agents import (
     AgentError,
     AgentOptions,
+    AgentResult,
     _codex_terminal,
     _install_codex_guard,
     check_agent_cli,
@@ -50,7 +52,7 @@ from acumen.improve import _write_material, collect_train_runs, load_rates
 from acumen.logs import LiveLog
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
 from acumen.pricefeed import PriceFeedError, diff_rates, parse_anthropic, parse_openai
-from acumen.prices import DEFAULT_RATES, Rates, Usage, normalize_usage, price_run, pricer, resolve_rates
+from acumen.prices import DEFAULT_RATES, Rates, Usage, normalize_usage, price_run, price_usage, pricer, resolve_rates
 from acumen.procs import label_env, reap, supported, survivors
 from acumen.prompts import draft_prompt, feedback_block, improve_prompt
 from acumen.report import (
@@ -66,16 +68,19 @@ from acumen.report import (
     _skill_diff_html,
     _split_diff_rows,
     _tests_table_html,
+    arm_metrics,
     load_results,
+    loaded_only_rates,
     metrics_figure,
     resolve_palette,
     skill_tests,
     tradeoff_figure,
 )
-from acumen.runner import StderrFilter, _skill_fired, _terminal_reason
+from acumen.runner import StderrFilter, _skill_fired, _terminal_reason, run_once
+from acumen.sandbox import Sandbox
 from acumen.ship import _ship_env
 from acumen.skills import SkillError, load_skill, read_meta, skill_hash, write_meta
-from acumen.tasks import TaskError, load_tasks, parse_tasks
+from acumen.tasks import Task, TaskError, TaskSplit, load_tasks, parse_tasks
 from acumen.transcript import render_agent_transcript, render_codex_transcript
 
 # --- grading ---------------------------------------------------------------------------
@@ -553,6 +558,23 @@ def test_live_log_records_codex_without_the_claude_sdk(tmp_path: Path, monkeypat
     assert events[0]["text"] == "done"
 
 
+def test_live_log_streams_codex_terminal_events_without_missing_field_crashes(tmp_path: Path) -> None:
+    lines: list[str] = []
+    with LiveLog(tmp_path / "log.jsonl", stream=True, echo=lines.append) as log:
+        log.append(
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": 12, "cached_input_tokens": 3, "output_tokens": 4},
+            }
+        )
+        log.append({"type": "turn.failed", "error": {"message": "boom"}})
+
+    assert lines == [
+        "● done: turn.completed · 1 turns · cost n/a",
+        "✗ error: turn.failed · cost n/a",
+    ]
+
+
 def test_usage_normalizes_both_providers_without_collapsing_the_cache_split() -> None:
     """The cache classes are priced up to 10x apart, so they must survive normalization.
 
@@ -613,10 +635,86 @@ def test_price_run_bills_each_cache_class_at_its_own_rate() -> None:
     assert collapsed > price_run(usage, rates) * 3
 
 
+def test_price_usage_prices_codex_meta_agent_tokens_when_provider_cost_is_absent() -> None:
+    cost = price_usage(
+        {"input_tokens": 1_000_000, "cached_input_tokens": 0, "output_tokens": 1_000_000},
+        model="gpt-5.6-sol",
+        provider="codex",
+    )
+
+    assert cost == pytest.approx(35.0)
+
+
 def test_price_run_leaves_an_unpriced_model_unpriced_rather_than_free() -> None:
     """``None`` is not ``0.0`` — a model with no rates must not read as a free one."""
     assert resolve_rates("some-local-llm") is None
     assert price_run(Usage(input=1, cache_read=0, cache_write=0, output=1), None) is None
+
+
+def test_benchmark_persists_unavailable_cost_as_null(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    box_root = tmp_path / "box"
+    box_root.mkdir()
+    box = Sandbox(
+        root=box_root,
+        home=tmp_path / "home",
+        config_dir=tmp_path / "codex-home",
+        env={},
+        authenticated=True,
+        provider="codex",
+    )
+
+    @contextmanager
+    def fake_sandbox(*_args, **_kwargs):
+        yield box
+
+    async def fake_run_agent(*_args, **_kwargs) -> AgentResult:
+        return AgentResult(
+            provider="codex",
+            is_error=False,
+            subtype="success",
+            errors=None,
+            session_id="thread-1",
+            result="done",
+            num_turns=1,
+            total_cost_usd=None,
+            duration_ms=100,
+            usage={"input_tokens": 10, "output_tokens": 2},
+        )
+
+    def collect(_box: Sandbox, directory: Path) -> None:
+        (directory / "answer.md").write_text("OK")
+
+    monkeypatch.setattr("acumen.runner.sandbox", fake_sandbox)
+    monkeypatch.setattr("acumen.runner.run_agent", fake_run_agent)
+    monkeypatch.setattr("acumen.runner._collect_artifacts", collect)
+    monkeypatch.setattr("acumen.runner.render_agent_transcript", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr("acumen.runner.agent_version", lambda _provider: "test")
+
+    run_dir = tmp_path / "run"
+    outcome = asyncio.run(
+        run_once(
+            key=RunKey(arm="noskill", split="test", model="gpt-unpriced", task_id="task", rep=1),
+            task=Task(id="task", train=TaskSplit("prompt", "OK"), test=TaskSplit("prompt", "OK")),
+            target=Target(
+                source="target",
+                ref="main",
+                src_dir=tmp_path / "src",
+                venv_dir=tmp_path / "venv",
+                commit="abc",
+                pkg_name="target",
+                pkg_version="1",
+            ),
+            run_dir=run_dir,
+            model="gpt-unpriced",
+            max_turns=1,
+            max_usd=1.0,
+        )
+    )
+
+    persisted = json.loads((run_dir / "result.json").read_text())
+    assert outcome.payload["cost_usd"] is None
+    assert persisted["cost_usd"] is None
+    assert persisted["cost_available"] is False
 
 
 def test_resolve_rates_accepts_provider_qualified_ids_and_config_overrides() -> None:
@@ -988,6 +1086,35 @@ def test_codex_auth_resolution_and_isolated_env(tmp_path: Path, monkeypatch: pyt
     assert api_env["CODEX_API_KEY"] == "sk-openai"
 
 
+def test_codex_persisted_api_key_is_api_auth_not_a_subscription(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_home = tmp_path / "real-codex"
+    real_home.mkdir()
+    (real_home / "auth.json").write_text('{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-stored"}')
+    monkeypatch.setenv("CODEX_HOME", str(real_home))
+    monkeypatch.delenv("CODEX_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    assert not session_auth_available("codex")
+    assert api_auth_available("codex")
+    assert resolve_auth_mode("auto", provider="codex") == "api"
+    assert resolve_auth_mode("api", provider="codex") == "api"
+    with pytest.raises(EnvError, match="--auth session"):
+        resolve_auth_mode("session", provider="codex")
+
+    isolated = tmp_path / "isolated-codex"
+    env = build_agent_env(
+        config_dir=isolated,
+        home=tmp_path / "home",
+        auth_mode="api",
+        provider="codex",
+    )
+    assert json.loads((isolated / "auth.json").read_text())["auth_mode"] == "apikey"
+    assert env["CODEX_API_KEY"] == ""
+    assert not env.get("OPENAI_API_KEY")
+
+
 def test_scrubbed_env_never_carries_the_other_providers_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1240,6 +1367,32 @@ def test_load_warning_needs_most_of_the_arm_to_miss(
     notes = _integrity_notes(load_results(runs_root))
 
     assert bool(notes) is warned
+
+
+def test_unpriced_runs_are_unknown_in_reports_not_zero_cost(
+    runs_root: Path, model: str, make_result, tmp_path: Path
+) -> None:
+    key = RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=1)
+    make_result(runs_root, key, cost_usd=0.0, cost_available=False)
+
+    df = load_results(runs_root)
+    test = df[df["split"] == "test"]
+    assert test["cost_usd"].isna().all()
+    assert pd.isna(arm_metrics(test).loc[0, "cost"])
+    assert any("cost unavailable" in note for note in _integrity_notes(df))
+    assert "&mdash;" in _runs_table_html(test, tmp_path)
+
+    tests = skill_tests(df)
+    assert tests.cost_unavailable
+    assert not tests.usable
+    assert "Cost comparison unavailable" in _tests_table_html(tests)
+
+    figure = tradeoff_figure(df)
+    try:
+        assert _pooled_marks(figure) == []
+        assert _model_marks(figure) == []
+    finally:
+        plt.close(figure)
 
 
 # --- the cost/success trade-off figure --------------------------------------------------
@@ -1711,6 +1864,49 @@ def test_runs_table_ranks_a_skill_that_failed_to_load_above_one_that_loaded() ->
     ranks = [_loaded_rank(r) for r in (missed, loaded, unknown, baseline)]
 
     assert ranks == sorted(ranks, reverse=True)
+
+
+def _run(arm: str, model: str, success: bool, loaded: object, split: str = "test") -> dict:
+    return {"arm": arm, "model": model, "split": split, "success": success, "skill_loaded": loaded}
+
+
+def test_loaded_only_rates_pools_over_one_model_mix_on_both_sides() -> None:
+    """A model that never loaded the skill must leave the pooled baseline too.
+
+    Otherwise a model that fails every run — an outage, an unavailable id — depresses the
+    baseline while contributing nothing to the loaded side, manufacturing a gain from nothing.
+    """
+    rows = (
+        # A working model: loads the skill, same rate in both arms.
+        [_run("noskill", "good", True, None) for _ in range(4)]
+        + [_run("skill_v1", "good", True, True) for _ in range(4)]
+        # A broken model: fails everything and never loads the skill.
+        + [_run("noskill", "broken", False, None) for _ in range(4)]
+        + [_run("skill_v1", "broken", False, False) for _ in range(4)]
+    )
+    table = loaded_only_rates(pd.DataFrame(rows))
+    pooled = table[table["scope"] == "matched"].iloc[0]
+    raw = table[table["scope"] == "all"].iloc[0]
+
+    # Only the loading model is pooled, on both sides — so the skill shows no gain…
+    assert pooled["loaded"] == 4 and pooled["runs"] == 4
+    assert pooled["baseline"] == 1.0 and pooled["rate"] == 1.0
+    assert pooled["delta"] == 0.0
+    # …while the raw all-models row keeps the mix as it ran, and shows the artifact the
+    # matched row exists to expose: a +50% that is entirely the broken model leaving.
+    assert raw["runs"] == 8 and raw["baseline"] == 0.5 and raw["rate"] == 1.0
+    assert raw["delta"] == 0.5
+
+
+def test_loaded_only_rates_reports_a_model_that_never_loaded() -> None:
+    """The row still appears — a 0% load rate is the finding, not a reason to hide the model."""
+    rows = [_run("noskill", "m", True, None), _run("skill_v1", "m", False, False)]
+    table = loaded_only_rates(pd.DataFrame(rows))
+
+    row = table[table["model"] == "m"].iloc[0]
+    assert row["loaded"] == 0
+    assert row["load_rate"] == 0.0
+    assert pd.isna(row["rate"]) and pd.isna(row["delta"])
 
 
 # --- split diff ------------------------------------------------------------------------

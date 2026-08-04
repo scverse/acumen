@@ -135,8 +135,8 @@ async def run_matrix(
     max_concurrency
         Ceiling on simultaneous agents.
     auth_mode
-        Which credential every run authenticates with; benchmark passes always use ``"api"``
-        so the recorded ``cost_usd`` reflects real metered spend.
+        Which credential every run authenticates with. Under ``"session"``, the recorded
+        ``cost_usd`` is the equivalent API-rate cost derived from tokens, not metered spend.
     skill
         The skill every run in this matrix installs, or ``None`` for the baseline. One
         matrix is one arm, so this is a property of the pass rather than of a run.

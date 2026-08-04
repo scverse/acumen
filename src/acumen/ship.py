@@ -43,7 +43,7 @@ from acumen.env import (
     agent_cli_dir,
 )
 from acumen.logs import LiveLog
-from acumen.prices import pricer
+from acumen.prices import price_usage, pricer
 from acumen.procs import label_env, reap
 from acumen.prompts import ship_prompt
 from acumen.skills import Skill, content_files, load_skill
@@ -65,7 +65,7 @@ class ShipResult:
     mode: str
     #: The agent's final message — for a GitHub target it carries the PR URL.
     summary: str
-    cost_usd: float
+    cost_usd: float | None
     turns: int
     #: Live log paths for this run, when a :class:`LiveLog` was attached.
     log_jsonl: Path | None = None
@@ -305,7 +305,12 @@ async def ship_skill(
             skill=skill,
             mode=mode,
             summary=result.result or "",
-            cost_usd=result.total_cost_usd or 0.0,
+            cost_usd=price_usage(
+                result.usage,
+                model=selected_model,
+                provider=result.provider,
+                overrides=cfg.prices,
+            ),
             turns=result.num_turns,
             log_jsonl=log.jsonl_path if log is not None else None,
             log_html=log.html_path if log is not None and log.html_rendered else None,

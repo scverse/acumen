@@ -55,18 +55,31 @@ SURFACE = "#f7f3ec"  # the one tinted surface — the inline skill diffs, so cod
 BAR = "#565149"  # a neutral tone, used where model hue does not apply
 ACCENT = "#b2ac9e"  # the light warm tone, for table tints and notes
 
-# The model is the hue: a single-hue ramp keyed to model "potency". The most capable model
-# (Fable) is the DARKEST / most saturated — the Claude orange — and each weaker tier is a
-# lighter tint of that same hue. The mapping is fixed by *tier* (parsed from the model id),
-# so a given tier always reads the same colour regardless of which — or how many — models a
-# pass happens to include. This is only the *default*: a caller can recolour any model by id
-# (see :func:`resolve_palette`), while the page and plot surfaces above stay fixed.
-_MODEL_ORDER = ("fable", "opus", "sonnet", "haiku")
+# The model is the hue, in two dimensions: the *provider* picks the hue family, and the tier
+# picks the step within it — darkest is most potent, each weaker tier a lighter step of the
+# same hue. The mapping is fixed by *tier* (parsed from the model id), so a given tier always
+# reads the same colour regardless of which — or how many — models a pass happens to include.
+# This is only the *default*: a caller can recolour any model by id (see
+# :func:`resolve_palette`), while the page and plot surfaces above stay fixed.
+#
+# The second family is teal, not green, and that is not a taste call. Orange and green are the
+# pair red-green colourblind readers cannot separate: a green ramp built parallel to the orange
+# one below scores ΔE 1.2 against it under simulated deuteranopia (OKLab ×100; ≥8 is the
+# target, and darkening the green only reaches 7.2). Teal is the nearest hue that clears the
+# gate — deuteranopia 14.9, protanopia 8.2, normal-vision 23.7 — so the two providers stay
+# distinguishable in every vision type. Train/test already spends the texture channel, so
+# colour is the only thing carrying provider identity here; it has to work on its own.
+_MODEL_ORDER = ("fable", "opus", "sonnet", "haiku", "sol", "luna", "terra")
 _MODEL_COLOR = {
+    # Anthropic — the warm ramp.
     "fable": "#d86f53",  # Claude orange — most potent, darkest/most saturated
     "opus": "#e18c74",  # a lighter tint
     "sonnet": "#e8a794",  # lighter still
     "haiku": "#eec0b0",  # lightest — least potent
+    # OpenAI — the cool ramp, stepped over the same lightness span.
+    "sol": "#005661",  # darkest
+    "luna": "#007782",
+    "terra": "#0099a3",  # lightest
 }
 _OTHER_MODEL_COLOR = "#8a8378"  # neutral fallback for an unrecognised model id
 
@@ -226,6 +239,12 @@ def load_results(runs_root: Path) -> pd.DataFrame:
         raise ReportError(f"no {RESULT_FILE} files under {runs_root} — run `acumen bench` first")
 
     df = pd.DataFrame(rows)
+    # New results carry an explicit availability flag; legacy results predate it and their
+    # numeric cost remains usable. An unavailable price is NaN inside pandas so every normal
+    # aggregation propagates "unknown" instead of silently treating the run as free.
+    available = df.get("cost_available", pd.Series(True, index=df.index)).fillna(True).astype(bool)
+    df["cost_usd"] = pd.to_numeric(df["cost_usd"], errors="coerce")
+    df.loc[~available, "cost_usd"] = math.nan
     df["total_tokens"] = df["input_tokens"] + df["output_tokens"]
     df["arm_label"] = df["arm"].map(arm_label)
     df["_arm_order"] = df["arm"].map(_arm_sort_key)
@@ -285,7 +304,7 @@ def arm_metrics(df: pd.DataFrame) -> pd.DataFrame:
                 "rate": rate,
                 "stderr": stderr,
                 "tokens": float(group["total_tokens"].sum()),
-                "cost": float(group["cost_usd"].sum()),
+                "cost": (float(group["cost_usd"].sum()) if group["cost_usd"].notna().all() else math.nan),
                 "time": float(group["duration_s"].sum()),
                 "n": len(group),
             }
@@ -305,6 +324,10 @@ def arm_metrics(df: pd.DataFrame) -> pd.DataFrame:
 #: table, which is now the same unit — because a per-run mean can sit well under a cent.
 _COLUMNS = [
     ("Success rate", "rate", mticker.PercentFormatter(1.0), lambda v: f"{v:.0%}"),
+    # Directly right of the headline rate and on the same 0–1 axis, so the pair is read as one
+    # comparison: the same bar with the runs that never read the skill taken out. A missing bar
+    # here means nothing loaded in that cell, which is the finding, not a gap in the data.
+    ("Success when loaded", "rate_loaded", mticker.PercentFormatter(1.0), lambda v: f"{v:.0%}"),
     ("Skill loaded", "loaded", mticker.PercentFormatter(1.0), lambda v: f"{v:.0%}"),
     ("Tokens / run", "tokens", mticker.FuncFormatter(lambda v, _p: _fmt_tokens(v)), _fmt_tokens),
     ("Cost / run", "cost", mticker.FuncFormatter(lambda v, _p: f"${v:.3f}"), lambda v: f"${v:.3f}"),
@@ -314,6 +337,12 @@ _COLUMNS = [
 #: Metric key → the boolean column it averages. A proportion is the mean of a 0/1 column, so
 #: it is a per-run mean like the rest; it differs only in being drawn on a fixed 0–1 axis.
 _PROPORTION_COLUMN = {"rate": "success", "loaded": "skill_loaded"}
+
+#: Keys drawn on the fixed 0–1 axis. A superset of :data:`_PROPORTION_COLUMN`: ``rate_loaded``
+#: is a proportion too, but of a *filtered* subset rather than of a whole column, so it is
+#: computed separately while still sharing the percentage axis — which is what lets it be read
+#: against the success rate beside it.
+_PROPORTION_KEYS = frozenset({*_PROPORTION_COLUMN, "rate_loaded"})
 
 #: Metric key → the resource column it averages (the proportions are handled separately).
 _MEAN_COLUMN = {"tokens": "total_tokens", "cost": "cost_usd", "time": "duration_s"}
@@ -397,7 +426,11 @@ def resolve_palette(models: Sequence[str], overrides: Mapping[str, str] | None =
 
 
 def _models_in_order(df: pd.DataFrame) -> list[str]:
-    """Models present, most-potent first (fable, opus, sonnet, haiku), then any others."""
+    """Models present, grouped by provider and most-potent first, then any others.
+
+    Anthropic's tiers lead (fable, opus, sonnet, haiku), then OpenAI's (sol, luna, terra), so
+    each provider's ramp reads as a run of one hue rather than being interleaved with the other.
+    """
 
     def key(model: str) -> tuple[int, str]:
         tier = _model_tier(model)
@@ -441,11 +474,22 @@ def _cell_value(df: pd.DataFrame, arm: str, model: str, split: str, key: str) ->
     group = df[rows if model == _ALL_MODELS else rows & (df["model"] == model)]
     if group.empty:
         return 0.0, 0.0, False
+    if key == "rate_loaded":
+        # Success among the runs that actually read the skill. A cell with nothing loaded —
+        # every baseline cell, and any model whose description never fired — draws no bar
+        # rather than a zero, because "never measured" is not "measured zero".
+        loaded = group[_loaded_flags(group)]
+        if loaded.empty:
+            return math.nan, 0.0, False
+        rate, error = _rate_and_error(loaded["success"])
+        return rate, error, True
     if key in _PROPORTION_COLUMN:
         flags = _loaded_flags(group) if key == "loaded" else group[_PROPORTION_COLUMN[key]]
         rate, error = _rate_and_error(flags)
         return rate, error, True
     values = group[_MEAN_COLUMN[key]]
+    if key == "cost" and values.isna().any():
+        return math.nan, 0.0, False
     mean = float(values.mean())
     error = float(values.std(ddof=1)) / math.sqrt(len(values)) if len(values) > 1 else 0.0
     return mean, error, True
@@ -546,7 +590,13 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, st
         # per-row breathing room, not a fixed block, so few-model plots stay compact.
         row_h = 0.26 * max_bars + 0.22
         fig, axes = plt.subplots(
-            n_rows, len(_COLUMNS), sharex="col", squeeze=False, figsize=(10.0, n_rows * row_h + 0.6)
+            # Width scales with the column count so adding a metric widens the figure rather
+            # than squeezing every column's labels into the same 10 inches.
+            n_rows,
+            len(_COLUMNS),
+            sharex="col",
+            squeeze=False,
+            figsize=(2.0 * len(_COLUMNS), n_rows * row_h + 0.6),
         )
         for c, (title, key, formatter, value_label) in enumerate(_COLUMNS):
             for r, arm in enumerate(arms):
@@ -559,7 +609,7 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, st
                 if c == 0:
                     ax.set_ylabel(_skill_label(arm), rotation=0, ha="right", va="center", fontweight="bold")
             # sharex="col" ties the whole column together, so one xlim covers every row.
-            if key in _PROPORTION_COLUMN:
+            if key in _PROPORTION_KEYS:
                 axes[-1][c].set_xlim(0, 1.28)
             else:
                 reach = max(
@@ -915,7 +965,7 @@ def _cluster_totals(df: pd.DataFrame, arms: Sequence[str]) -> tuple[np.ndarray, 
     for ci, cluster in enumerate(clusters):
         for ai, arm in enumerate(arms):
             rows = test[(test[_CLUSTER_COLUMN] == cluster) & (test["arm"] == arm)]
-            cost[ci, ai] = rows["cost_usd"].sum()
+            cost[ci, ai] = rows["cost_usd"].sum() if rows["cost_usd"].notna().all() else math.nan
             successes[ci, ai] = rows["success"].sum()
             runs[ci, ai] = len(rows)
     return cost, successes, runs
@@ -1002,6 +1052,7 @@ class SkillTests:
     comparisons: pd.DataFrame
     baseline: str
     n_clusters: int
+    cost_unavailable: bool = False
 
     @property
     def usable(self) -> bool:
@@ -1035,8 +1086,16 @@ def skill_tests(df: pd.DataFrame, *, resamples: int = _BOOTSTRAP_RESAMPLES, seed
     cost, successes, runs = _cluster_totals(df, arms)
     n_clusters = len(cost)
     baseline = arms[0] if arms else NOSKILL_ARM  # noskill sorts first when it is present
+    empty = pd.DataFrame(columns=["challenger", "reference", "d_rate", "d_cost", "p", "p_adjusted"])
+    if np.isnan(cost).any():
+        return SkillTests(
+            arms=pd.DataFrame(columns=["arm", "rate", "cost", "frontier"]),
+            comparisons=empty,
+            baseline=baseline,
+            n_clusters=n_clusters,
+            cost_unavailable=True,
+        )
     if n_clusters < _MIN_CLUSTERS or len(arms) < 2:
-        empty = pd.DataFrame(columns=["challenger", "reference", "d_rate", "d_cost", "p", "p_adjusted"])
         return SkillTests(
             arms=pd.DataFrame(columns=["arm", "rate", "cost", "frontier"]),
             comparisons=empty,
@@ -1128,6 +1187,12 @@ def _best_cells(values: Sequence[float | None], *, highest: bool) -> set[int]:
 
 def _tests_table_html(tests: SkillTests) -> str:
     """The significance table: one row per arm, with the best value in each column set bold."""
+    if tests.cost_unavailable:
+        return (
+            '<div class="note">Cost comparison unavailable: at least one reported test run '
+            "has no configured model rate. Add a rate and rerun that benchmark before drawing "
+            "cost or Pareto conclusions.</div>"
+        )
     if not tests.usable:
         return (
             f'<div class="note">Not enough to test: a paired bootstrap needs at least {_MIN_CLUSTERS} '
@@ -1172,6 +1237,165 @@ def _tests_table_html(tests: SkillTests) -> str:
 </table></div>"""
 
 
+def loaded_only_rates(df: pd.DataFrame) -> pd.DataFrame:
+    """Success rate restricted to the runs that actually loaded the skill, per skill and model.
+
+    A skill-arm run where the skill never loaded is not evidence about the skill's *body*: the
+    agent never read it, so the run measures the baseline with extra steps. Pooling those runs
+    into the arm's headline rate drags a skill toward the baseline in exactly the case where
+    the thing to fix is the frontmatter ``description`` rather than the guidance — and the load
+    rate varies enormously by model, so the dilution is uneven across the matrix.
+
+    This is the overview's comparison with those runs held out instead of counted against the
+    skill. It is deliberately *not* the headline number: conditioning on load is conditioning on
+    something the agent chose, so the loaded runs are not a random subset and this cannot prove
+    a skill works. It answers the narrower question — when the guidance did reach the agent, did
+    it help? — and separates a description problem from a content problem.
+
+    Two pooled rows close each skill, and the pair is the point. ``all models`` pools every
+    model in the arm; ``models that loaded`` restricts **both sides** to the models that
+    contributed at least one loaded run. When they disagree, the gap is model mix rather than
+    skill effect — a model that fails every run (an outage, an unavailable id) sits in the
+    all-models baseline while contributing nothing to the loaded column, which on its own would
+    manufacture a gain out of an absence. Reporting only the matched row would hide that the
+    arm's headline moved; reporting only the raw row would credit the skill for it.
+
+    Returns
+    -------
+    One row per (arm, model) over the reported split, then the two pooled rows per arm.
+    Columns: ``arm``, ``model``, ``scope`` (``"model"``, ``"all"`` or ``"matched"``),
+    ``loaded``, ``runs``, ``load_rate``, ``baseline``, ``overall`` (the arm's rate over every
+    run, which is what the overview reports), ``rate`` (successes among loaded runs only), and
+    ``delta`` (``rate - baseline``). ``overall`` and ``rate`` are shown side by side because the
+    distance between them *is* the dilution the non-loading runs cause. ``rate`` is ``NaN``
+    where nothing loaded, and ``baseline`` is ``NaN`` where that model has no baseline runs.
+    """
+    test = df[df["split"] == _REPORTED_SPLIT]
+    arms = [arm for arm in _arms_in_order(test) if arm != NOSKILL_ARM]
+    base = test[test["arm"] == NOSKILL_ARM]
+    records: list[dict[str, object]] = []
+    for arm in arms:
+        subset = test[test["arm"] == arm]
+        contributing = {
+            model for model in subset["model"].unique() if _loaded_flags(subset[subset["model"] == model]).any()
+        }
+        plan: list[tuple[str, object, pd.DataFrame, pd.DataFrame]] = [
+            ("model", model, subset[subset["model"] == model], base[base["model"] == model])
+            for model in _models_in_order(subset)
+        ]
+        plan.append(("all", _ALL_MODELS, subset, base))
+        plan.append(
+            (
+                "matched",
+                _LOADED_MODELS,
+                subset[subset["model"].isin(contributing)],
+                base[base["model"].isin(contributing)],
+            )
+        )
+        for scope, model, runs, reference in plan:
+            if runs.empty:
+                continue
+            loaded = runs[_loaded_flags(runs)]
+            rate = float(loaded["success"].mean()) if len(loaded) else math.nan
+            overall = float(runs["success"].mean())
+            baseline = float(reference["success"].mean()) if len(reference) else math.nan
+            records.append(
+                {
+                    "arm": arm,
+                    "model": model,
+                    "scope": scope,
+                    "loaded": len(loaded),
+                    "runs": len(runs),
+                    "load_rate": len(loaded) / len(runs),
+                    "baseline": baseline,
+                    # The arm as it ran (what the overview reports) beside the arm with the
+                    # non-loading runs held out. The gap between them is the dilution.
+                    "overall": overall,
+                    "rate": rate,
+                    "delta": rate - baseline,
+                }
+            )
+    return pd.DataFrame.from_records(records, columns=_LOADED_COLUMNS)
+
+
+#: Column order for :func:`loaded_only_rates`, so an empty frame still has the right shape.
+_LOADED_COLUMNS = (
+    "arm",
+    "model",
+    "scope",
+    "loaded",
+    "runs",
+    "load_rate",
+    "baseline",
+    "overall",
+    "rate",
+    "delta",
+)
+
+#: Sentinel for the pooled row that restricts both sides to the models which loaded the skill,
+#: alongside :data:`_ALL_MODELS` for the row that pools the arm as it actually ran.
+_LOADED_MODELS = "\x00loaded-models"
+_LOADED_MODELS_LABEL = "models that loaded"
+
+#: Loaded runs below this count are reported without a direction. The rate is still shown —
+#: it is what was measured — but a delta off one or two runs is noise wearing a percentage,
+#: and colouring it green would read as a finding.
+_MIN_LOADED = 5
+
+
+def _loaded_table_html(df: pd.DataFrame) -> str:
+    """The loaded-only comparison: one row per model per skill, pooled row per skill."""
+    table = loaded_only_rates(df)
+    if table.empty:
+        return '<div class="note">No skill arm to compare — this report covers the baseline only.</div>'
+
+    def pct(value: float) -> str:
+        return "&mdash;" if pd.isna(value) else f"{value:.0%}"
+
+    def signed(value: float) -> str:
+        # A difference that rounds to nothing is written "0%", never "-0%": the sign would
+        # claim a direction the rounding just erased.
+        return "0%" if round(value, 2) == 0 else f"{value:+.0%}"
+
+    labels = {"all": _ALL_MODELS_LABEL, "matched": _LOADED_MODELS_LABEL}
+    thin = False
+    body = []
+    for row in table.itertuples():
+        pooled = row.scope != "model"
+        label = labels.get(row.scope) or _model_label(row.model)
+        if pd.isna(row.delta):
+            delta = "&mdash;"
+        elif row.loaded < _MIN_LOADED:
+            # Shown, but undressed: too few runs to read a direction from.
+            thin = True
+            delta = f"{signed(row.delta)}&#8203;<sup>†</sup>"
+        elif round(row.delta, 2) == 0:
+            delta = signed(row.delta)
+        else:
+            delta = f'<span class="{"gain" if row.delta > 0 else "loss"}">{signed(row.delta)}</span>'
+        cells = (
+            f"<td>{_skill_label(row.arm)}</td><td>{html.escape(label)}</td>"
+            f"<td>{row.loaded}/{row.runs}</td><td>{pct(row.load_rate)}</td>"
+            f"<td>{pct(row.baseline)}</td><td>{pct(row.overall)}</td>"
+            f"<td>{pct(row.rate)}</td><td>{delta}</td>"
+        )
+        body.append(f'<tr class="{"pooled" if pooled else ""}">{cells}</tr>')
+
+    footnote = (
+        f'<p class="task-desc">† fewer than {_MIN_LOADED} loaded runs — the rate is what was '
+        "measured, but the difference is not readable at that count.</p>"
+        if thin
+        else ""
+    )
+    return f"""<div class="table-center"><table class="tests loaded">
+<thead><tr>
+<th>Skill</th><th>Model</th><th>Loaded</th><th>Load rate</th>
+<th>Baseline</th><th>All runs</th><th>When loaded</th><th>&Delta; loaded</th>
+</tr></thead>
+<tbody>{"".join(body)}</tbody>
+</table>{footnote}</div>"""
+
+
 @dataclass(frozen=True)
 class Report:
     """A rendered report and the data behind it."""
@@ -1197,6 +1421,12 @@ def _integrity_notes(df: pd.DataFrame) -> list[str]:
     only flagged once fewer than half its runs loaded the skill.
     """
     notes = []
+    unpriced = int(df["cost_usd"].isna().sum())
+    if unpriced:
+        notes.append(
+            f"cost unavailable for {unpriced}/{len(df)} runs; cost charts and comparisons omit "
+            "groups containing unpriced runs"
+        )
     if "skill_loaded" not in df.columns:
         return notes
     for arm in _arms_in_order(df):
@@ -1287,6 +1517,8 @@ def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
         else:
             link = "&mdash;"
         status = "pass" if row["success"] else "fail"
+        cost = row["cost_usd"]
+        cost_cell = ("&mdash;", None) if pd.isna(cost) else (f"{float(cost):.3f}", float(cost))
         cells: list[tuple[str, float | None]] = [
             (html.escape(str(row["arm_label"])), None),
             (html.escape(str(row["split"])), None),
@@ -1297,7 +1529,7 @@ def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
             (html.escape(str(row["reason"])), None),
             (str(int(row["turns"])), float(row["turns"])),
             (f"{int(row['total_tokens']):,}", float(row["total_tokens"])),
-            (f"{float(row['cost_usd']):.3f}", float(row["cost_usd"])),
+            cost_cell,
             (_fmt_seconds(float(row["duration_s"])), float(row["duration_s"])),
             (link, None),
         ]
@@ -1345,6 +1577,13 @@ th:first-child, td:first-child {{ text-align: left; }}
 thead th {{ background: {BAR}1a; }}
 tbody tr:nth-child(even) td {{ background: {INK}08; }}
 tr.fail td {{ background: {ACCENT}66; }}
+/* The loaded-only table names models in its second column, and closes each skill with a
+   pooled row summarising the ones above it. The delta's sign carries the direction; colour
+   only reinforces it, so the pair is never read by hue alone. */
+table.loaded td:nth-child(2) {{ text-align: left; }}
+table.loaded tr.pooled td {{ font-weight: 600; background: {BAR}1f; }}
+.gain {{ color: #3f6b4a; }}
+.loss {{ color: #a4553f; }}
 /* Sorting affordances appear only once the script has wired the table up, so with JS off
    nothing invites a click that would do nothing. The arrow is padded for, not floated over
    the label, so the heading does not shift when the column becomes the sorted one. */
@@ -1731,7 +1970,8 @@ def render_report(
 <div class="toc-title">acumen report</div>
 <ul>
 <li><a href="#overview">Overview</a><ul><li><a href="#tradeoff">Cost vs. success</a></li>
-<li><a href="#dominance">Is the difference real?</a></li></ul></li>
+<li><a href="#dominance">Is the difference real?</a></li>
+<li><a href="#loaded">Did it help when it actually loaded?</a></li></ul></li>
 <li><a href="#per-task">Per-task breakdown</a><ul>{"".join(toc_tasks)}</ul></li>
 {skills_toc}
 <li><a href="#runs">Runs</a></li>
@@ -1780,6 +2020,20 @@ def render_report(
  across resamples. Resampling is over the {tests.n_clusters} test tasks, paired across arms, so the
  unit is the task rather than the run.</p>
 {_tests_table_html(tests)}
+<h3 id="loaded">Did it help when it actually loaded?</h3>
+<p class="task-desc">A skill-arm run where the skill never loaded is not evidence about the
+ skill's body — the agent never read it, so the run measures the baseline with extra steps.
+ Those runs are held out here instead of counted against the skill, which separates a
+ <em>description</em> problem (the skill does not load) from a <em>content</em> problem (it
+ loads and does not help). Load rate varies widely by model, so the dilution is uneven across
+ the matrix. Two pooled rows close each skill, and the pair is the point: <em>all models</em>
+ pools the arm as it actually ran, while <em>models that loaded</em> restricts both sides to the
+ models that contributed a loaded run. Where the two disagree, the gap is model mix, not skill
+ effect — a model that fails every run sits in the all-models baseline while contributing
+ nothing to the loaded column. Read this as a diagnostic, not as the headline: conditioning on
+ load conditions on something the agent chose, so the loaded runs are not a random subset and a
+ gain here is not the same evidence as the test above.</p>
+{_loaded_table_html(df)}
 </section>
 <section id="per-task">
 <h2>Per-task breakdown</h2>

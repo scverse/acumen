@@ -102,7 +102,8 @@ def sandbox(
         The prepared target; its venv ``bin`` goes on the sandbox PATH.
     auth_mode
         Which credential the run authenticates with (see :func:`acumen.env.build_agent_env`).
-        Benchmark runs always pass ``"api"`` so the recorded ``cost_usd`` is real.
+        Benchmark runs pass their resolved ``--auth`` mode. Under ``"session"``, recorded
+        ``cost_usd`` is the equivalent API-rate cost derived from tokens, not metered spend.
     base
         Parent directory for the sandbox. Defaults to the system temp dir.
     keep

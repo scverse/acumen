@@ -13,10 +13,11 @@ from pathlib import Path
 
 import pytest
 
-from acumen.cli import build_parser, main
+from acumen.cli import _Progress, build_parser, main
 from acumen.config import load_config
 from acumen.paths import RunKey
 from acumen.prices import RATES_AS_OF
+from acumen.runner import RunOutcome
 from acumen.tasks import load_tasks
 
 
@@ -39,6 +40,27 @@ def bench_args(project: Path, *extra: str) -> list[str]:
 def test_parser_requires_a_command() -> None:
     with pytest.raises(SystemExit):
         build_parser().parse_args([])
+
+
+def test_progress_prints_unavailable_cost_without_casting_null(capsys: pytest.CaptureFixture[str], model: str) -> None:
+    progress = _Progress(1)
+    progress.running = 1
+    progress.on_done(
+        RunOutcome(
+            key=RunKey(arm="noskill", split="test", model=model, task_id="task", rep=1),
+            success=True,
+            reason="ok",
+            payload={
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cost_usd": None,
+                "cost_available": False,
+                "duration_s": 0.1,
+            },
+        )
+    )
+
+    assert "cost n/a" in capsys.readouterr().out
 
 
 def test_init_writes_files_the_loaders_accept(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:

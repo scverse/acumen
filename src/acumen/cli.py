@@ -194,9 +194,9 @@ class _Progress:
         mark = "✓ pass" if outcome.success else "✗ FAIL"
         p = outcome.payload
         toks = int(p.get("input_tokens", 0)) + int(p.get("output_tokens", 0))
-        cost = float(p.get("cost_usd", 0.0))
         dur = _fmt_secs(float(p.get("duration_s", 0.0)))
-        cost_label = f"${cost:.2f}" if p.get("cost_available", True) else "cost n/a"
+        cost_available = p.get("cost_available", True) and p.get("cost_usd") is not None
+        cost_label = f"${float(p['cost_usd']):.2f}" if cost_available else "cost n/a"
         stats = f"{_fmt_tokens(toks)}tok {cost_label} {dur}"
         print(
             f"[{self._stamp()}] {mark} {_key_label(outcome.key)}"
@@ -213,6 +213,11 @@ def _fmt_tokens(value: int) -> str:
     if value >= 1000:
         return f"{value / 1000:.0f}k"
     return str(value)
+
+
+def _fmt_cost(value: float | None) -> str:
+    """Format a known cost without presenting unavailable pricing as free."""
+    return f"${value:.2f}" if value is not None else "cost n/a"
 
 
 def _cmd_bench(args: argparse.Namespace) -> int:
@@ -284,11 +289,18 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     passed = sum(1 for o in outcomes if o.success)
     counts = summarize(outcomes)
     breakdown = ", ".join(f"{reason}={n}" for reason, n in sorted(counts.items()))
-    total_cost = sum(float(o.payload.get("cost_usd", 0.0)) for o in outcomes)
-    unpriced = sum(not o.payload.get("cost_available", True) for o in outcomes)
-    cost_summary = f"${total_cost:.2f}"
-    if unpriced:
+    priced = [
+        float(o.payload["cost_usd"])
+        for o in outcomes
+        if o.payload.get("cost_available", True) and o.payload.get("cost_usd") is not None
+    ]
+    total_cost = sum(priced)
+    unpriced = len(outcomes) - len(priced)
+    cost_summary = f"${total_cost:.2f}" if priced else "cost n/a"
+    if unpriced and priced:
         cost_summary += f" + {unpriced} unpriced run(s)"
+    elif unpriced:
+        cost_summary += f" ({unpriced} unpriced run(s))"
     print(f"\n{passed}/{len(outcomes)} passed in {_fmt_secs(progress.elapsed)}  ({cost_summary}, {breakdown})")
 
     # The comparison is only meaningful if the skill actually reached the agent, so say
@@ -354,7 +366,7 @@ def _cmd_draft(args: argparse.Namespace) -> int:
     print(f"  description: {skill.description}")
     print(f"  hash:        {skill.hash}")
     print(f"  files:       {', '.join(files)}")
-    print(f"  cost:        ${result.cost_usd:.2f} over {result.turns} turns")
+    print(f"  cost:        {_fmt_cost(result.cost_usd)} over {result.turns} turns")
     _print_log_result(log)
     print(f"\nnext: acumen bench --skill {skill.version}")
     return 0
@@ -414,7 +426,7 @@ def _cmd_improve(args: argparse.Namespace) -> int:
     print(f"  hash:        {new.hash}")
     print(f"  files:       {', '.join(files)}")
     print(f"  evidence:    {result.n_train_runs} train runs ({result.n_train_failures} failing)")
-    print(f"  cost:        ${result.cost_usd:.2f} over {result.turns} turns")
+    print(f"  cost:        {_fmt_cost(result.cost_usd)} over {result.turns} turns")
     if new.hash == skill.hash:
         print(
             "warning: the new version is byte-identical to its parent — the improver changed nothing",
@@ -475,7 +487,7 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
         )
     print(f"\nwrote {result.out_path.resolve()}")
     print(f"  tasks: {len(result.tasks)} ({', '.join(t.id for t in result.tasks)})")
-    print(f"  cost:  ${result.cost_usd:.2f} over {result.turns} turns")
+    print(f"  cost:  {_fmt_cost(result.cost_usd)} over {result.turns} turns")
     _print_log_result(log)
     print("\nnext: review the tasks, then `acumen draft` and `acumen bench`")
     return 0
@@ -527,7 +539,7 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         )
     print(f"\nshipped {result.skill.version} of {result.skill.name}")
     print(f"  mode:  {'pull request' if result.mode == 'github' else 'working tree (local)'}")
-    print(f"  cost:  ${result.cost_usd:.2f} over {result.turns} turns")
+    print(f"  cost:  {_fmt_cost(result.cost_usd)} over {result.turns} turns")
     _print_log_result(log)
     if result.summary:
         print("\nagent summary:")

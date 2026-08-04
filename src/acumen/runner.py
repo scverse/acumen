@@ -228,8 +228,8 @@ async def run_once(
     model, max_turns, max_usd
         Already resolved against per-task overrides by the caller.
     auth_mode
-        Which credential benchmark runs authenticate with; always ``"api"`` so the recorded
-        ``cost_usd`` reflects real metered spend.
+        Which credential the benchmark run authenticates with. Under ``"session"``, recorded
+        ``cost_usd`` is the equivalent API-rate cost derived from tokens, not metered spend.
     skill
         The skill to install, or ``None`` for the baseline arm. Must agree with
         ``key.arm``, else the run would be filed under an arm it doesn't belong to.
@@ -343,7 +343,7 @@ async def run_once(
         "success": success,
         "reason": reason,
         "turns": result.num_turns if result else 0,
-        "cost_usd": computed or 0.0,
+        "cost_usd": computed,
         "cost_available": computed is not None,
         "provider_cost_usd": provider_cost,
         "price_rates": rates_payload(rates),

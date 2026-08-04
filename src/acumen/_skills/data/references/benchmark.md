@@ -6,6 +6,7 @@
 acumen bench [--no-skill | --skill v1] [--split train|test]... [--task ID]...
              [--replicates N] [--max-concurrency N] [--dry-run] [--no-resume]
              [--keep-sandboxes] [--refresh-target]
+             [--auth auto|session|api]
              [--config config.yaml] [--tasks tasks.yaml] [--runs runs] [--skills skills]
              [--cache ~/.cache/acumen]
 ```
@@ -15,8 +16,10 @@ acumen bench [--no-skill | --skill v1] [--split train|test]... [--task ID]...
 - `--dry-run` prints the planned matrix and exits **before** target prep and before any
   agent runs — free, and the right way to check the size of a pass.
 - `--replicates` / `--max-concurrency` override the config for this pass only.
-- Always bills the selected provider's API (`ANTHROPIC_API_KEY` for Claude;
-  `CODEX_API_KEY`/`OPENAI_API_KEY` for Codex); there is no `--auth` here.
+- `--auth auto` (default) prefers a stored account/subscription login, then falls back to
+  metered API credentials. Use `--auth session` or `--auth api` to require one explicitly.
+  Each run records the resolved mode; under `session`, `cost_usd` is the equivalent API-rate
+  cost computed from tokens, not money charged to the subscription.
 - Ctrl-C is safe: completed runs are preserved and the next invocation resumes.
 
 **Arm parity is the whole point.** Both arms get an identical prompt, tools, caps, and
@@ -54,7 +57,7 @@ resume safe. Useful fields: `success`, `reason`, `answer`, `expected`, `model`, 
 cost is those counts times the model's rates, which are frozen into the run as
 `price_rates` so old runs are never re-priced. The provider's own figure, where it exists,
 is kept alongside as `provider_cost_usd` for cross-checking. A model with no rate leaves
-`cost_available` false and `cost_usd` 0 — check the flag before summing. Inspect or
+`cost_available` false and `cost_usd` null, so reports cannot mistake it for a free run. Inspect or
 re-check the rate table with `acumen prices` / `acumen prices --refresh`, and set
 `prices:` in `config.yaml` to price an unlisted model.
 

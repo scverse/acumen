@@ -113,6 +113,14 @@ class AgentOptions:
     #: means pricing its usage ourselves — pass the caller's rate table in as this hook.
     #: Without it ``max_usd`` cannot be enforced for a Codex run.
     price_usd: Callable[[dict[str, Any]], float | None] | None = None
+    #: Codex's own sandbox mode. ``"workspace-write"`` is right nearly everywhere, but it needs
+    #: unprivileged user namespaces, which some hosts refuse — Ubuntu 24.04 restricts them by
+    #: AppArmor default, and containers often lack the capability. There bubblewrap cannot start
+    #: and every file write fails, so ``"danger-full-access"`` is the way to run at all. It is
+    #: less reckless than it sounds here: acumen already gives each run a throwaway ``HOME``, a
+    #: scrubbed env allowlist, a temp working directory and the ``deny_paths`` hook, so Codex's
+    #: sandbox is a second layer rather than the only one.
+    codex_sandbox: str = "workspace-write"
 
 
 def _claude_options(options: AgentOptions) -> ClaudeAgentOptions:
@@ -182,7 +190,7 @@ def _codex_command(options: AgentOptions, prompt: str) -> list[str]:
         "--color",
         "never",
         "--sandbox",
-        "workspace-write",
+        options.codex_sandbox,
         "-c",
         "project_doc_max_bytes=0",
         "-c",
@@ -311,6 +319,31 @@ _TURN_ITEM_TYPES = frozenset({"agent_message", "command_execution", "file_change
 _MAX_TURNS_SUBTYPE = "error_max_turns"
 _MAX_BUDGET_SUBTYPE = "error_max_budget_usd"
 
+#: Subtype for a run whose *sandbox* failed, as distinct from a run that failed the task.
+_SANDBOX_SUBTYPE = "error_sandbox"
+
+#: Stderr fragments that mean Codex's own sandbox could not carry out the agent's file writes.
+#: On a host where unprivileged user namespaces are restricted — Ubuntu 24.04's AppArmor
+#: default, a container without the capability — bubblewrap cannot start, and every write the
+#: agent attempts fails. The agent still does the whole task and still spends the tokens; it
+#: just cannot save the answer, which would otherwise be graded ``no_answer_file`` and read as
+#: the model failing. It is the harness that failed, so the run is recorded as an error and
+#: leaves the comparison rather than being counted against the model.
+_SANDBOX_FAILURES = (
+    "fs sandbox helper failed",
+    "bwrap:",
+    "Failed to write file",
+    "sandbox helper",
+)
+
+
+def _sandbox_failure(lines: Sequence[str]) -> str | None:
+    """Return the first stderr line showing a sandbox failure, or ``None``."""
+    for line in lines:
+        if any(marker in line for marker in _SANDBOX_FAILURES):
+            return line.strip()
+    return None
+
 
 def _is_turn_item(event: dict[str, Any]) -> bool:
     """Whether ``event`` is one completed model action — the unit Codex turns are counted in."""
@@ -325,6 +358,7 @@ def _codex_terminal(
     returncode: int,
     duration_ms: int,
     capped: str | None = None,
+    sandbox_failure: str | None = None,
 ) -> AgentResult:
     session_id: str | None = None
     final = ""
@@ -354,7 +388,15 @@ def _codex_terminal(
             detail = event.get("message") or event.get("error")
             errors.append(str(detail or event))
 
-    if capped is not None:
+    if sandbox_failure is not None:
+        # Checked before the cap and before the exit status: when the sandbox cannot carry out
+        # the agent's writes, nothing downstream of it means anything. The run did the work and
+        # spent the tokens, so the usage is kept, but the outcome is the harness's failure and
+        # is recorded as such — never as the model declining to answer.
+        is_error = True
+        subtype = _SANDBOX_SUBTYPE
+        errors.append(f"the Codex sandbox could not complete the run's file operations: {sandbox_failure}")
+    elif capped is not None:
         # We terminated the process on purpose, so its non-zero status is ours and must not be
         # reported as a codex failure. The partial transcript is kept: it is the evidence of
         # what the run spent the cap on.
@@ -388,9 +430,12 @@ def _codex_terminal(
 async def _drain_stderr(
     stream: asyncio.StreamReader,
     callback: Callable[[str], None] | None,
+    sink: list[str] | None = None,
 ) -> None:
     while line := await stream.readline():
         text = line.decode(errors="replace").rstrip("\r\n")
+        if sink is not None:
+            sink.append(text)
         if callback is not None:
             callback(text)
         else:
@@ -441,7 +486,8 @@ async def _run_codex(
     )
     assert process.stdout is not None
     assert process.stderr is not None
-    stderr_task = asyncio.create_task(_drain_stderr(process.stderr, options.stderr))
+    noise: list[str] = []
+    stderr_task = asyncio.create_task(_drain_stderr(process.stderr, options.stderr, noise))
     events: list[dict[str, Any]] = []
     turns = 0
     capped: str | None = None
@@ -470,7 +516,7 @@ async def _run_codex(
         stderr_task.cancel()
         raise
     duration_ms = round((time.monotonic() - started) * 1000)
-    return _codex_terminal(events, returncode, duration_ms, capped)
+    return _codex_terminal(events, returncode, duration_ms, capped, _sandbox_failure(noise))
 
 
 async def run_agent(

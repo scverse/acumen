@@ -43,7 +43,7 @@ from acumen.paths import (
     arm_name,
     parse_run_dir,
 )
-from acumen.prices import pricer
+from acumen.prices import price_usage, pricer
 from acumen.procs import label_env, reap
 from acumen.prompts import improve_prompt
 from acumen.skills import (
@@ -104,7 +104,7 @@ class ImproveResult:
 
     skill: Skill
     parent: str
-    cost_usd: float
+    cost_usd: float | None
     turns: int
     n_train_runs: int
     n_train_failures: int
@@ -572,7 +572,12 @@ async def improve_skill(
         return ImproveResult(
             skill=skill,
             parent=parent.version,
-            cost_usd=result.total_cost_usd or 0.0,
+            cost_usd=price_usage(
+                result.usage,
+                model=selected_model,
+                provider=result.provider,
+                overrides=cfg.prices,
+            ),
             turns=result.num_turns,
             n_train_runs=len(train_runs),
             n_train_failures=n_failures,
