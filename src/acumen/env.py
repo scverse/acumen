@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from acumen.agents import AgentProvider
 from acumen.config import Config
 from acumen.paths import slugify
 
@@ -49,6 +50,9 @@ ENV_ALLOWLIST = (
     "ANTHROPIC_VERTEX_PROJECT_ID",
     "CLOUD_ML_REGION",
     "GOOGLE_APPLICATION_CREDENTIALS",
+    "CODEX_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "NO_PROXY",
@@ -238,6 +242,17 @@ def claude_cli_dir() -> Path | None:
     return Path(found).parent if found else None
 
 
+def codex_cli_dir() -> Path | None:
+    """Return the directory holding the ``codex`` CLI."""
+    found = shutil.which("codex")
+    return Path(found).parent if found else None
+
+
+def agent_cli_dir(provider: AgentProvider) -> Path | None:
+    """Return the directory holding the selected provider's CLI."""
+    return claude_cli_dir() if provider == "claude" else codex_cli_dir()
+
+
 #: Allowlisted variables that, present and non-empty, let a run authenticate on their own:
 #: a direct Anthropic key/token, or a flag routing to a cloud provider whose own (AWS/GCP)
 #: credentials then apply. A subset of :data:`ENV_ALLOWLIST` — the entries that carry or
@@ -270,6 +285,8 @@ API_AUTH_ENV_VARS = (
 #: Kept in ``"session"`` mode and dropped in ``"api"`` mode so exactly one auth path is live.
 SESSION_AUTH_ENV_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
 
+CODEX_API_AUTH_ENV_VARS = ("CODEX_API_KEY", "OPENAI_API_KEY")
+
 
 def _credentials_path() -> Path:
     """The user's Claude OAuth credentials file — what :func:`seed_credentials` copies."""
@@ -277,36 +294,13 @@ def _credentials_path() -> Path:
     return Path(base) / ".credentials.json"
 
 
-def auth_available() -> bool:
-    """Whether an agent run could authenticate to the Claude API.
-
-    A run gets its credential one of two ways: an allowlisted auth variable in the
-    environment (a direct Anthropic key/token, or a Bedrock/Vertex routing flag whose own
-    cloud credentials then apply), or a Claude credentials file that
-    :func:`seed_credentials` copies into the throwaway config dir (an OAuth login). An
-    empty variable does not count.
-    """
-    if any(os.environ.get(var) for var in AUTH_ENV_VARS):
-        return True
-    return _credentials_path().is_file()
+def _codex_home() -> Path:
+    """The user's real Codex home, which contains ``auth.json``."""
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 
 
-def check_auth() -> None:
-    """Raise :class:`EnvError` if no credential is reachable for an agent run.
-
-    A preflight guard for the agentic commands. Without it an unauthenticated ``bench``
-    would run the whole matrix, record every run as an ``error``, and still exit 0, while
-    the meta-agents (``draft``/``improve``/``tasks``/``ship``) would fail deep in the SDK
-    with a raw message — so fail early, before the costly target prep, with a clear fix.
-    """
-    if auth_available():
-        return
-    raise EnvError(
-        "no Claude credentials found — an agent run cannot authenticate. Set "
-        "ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_OAUTH_TOKEN), enable a "
-        "provider with CLAUDE_CODE_USE_BEDROCK / CLAUDE_CODE_USE_VERTEX, or log in with "
-        "`claude` so ~/.claude/.credentials.json exists."
-    )
+def _codex_credentials_path() -> Path:
+    return _codex_home() / "auth.json"
 
 
 def _has_oauth_credentials() -> bool:
@@ -324,18 +318,20 @@ def _has_oauth_credentials() -> bool:
     return isinstance(data.get("claudeAiOauth"), dict)
 
 
-def session_auth_available() -> bool:
+def session_auth_available(provider: AgentProvider = "claude") -> bool:
     """Whether an agent run could bill the Claude subscription ("session usage").
 
     True when a portable ``CLAUDE_CODE_OAUTH_TOKEN`` is set, or the user has a subscription
     OAuth login on disk (:func:`_has_oauth_credentials`). An empty variable does not count.
     """
+    if provider == "codex":
+        return _codex_credentials_path().is_file()
     if os.environ.get(SESSION_AUTH_ENV_VAR):
         return True
     return _has_oauth_credentials()
 
 
-def api_auth_available() -> bool:
+def api_auth_available(provider: AgentProvider = "claude") -> bool:
     """Whether an agent run could bill the Anthropic API (or a cloud provider) per token.
 
     True when any metered auth variable is set (:data:`API_AUTH_ENV_VARS`): a direct
@@ -343,10 +339,16 @@ def api_auth_available() -> bool:
     apply. The subscription OAuth token is deliberately excluded — it bills the plan, not
     the API. An empty variable does not count.
     """
-    return any(os.environ.get(var) for var in API_AUTH_ENV_VARS)
+    variables = API_AUTH_ENV_VARS if provider == "claude" else CODEX_API_AUTH_ENV_VARS
+    return any(os.environ.get(var) for var in variables)
 
 
-def resolve_auth_mode(requested: str, *, allow_session: bool) -> AuthMode:
+def resolve_auth_mode(
+    requested: str,
+    *,
+    allow_session: bool,
+    provider: AgentProvider = "claude",
+) -> AuthMode:
     """Resolve a requested auth choice to the concrete mode a run will use, or fail loudly.
 
     A preflight guard that replaces :func:`check_auth` on the agentic commands: it both
@@ -374,7 +376,11 @@ def resolve_auth_mode(requested: str, *, allow_session: bool) -> AuthMode:
                 "not available for it — the Claude subscription does not meter per-run spend. "
                 "Run the single-agent commands (draft/improve/tasks/ship) on the session instead."
             )
-        if not api_auth_available():
+        if not api_auth_available(provider):
+            if provider == "codex":
+                raise EnvError(
+                    "no API credential found — Codex bench must bill the API. Set CODEX_API_KEY (or OPENAI_API_KEY)."
+                )
             raise EnvError(
                 "no API credential found — bench must bill the API. Set ANTHROPIC_API_KEY (or "
                 "ANTHROPIC_AUTH_TOKEN), or enable a provider with CLAUDE_CODE_USE_BEDROCK / "
@@ -383,7 +389,12 @@ def resolve_auth_mode(requested: str, *, allow_session: bool) -> AuthMode:
         return "api"
 
     if requested == "session":
-        if not session_auth_available():
+        if not session_auth_available(provider):
+            if provider == "codex":
+                raise EnvError(
+                    "no Codex account login found for --auth session. Log in with `codex login` "
+                    "so ~/.codex/auth.json exists."
+                )
             raise EnvError(
                 "no Claude subscription login found for --auth session. Log in with `claude` so "
                 "~/.claude/.credentials.json exists, or set CLAUDE_CODE_OAUTH_TOKEN (from "
@@ -391,7 +402,9 @@ def resolve_auth_mode(requested: str, *, allow_session: bool) -> AuthMode:
             )
         return "session"
     if requested == "api":
-        if not api_auth_available():
+        if not api_auth_available(provider):
+            if provider == "codex":
+                raise EnvError("no API credential found for --auth api. Set CODEX_API_KEY (or OPENAI_API_KEY).")
             raise EnvError(
                 "no API credential found for --auth api. Set ANTHROPIC_API_KEY (or "
                 "ANTHROPIC_AUTH_TOKEN), or enable a provider with CLAUDE_CODE_USE_BEDROCK / "
@@ -401,10 +414,15 @@ def resolve_auth_mode(requested: str, *, allow_session: bool) -> AuthMode:
 
     # "auto": prefer the subscription (it's what the user is paying a flat rate for), fall
     # back to the metered API, and only then give up.
-    if session_auth_available():
+    if session_auth_available(provider):
         return "session"
-    if api_auth_available():
+    if api_auth_available(provider):
         return "api"
+    if provider == "codex":
+        raise EnvError(
+            "no Codex credentials found — log in with `codex login` (subscription), "
+            "or set CODEX_API_KEY / OPENAI_API_KEY (API)."
+        )
     raise EnvError(
         "no Claude credentials found — an agent run cannot authenticate. Log in with `claude` "
         "so ~/.claude/.credentials.json exists (subscription), or set ANTHROPIC_API_KEY (or "
@@ -435,13 +453,36 @@ def seed_credentials(config_dir: Path) -> bool:
     return True
 
 
-def _apply_auth_mode(env: dict[str, str], auth_mode: AuthMode | None) -> None:
-    """Neutralize the credential variables the chosen mode must not authenticate with.
+def seed_codex_credentials(config_dir: Path) -> bool:
+    """Copy only Codex's login token into an isolated ``CODEX_HOME``."""
+    real = _codex_credentials_path()
+    if not real.is_file():
+        return False
+    config_dir.mkdir(parents=True, exist_ok=True)
+    dest = config_dir / "auth.json"
+    shutil.copyfile(real, dest)
+    dest.chmod(0o600)
+    return True
 
-    So exactly one auth path is live: ``"session"`` neutralizes the metered API/cloud variables
-    and keeps the subscription OAuth token; ``"api"`` neutralizes the OAuth token and keeps the
-    metered ones. ``None`` leaves the allowlisted credentials untouched (the historical
-    behavior, for callers that don't select a mode).
+
+def _apply_auth_mode(
+    env: dict[str, str],
+    auth_mode: AuthMode | None,
+    provider: AgentProvider = "claude",
+) -> None:
+    """Neutralize the credential variables the chosen provider and mode must not authenticate with.
+
+    Two rules, in order. First, the *other* provider's credentials are blanked whatever the
+    mode: they can never authenticate this run, so allowlisting them would only carry the
+    operator's second API key into a web-enabled agent. Second, within the selected provider
+    exactly one auth path is left live: ``"session"`` neutralizes the metered API/cloud
+    variables and keeps the subscription login; ``"api"`` neutralizes the OAuth token and keeps
+    the metered ones. ``None`` leaves the selected provider's own credentials untouched (the
+    historical behavior, for callers that don't select a mode).
+
+    Codex has no session *variable* — its subscription login is the ``auth.json`` that
+    :func:`seed_codex_credentials` copies into the throwaway ``CODEX_HOME`` — so ``"session"``
+    there just blanks the API keys.
 
     The variables are set to ``""``, not deleted. The SDK builds the agent subprocess env as
     ``{**os.environ, **options.env}`` — it merges our mapping *over* the inherited environment —
@@ -449,14 +490,22 @@ def _apply_auth_mode(env: dict[str, str], auth_mode: AuthMode | None) -> None:
     silently authenticates with the wrong one. An explicit empty value overrides the inherited
     one, which the CLI reads as unset.
     """
-    if auth_mode == "session":
-        drop = API_AUTH_ENV_VARS
-    elif auth_mode == "api":
-        drop = (SESSION_AUTH_ENV_VAR,)
+    if provider == "claude":
+        drop = [*CODEX_API_AUTH_ENV_VARS]
+        if auth_mode == "session":
+            drop += API_AUTH_ENV_VARS
+        elif auth_mode == "api":
+            drop.append(SESSION_AUTH_ENV_VAR)
     else:
-        return
+        drop = [*API_AUTH_ENV_VARS, SESSION_AUTH_ENV_VAR]
+        if auth_mode == "session":
+            drop += CODEX_API_AUTH_ENV_VARS
     for var in drop:
         env[var] = ""
+    if provider == "codex" and auth_mode == "api":
+        # ``codex exec`` consumes CODEX_API_KEY. Accept the conventional OpenAI variable too
+        # and translate it here, without mutating the operator's shell.
+        env["CODEX_API_KEY"] = os.environ.get("CODEX_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
 
 
 def scrubbed_env(
@@ -466,6 +515,7 @@ def scrubbed_env(
     extra_path: list[Path] | None = None,
     auth_mode: AuthMode | None = None,
     extra_allow: Sequence[str] | None = None,
+    provider: AgentProvider = "claude",
 ) -> dict[str, str]:
     """Build the environment an isolated agent runs under.
 
@@ -508,10 +558,10 @@ def scrubbed_env(
     """
     allow = (*ENV_ALLOWLIST, *(extra_allow or ()))
     env = {key: os.environ[key] for key in allow if key in os.environ}
-    _apply_auth_mode(env, auth_mode)
+    _apply_auth_mode(env, auth_mode, provider)
 
     path_parts = [str(p) for p in (extra_path or [])]
-    cli_dir = claude_cli_dir()
+    cli_dir = agent_cli_dir(provider)
     if cli_dir is not None:
         path_parts.append(str(cli_dir))
     node_dir = shutil.which("node")
@@ -526,6 +576,7 @@ def scrubbed_env(
     env["PATH"] = os.pathsep.join(seen)
     env["HOME"] = str(home)
     env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    env["CODEX_HOME"] = str(config_dir)
     # Skill discovery needs setting_sources=["project"], but project discovery
     # also walks UP from cwd and auto-loads every CLAUDE.md it passes. Verified: an agent
     # recited a canary planted in its sandbox's parent directory having made zero tool
@@ -557,6 +608,7 @@ def build_agent_env(
     extra_path: list[Path] | None = None,
     auth_mode: AuthMode,
     extra_allow: Sequence[str] | None = None,
+    provider: AgentProvider = "claude",
 ) -> dict[str, str]:
     """Prepare an isolated agent's environment for a resolved auth mode.
 
@@ -572,9 +624,17 @@ def build_agent_env(
     allowlist, for a target that needs one at runtime.
     """
     if auth_mode == "session":
-        seed_credentials(config_dir)
+        if provider == "claude":
+            seed_credentials(config_dir)
+        else:
+            seed_codex_credentials(config_dir)
     return scrubbed_env(
-        config_dir=config_dir, home=home, extra_path=extra_path, auth_mode=auth_mode, extra_allow=extra_allow
+        config_dir=config_dir,
+        home=home,
+        extra_path=extra_path,
+        auth_mode=auth_mode,
+        extra_allow=extra_allow,
+        provider=provider,
     )
 
 
@@ -588,13 +648,28 @@ DEFAULT_CACHE_ROOT = _default_cache_root()
 
 
 def sdk_version() -> str:
-    """Return the installed ``claude-agent-sdk`` version, for the run fingerprint."""
+    """Return the installed ``claude-agent-sdk`` version, for the run fingerprint.
+
+    ``"unknown"`` on a Codex-only install, where the SDK is deliberately absent — the
+    fingerprint records what drove the run, and nothing Claude drove can be recorded here.
+    """
     from importlib.metadata import PackageNotFoundError, version
 
     try:
         return version("claude-agent-sdk")
-    except PackageNotFoundError:  # pragma: no cover - the SDK is a hard dependency
+    except PackageNotFoundError:
         return "unknown"
+
+
+def agent_version(provider: AgentProvider) -> str:
+    """Return the installed provider runtime version for run fingerprints."""
+    if provider == "claude":
+        return sdk_version()
+    try:
+        output = _run(["codex", "--version"])
+    except EnvError:
+        return "unknown"
+    return output.removeprefix("codex-cli ").strip()
 
 
 def python_version() -> str:

@@ -25,10 +25,12 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, ResultMessage, query
+if TYPE_CHECKING:
+    from claude_agent_sdk import HookMatcher
 
+from acumen.agents import AgentOptions, AgentResult, provider_for_model, run_agent
 from acumen.config import Config
 from acumen.env import AuthMode, Target, build_agent_env
 from acumen.logs import LiveLog
@@ -41,6 +43,7 @@ from acumen.paths import (
     arm_name,
     parse_run_dir,
 )
+from acumen.prices import pricer
 from acumen.procs import label_env, reap
 from acumen.prompts import improve_prompt
 from acumen.skills import (
@@ -348,6 +351,10 @@ def make_test_guard(runs_root: Path) -> HookMatcher:
     ``matcher=None`` fires the hook for every tool. The hook resolves paths against the real
     project ``runs/`` root, so it holds regardless of the agent's ``cwd``.
     """
+    # Imported here, not at module scope: the Claude SDK is an optional dependency and a
+    # Codex-only install never builds an SDK hook.
+    from claude_agent_sdk import HookMatcher
+
     root = runs_root.resolve()
 
     async def guard(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
@@ -475,7 +482,9 @@ async def improve_skill(
         train_dir = work / "train"
         rationale_path = work / "rationale.md"
         home = holder / "home"
-        config_dir = home / ".claude"
+        selected_model = model or cfg.improve_model
+        provider = provider_for_model(selected_model)
+        config_dir = home / (".claude" if provider == "claude" else ".codex")
         for path in (work, home, config_dir, home / "tmp"):
             path.mkdir(parents=True, exist_ok=True)
 
@@ -490,6 +499,7 @@ async def improve_skill(
                 extra_path=[target.bin_dir],
                 auth_mode=auth_mode,
                 extra_allow=cfg.env_passthrough,
+                provider=provider,
             ),
             holder,
         )
@@ -506,30 +516,34 @@ async def improve_skill(
             new_version=new_version,
             feedback=feedback,
         )
-        options = ClaudeAgentOptions(
-            cwd=str(work),
+        options = AgentOptions(
+            cwd=work,
             env=env,
-            model=model or cfg.improve_model,
+            model=selected_model,
             # No default turn or budget cap: only bound the agent if the caller asked. The
             # config's ``max_turns``/``max_usd`` cap benchmark agents only.
             max_turns=max_turns,
-            max_budget_usd=max_usd,
-            setting_sources=["project"],
-            permission_mode="bypassPermissions",
-            system_prompt={"type": "preset", "preset": "claude_code"},
+            max_usd=max_usd,
+            # Codex reports no billed figure, so a budget cap needs the run's own rate table.
+            price_usd=pricer(selected_model, cfg.prices),
+            discover_skills=True,
             # Belt-and-braces over the structural isolation: refuse any call that reaches a
-            # held-out test result, wherever the agent points it.
-            hooks={"PreToolUse": [make_test_guard(runs_root)]},
+            # held-out test result, wherever the agent points it. Built only for Claude — the
+            # hook is an SDK object, and Codex gets the equivalent from ``deny_paths`` below.
+            claude_hooks={"PreToolUse": [make_test_guard(runs_root)]} if provider == "claude" else None,
+            # Codex gets only the staged train evidence and is denied the original
+            # run tree wholesale, which includes every held-out test artifact.
+            deny_paths=(runs_root.resolve(),),
         )
 
-        result: ResultMessage | None = None
+        result: AgentResult | None = None
         agent_error: Exception | None = None
         try:
-            async for message in query(prompt=prompt, options=options):
-                if log is not None:
-                    log.append(message)
-                if isinstance(message, ResultMessage):
-                    result = message
+            result = await run_agent(
+                prompt,
+                options=options,
+                on_event=log.append if log is not None else None,
+            )
         except Exception as err:  # noqa: BLE001 - a failed improve is an error to report, re-raised below
             agent_error = err
         finally:
@@ -580,7 +594,7 @@ def _latest_or_error(skills_root: Path) -> str:
     return latest
 
 
-def _read_rationale(path: Path, result: ResultMessage, parent: str, new_version: str) -> str:
+def _read_rationale(path: Path, result: AgentResult, parent: str, new_version: str) -> str:
     """Recover the agent's rationale for ``meta.json``.
 
     Prefers the ``rationale.md`` the prompt asks for; falls back to the agent's final

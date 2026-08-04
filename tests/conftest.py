@@ -1,8 +1,8 @@
 """Shared fixtures for the acumen test suite.
 
 The suite is deliberately small and offline: it covers the CLI's main commands and the
-pure helpers underneath them, and never spawns an agent. Anything that would call the
-Claude Agent SDK (``draft``, ``improve``, ``tasks``, ``ship``) is only exercised up to
+pure helpers underneath them, and never spawns an agent. Anything that would call a
+Claude or Codex agent (``draft``, ``improve``, ``tasks``, ``ship``) is only exercised up to
 the pre-flight checks that run *before* the agent — those are the parts a unit test can
 honestly assert.
 """

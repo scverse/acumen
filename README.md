@@ -67,6 +67,62 @@ train/test isolation, and for `draft`/`improve` it is recorded in the version's 
 shown in the report. (Don't paste held-out test answers into `improve` feedback — that would
 defeat the split.)
 
+Claude and Codex can run side by side. Put both model families in `models` to compare them
+in one matrix; model IDs beginning with `claude` use Claude Code, while `gpt-*`, `o1`,
+`o3`, `o4`, and `codex-*` use Codex:
+
+```yaml
+models:
+  - claude-opus-5
+  - claude-sonnet-5
+  - claude-haiku-4-5-20251001
+  - gpt-5.6-sol
+  - gpt-5.6-terra
+  - gpt-5.6-luna
+```
+
+This spans each provider's quality/cost range; it is not a claim that the tiers are
+one-to-one equivalents.
+
+Neither backend is required. Claude is an optional dependency and Codex is an external CLI,
+so install only the one you run — `pip install acumen[claude]`, or plain `acumen` plus the
+`codex` CLI on `PATH`. Selecting a model whose backend is missing fails immediately, with the
+install command, before acumen prepares a target or spends anything.
+
+Claude API runs use `ANTHROPIC_API_KEY`; Codex API runs use `CODEX_API_KEY` (or
+`OPENAI_API_KEY`). The meta-agent commands also accept a Codex model through their
+`*_model` config keys or `--model`, and `--auth auto` prefers that provider's logged-in
+subscription.
+
+`max_turns` and `max_usd` apply to both providers, but they are not equally strict for Codex,
+which has no cap of its own — acumen enforces both against its event stream:
+
+- **`max_turns` bounds the run.** One `codex exec` is a single Codex turn however much work
+  happens inside it, so turns are counted in completed model actions (a message, a command, a
+  file change, a tool or search call) and the agent is stopped at the cap.
+- **`max_usd` cannot.** Codex reports usage once, when the turn ends, so a breach is only
+  visible after the money is spent. The run is recorded as a budget failure — the same outcome
+  Claude gives it — but bound Codex spend with `max_turns`. acumen prints this before the pass.
+
+**Cost is computed from tokens, not taken from the provider.** Only one of the two
+providers reports a billed dollar figure, so a mixed matrix would be comparing a real
+number against a zero. Every run instead records its token breakdown — fresh input, cache
+reads, cache writes, output, which are priced up to 10x apart — and `cost_usd` is derived
+from a rate table, identical arithmetic for both providers. The rates used are frozen into
+each `result.json`, so a pass benchmarked in January is not silently re-priced in July.
+
+```bash
+acumen prices              # the rates in use, and where each came from
+acumen prices --refresh    # re-check them against the providers' pricing pages
+```
+
+`--refresh` fetches both providers' published tables and prints a diff for you to accept —
+it never rewrites anything, because picking the wrong tier or context band would silently
+misprice every future run. Adopt changes by pasting the emitted block into `config.yaml`
+under `prices:`, which is also how you price a model acumen doesn't ship a rate for, or
+override rates for a gateway. A model with no rate records its tokens and leaves `cost_usd`
+unset — never zero, which would read as free.
+
 `draft`, `improve`, `tasks`, and `ship` each drive a long autonomous agent. Every run writes a
 live `logs/acumen-<command>-<datetime>.jsonl` (one event per step, flushed as it goes — so you
 can watch progress by reading the file) and a rendered `.html` transcript. Add `--stream` to
@@ -81,6 +137,15 @@ in particular, the [API documentation][].
 
 You need to have Python 3.12 or newer installed on your system.
 If you don't have Python installed, we recommend installing [uv][].
+
+Install the backend you actually run — both are optional, and either alone is a complete
+install:
+
+| you run | install | also needs |
+|---|---|---|
+| Claude only | `pip install acumen[claude]` | an Anthropic key or a `claude` login |
+| Codex only | `pip install acumen` | the `codex` CLI on `PATH`, plus a Codex login or key |
+| both | `pip install acumen[all]` | both of the above |
 
 <!--
 1) Install the latest release of `acumen` from [PyPI][]:

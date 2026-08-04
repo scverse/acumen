@@ -16,6 +16,7 @@ import pytest
 from acumen.cli import build_parser, main
 from acumen.config import load_config
 from acumen.paths import RunKey
+from acumen.prices import RATES_AS_OF
 from acumen.tasks import load_tasks
 
 
@@ -46,7 +47,16 @@ def test_init_writes_files_the_loaders_accept(tmp_path: Path, capsys: pytest.Cap
     config, tasks = tmp_path / "config.yaml", tmp_path / "tasks.yaml"
     assert config.is_file() and tasks.is_file()
     # The scaffold is a placeholder, but it must still be a *valid* placeholder.
-    assert load_config(config).repo.startswith("https://")
+    loaded = load_config(config)
+    assert loaded.repo.startswith("https://")
+    assert loaded.models == [
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-haiku-4-5-20251001",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ]
     assert [t.id for t in load_tasks(tasks)] == ["example_task"]
     assert "wrote" in capsys.readouterr().out
 
@@ -205,3 +215,13 @@ def test_ship_rejects_an_unknown_version(project: Path, skills_root: Path, capsy
 
     assert exit_code == 2
     assert "no such skill version" in capsys.readouterr().err
+
+
+def test_prices_lists_the_rate_table_without_touching_the_network(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`acumen prices` is the offline view; only --refresh reaches for the network."""
+    assert main(["prices", "--config", str(tmp_path / "absent.yaml")]) == 0
+    out = capsys.readouterr().out
+    assert "claude-opus-5" in out and "gpt-5.6-sol" in out
+    assert RATES_AS_OF in out

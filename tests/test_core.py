@@ -6,6 +6,8 @@ broke, not an exhaustive sweep of each validator.
 
 from __future__ import annotations
 
+import ast
+import asyncio
 import json
 import os
 import re
@@ -13,6 +15,7 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -20,6 +23,16 @@ import pytest
 from matplotlib import pyplot as plt
 from matplotlib.colors import to_hex
 
+import acumen
+from acumen.agents import (
+    AgentError,
+    AgentOptions,
+    _codex_terminal,
+    _install_codex_guard,
+    check_agent_cli,
+    provider_for_model,
+    run_agent,
+)
 from acumen.bench import build_matrix, pending
 from acumen.config import ConfigError, derive_skill_name, load_config, parse_config
 from acumen.env import (
@@ -27,16 +40,17 @@ from acumen.env import (
     EnvError,
     Target,
     api_auth_available,
-    auth_available,
     build_agent_env,
-    check_auth,
     resolve_auth_mode,
     scrubbed_env,
     session_auth_available,
 )
 from acumen.grade import grade_answer, grade_run
 from acumen.improve import _write_material, collect_train_runs, load_rates
+from acumen.logs import LiveLog
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
+from acumen.pricefeed import PriceFeedError, diff_rates, parse_anthropic, parse_openai
+from acumen.prices import DEFAULT_RATES, Rates, Usage, normalize_usage, price_run, pricer, resolve_rates
 from acumen.procs import label_env, reap, supported, survivors
 from acumen.prompts import draft_prompt, feedback_block, improve_prompt
 from acumen.report import (
@@ -58,10 +72,11 @@ from acumen.report import (
     skill_tests,
     tradeoff_figure,
 )
-from acumen.runner import StderrFilter, _skill_fired
+from acumen.runner import StderrFilter, _skill_fired, _terminal_reason
 from acumen.ship import _ship_env
 from acumen.skills import SkillError, load_skill, read_meta, skill_hash, write_meta
 from acumen.tasks import TaskError, load_tasks, parse_tasks
+from acumen.transcript import render_agent_transcript, render_codex_transcript
 
 # --- grading ---------------------------------------------------------------------------
 
@@ -191,6 +206,515 @@ def test_skill_fired_matches_the_skill_under_test_only(tmp_path: Path) -> None:
     assert _skill_fired(transcript(), "target") is False
     # A missing transcript is unknown, not a miss.
     assert _skill_fired(tmp_path / "absent.jsonl", "target") is None
+
+
+def test_codex_skill_fired_matches_project_skill_read(tmp_path: Path) -> None:
+    path = tmp_path / "codex.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "sed -n '1,200p' .agents/skills/target/SKILL.md",
+                },
+            }
+        )
+        + "\n"
+    )
+    assert _skill_fired(path, "target", provider="codex") is True
+    assert _skill_fired(path, "another", provider="codex") is False
+
+
+@pytest.mark.parametrize(
+    ("model", "provider"),
+    [
+        ("claude-opus-5", "claude"),
+        ("anthropic/claude-sonnet-5", "claude"),
+        ("gpt-5.6-sol", "codex"),
+        ("openai/gpt-5.6-terra", "codex"),
+        ("o4-mini", "codex"),
+    ],
+)
+def test_provider_for_model(model: str, provider: str) -> None:
+    assert provider_for_model(model) == provider
+
+
+def test_provider_for_model_rejects_ambiguous_ids() -> None:
+    with pytest.raises(AgentError, match="cannot infer"):
+        provider_for_model("custom-model")
+
+
+def test_codex_terminal_normalizes_jsonl() -> None:
+    result = _codex_terminal(
+        [
+            {"type": "thread.started", "thread_id": "thread-1"},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "done"},
+            },
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 100,
+                    "cached_input_tokens": 60,
+                    "output_tokens": 20,
+                },
+            },
+        ],
+        0,
+        1234,
+    )
+    assert result.provider == "codex"
+    assert result.session_id == "thread-1"
+    assert result.result == "done"
+    assert result.num_turns == 1
+    assert result.usage["input_tokens"] == 100
+    assert result.total_cost_usd is None
+    assert not result.is_error
+
+
+def test_codex_adapter_runs_jsonl_cli(tmp_path: Path) -> None:
+    fake = tmp_path / "codex"
+    fake.write_text(
+        """#!/bin/sh
+printf '%s\\n' \\
+  '{"type":"thread.started","thread_id":"thread-1"}' \\
+  '{"type":"turn.started"}' \\
+  '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}' \\
+  '{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":3}}'
+"""
+    )
+    fake.chmod(0o755)
+    seen: list[dict] = []
+    result = asyncio.run(
+        run_agent(
+            "write the answer",
+            options=AgentOptions(
+                cwd=tmp_path,
+                env={"PATH": f"{tmp_path}:/usr/bin", "HOME": str(tmp_path)},
+                model="gpt-5.6-sol",
+            ),
+            on_event=seen.append,
+        )
+    )
+    assert result.result == "done"
+    assert result.usage == {"input_tokens": 12, "output_tokens": 3}
+    assert len(seen) == 4
+
+
+def test_codex_guard_denies_isolated_paths(tmp_path: Path) -> None:
+    denied = tmp_path / "runs"
+    denied.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    codex_home = tmp_path / "codex-home"
+    options = AgentOptions(
+        cwd=work,
+        env={"CODEX_HOME": str(codex_home)},
+        model="gpt-5.6-sol",
+        deny_paths=(denied,),
+    )
+    _install_codex_guard(options)
+
+    hooks = json.loads((work / ".codex" / "hooks.json").read_text())
+    assert "acumen_guard.py" in hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    payload = json.dumps(
+        {
+            "cwd": str(work),
+            "tool_name": "Bash",
+            "tool_input": {"command": f"cat {denied / 'skill_v1/test/result.json'}"},
+        }
+    )
+    proc = subprocess.run(
+        [sys.executable, str(codex_home / "acumen_guard.py")],
+        input=payload,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    decision = json.loads(proc.stdout)
+    assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def _fake_codex(path: Path, events: list[dict]) -> Path:
+    """Write a stub ``codex`` CLI that replays ``events`` as JSONL and exits 0."""
+    lines = "".join(f"  '{json.dumps(event)}' \\\n" for event in events).rstrip(" \\\n")
+    cli = path / "codex"
+    cli.write_text(f"#!/bin/sh\nprintf '%s\\n' \\\n{lines}\n")
+    cli.chmod(0o755)
+    return cli
+
+
+def _codex_options(tmp_path: Path, **kwargs: object) -> AgentOptions:
+    return AgentOptions(
+        cwd=tmp_path,
+        env={"PATH": f"{tmp_path}:/usr/bin", "HOME": str(tmp_path)},
+        model="gpt-5.6-sol",
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def test_codex_turns_count_model_actions_not_exec_invocations() -> None:
+    """`codex exec` is one turn however much work happens inside it.
+
+    Counting ``turn.started`` would record 1 for every Codex run, which makes the turns column
+    meaningless and leaves ``max_turns`` with nothing to bite on. Completed items are the unit.
+    """
+    result = _codex_terminal(
+        [
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {"type": "reasoning", "text": "thinking"}},
+            {"type": "item.completed", "item": {"type": "command_execution", "command": "echo one"}},
+            {"type": "item.completed", "item": {"type": "command_execution", "command": "echo two"}},
+            {"type": "item.completed", "item": {"type": "todo_list", "items": []}},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 1}},
+        ],
+        0,
+        10,
+    )
+    # Two commands and the message; reasoning and bookkeeping are not actions.
+    assert result.num_turns == 3
+
+
+def test_codex_stops_at_the_turn_cap(tmp_path: Path) -> None:
+    _fake_codex(
+        tmp_path,
+        [
+            {"type": "thread.started", "thread_id": "t"},
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {"id": "a", "type": "command_execution", "command": "echo one"}},
+            {"type": "item.completed", "item": {"id": "b", "type": "command_execution", "command": "echo two"}},
+            {"type": "item.completed", "item": {"id": "c", "type": "agent_message", "text": "never reached"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 999}},
+        ],
+    )
+    result = asyncio.run(run_agent("go", options=_codex_options(tmp_path, max_turns=2)))
+
+    assert result.is_error
+    assert result.subtype == "error_max_turns"
+    assert result.num_turns == 2
+    # The agent is stopped at the cap, so the events after it are never recorded…
+    assert result.result == ""
+    # …and the run is a cap breach, not a crashed CLI.
+    assert result.errors == ["acumen stopped the run at its turn cap"]
+
+
+def test_codex_stops_at_the_budget_cap(tmp_path: Path) -> None:
+    _fake_codex(
+        tmp_path,
+        [
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 1_000_000, "output_tokens": 0}},
+        ],
+    )
+    # gpt-5.6-sol bills $5/M input, so a million fresh input tokens is $5 against a $1 cap.
+    options = _codex_options(tmp_path, max_usd=1.0, price_usd=pricer("gpt-5.6-sol"))
+    result = asyncio.run(run_agent("go", options=options))
+
+    assert result.is_error
+    assert result.subtype == "error_max_budget_usd"
+
+
+def test_codex_budget_cap_is_inert_without_a_rate_for_the_model(tmp_path: Path) -> None:
+    """An unpriced model must not be capped as if it were free."""
+    _fake_codex(
+        tmp_path,
+        [
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 1_000_000}},
+        ],
+    )
+    options = _codex_options(tmp_path, max_usd=0.000_001, price_usd=pricer("gpt-unpriced-model"))
+    result = asyncio.run(run_agent("go", options=options))
+
+    assert not result.is_error
+    assert result.result == "done"
+
+
+@pytest.mark.parametrize(
+    ("subtype", "reason"),
+    [("error_max_turns", "max_turns"), ("error_max_budget_usd", "budget")],
+)
+def test_codex_cap_subtypes_map_onto_the_same_reasons_as_claude(subtype: str, reason: str) -> None:
+    """A cap breach must record the same reason whichever provider hit it."""
+    result = _codex_terminal([], -15, 10, subtype)
+    assert _terminal_reason(result) == reason
+
+
+def test_codex_transcript_renders_its_own_html(tmp_path: Path) -> None:
+    """`claude-code-log` reads the SDK format only — given Codex events it silently exits 0
+    and writes an empty page, so Codex is rendered here instead."""
+    jsonl = tmp_path / "transcript.jsonl"
+    jsonl.write_text(
+        "\n".join(
+            json.dumps(event)
+            for event in [
+                {"type": "thread.started", "thread_id": "thread-9"},
+                {"type": "item.completed", "item": {"id": "a", "type": "agent_message", "text": "<b>hi</b>"}},
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "b",
+                        "type": "command_execution",
+                        "command": "python -c 'print(1)'",
+                        "aggregated_output": "1\n",
+                        "exit_code": 0,
+                    },
+                },
+                # Started but never completed — what a turn-capped run leaves behind.
+                {"type": "item.started", "item": {"id": "c", "type": "command_execution", "command": "sleep 60"}},
+                {"type": "turn.completed", "usage": {"input_tokens": 41_214, "output_tokens": 122}},
+            ]
+        )
+        + "\n"
+    )
+    html = tmp_path / "transcript.html"
+    assert render_codex_transcript(jsonl, html) is True
+
+    body = html.read_text()
+    assert "thread-9" in body
+    assert "python -c &#x27;print(1)&#x27;" in body
+    assert "exit 0" in body
+    # Agent text is escaped, never injected as markup.
+    assert "&lt;b&gt;hi&lt;/b&gt;" in body and "<b>hi</b>" not in body
+    # The unfinished item survives, flagged as such.
+    assert "sleep 60" in body and "unfinished" in body
+    assert "41214" in body
+
+
+def test_codex_transcript_renders_without_events(tmp_path: Path) -> None:
+    jsonl = tmp_path / "empty.jsonl"
+    jsonl.write_text("not json\n")
+    html = tmp_path / "empty.html"
+    assert render_codex_transcript(jsonl, html) is True
+    assert "no events" in html.read_text()
+    assert render_codex_transcript(tmp_path / "missing.jsonl", tmp_path / "missing.html") is False
+
+
+def test_render_agent_transcript_dispatches_on_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    jsonl = tmp_path / "t.jsonl"
+    jsonl.write_text(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "hi"}}) + "\n")
+    calls: list[str] = []
+    monkeypatch.setattr("acumen.transcript.render_transcript", lambda *_: calls.append("claude") or True)
+
+    assert render_agent_transcript(jsonl, tmp_path / "codex.html", provider="codex") is True
+    assert calls == []
+    assert render_agent_transcript(jsonl, tmp_path / "claude.html", provider="claude") is True
+    assert calls == ["claude"]
+
+
+def test_backends_are_optional_at_import_time() -> None:
+    """A Codex-only install has no Claude SDK, so nothing may import it at module scope.
+
+    This is the invariant that keeps ``import acumen`` working with either backend installed
+    alone; the SDK may only be reached inside a function or under ``TYPE_CHECKING``.
+    """
+    offenders: list[str] = []
+    for path in sorted(Path(acumen.__file__).parent.rglob("*.py")):
+        for node in ast.parse(path.read_text()).body:
+            if isinstance(node, ast.If) and ast.unparse(node.test) == "TYPE_CHECKING":
+                continue  # annotations only — never executed
+            for child in ast.walk(node) if isinstance(node, ast.If | ast.Try) else [node]:
+                module = getattr(child, "module", None) if isinstance(child, ast.ImportFrom) else None
+                names = [alias.name for alias in getattr(child, "names", [])] if isinstance(child, ast.Import) else []
+                if (module or "").startswith("claude_agent_sdk") or any(
+                    name.startswith("claude_agent_sdk") for name in names
+                ):
+                    offenders.append(f"{path.name}:{child.lineno}")
+    assert offenders == []
+
+
+def test_missing_backend_fails_before_any_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both backends are optional, so both are preflighted the same way."""
+    monkeypatch.setattr("acumen.agents.claude_sdk_available", lambda: False)
+    with pytest.raises(AgentError, match=r"acumen\[claude\]"):
+        check_agent_cli("claude")
+
+    monkeypatch.setattr("acumen.agents.claude_sdk_available", lambda: True)
+    check_agent_cli("claude")
+
+    monkeypatch.setattr("acumen.agents.shutil.which", lambda _: None)
+    with pytest.raises(AgentError, match="codex is not on PATH"):
+        check_agent_cli("codex")
+
+
+def test_live_log_records_codex_without_the_claude_sdk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The live JSONL is provider-neutral: Codex events are dicts, recognized without the SDK."""
+    monkeypatch.setattr("acumen.logs._sdk", lambda: None)
+    with LiveLog(tmp_path / "log.jsonl") as log:
+        log.append({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}})
+        log.append(object())  # an SDK message on an install that cannot recognize it
+    events = [json.loads(line) for line in (tmp_path / "log.jsonl").read_text().splitlines()]
+    assert [event["type"] for event in events] == ["assistant"]
+    assert events[0]["text"] == "done"
+
+
+def test_usage_normalizes_both_providers_without_collapsing_the_cache_split() -> None:
+    """The cache classes are priced up to 10x apart, so they must survive normalization.
+
+    The two providers report the same information differently: Codex's ``input_tokens``
+    is the total with ``cached_input_tokens`` inside it, while the Claude SDK reports the
+    three classes side by side. Both normalize to a total ``input`` plus its parts.
+    """
+    claude = normalize_usage(
+        {
+            "input_tokens": 5_000,
+            "cache_read_input_tokens": 180_000,
+            "cache_creation_input_tokens": 15_000,
+            "output_tokens": 4_000,
+        }
+    )
+    assert (claude.input, claude.cache_read, claude.cache_write, claude.output) == (200_000, 180_000, 15_000, 4_000)
+    assert claude.fresh_input == 5_000
+
+    # Captured verbatim from a live `codex exec --json` turn.completed event.
+    codex = normalize_usage(
+        {
+            "input_tokens": 12_051,
+            "cached_input_tokens": 8_960,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 5,
+            "reasoning_output_tokens": 0,
+        },
+        provider="codex",
+    )
+    assert (codex.input, codex.cache_read, codex.cache_write, codex.output) == (12_051, 8_960, 0, 5)
+    # Cached input is a subset of input_tokens, not an addition to it.
+    assert codex.fresh_input == 3_091
+    # reasoning_output_tokens is a subset of output_tokens, so it must not be added on.
+    assert codex.total == 12_056
+
+    written = normalize_usage(
+        {"input_tokens": 12_051, "cached_input_tokens": 8_000, "cache_write_input_tokens": 960, "output_tokens": 5},
+        provider="codex",
+    )
+    assert (written.cache_write, written.fresh_input) == (960, 3_091)
+
+    empty = normalize_usage(None)
+    assert (empty.input, empty.output, empty.total) == (0, 0, 0)
+
+
+def test_price_run_bills_each_cache_class_at_its_own_rate() -> None:
+    """Collapsing the split and billing it all at the base input rate overcharges ~3.6x.
+
+    That is the whole reason the breakdown is carried: a benchmark agent's input is
+    mostly cache reads, billed at a tenth of the base rate.
+    """
+    usage = Usage(input=200_000, cache_read=180_000, cache_write=15_000, output=4_000)
+    rates = resolve_rates("claude-opus-5")
+    assert rates is not None
+    # 5k @ $5 + 180k @ $0.50 + 15k @ $6.25 + 4k @ $25, per million.
+    assert price_run(usage, rates) == pytest.approx(0.30875)
+    collapsed = (usage.input * rates.input + usage.output * rates.output) / 1_000_000
+    assert collapsed > price_run(usage, rates) * 3
+
+
+def test_price_run_leaves_an_unpriced_model_unpriced_rather_than_free() -> None:
+    """``None`` is not ``0.0`` — a model with no rates must not read as a free one."""
+    assert resolve_rates("some-local-llm") is None
+    assert price_run(Usage(input=1, cache_read=0, cache_write=0, output=1), None) is None
+
+
+def test_resolve_rates_accepts_provider_qualified_ids_and_config_overrides() -> None:
+    assert resolve_rates("openai/gpt-5.6-sol") == resolve_rates("gpt-5.6-sol")
+    assert resolve_rates("Claude-Opus-5") == resolve_rates("claude-opus-5")
+
+    overrides = {"claude-opus-5": Rates(input=1.0, cached_input=0.1, cache_write=1.25, output=2.0)}
+    assert resolve_rates("claude-opus-5", overrides).input == 1.0
+    # An override for one model doesn't shadow the built-in table for the others.
+    assert resolve_rates("gpt-5.6-luna", overrides) == DEFAULT_RATES["gpt-5.6-luna"]
+
+
+def test_config_prices_block_validates_and_defaults_the_cache_rates() -> None:
+    cfg = parse_config(
+        {
+            "repo": "https://github.com/o/r",
+            "prices": {"my-gateway-model": {"input": 4.0, "output": 20.0}},
+        }
+    )
+    rates = cfg.prices["my-gateway-model"]
+    # Cache rates are optional; they default to the standard 0.1x / 1.25x of input.
+    assert (rates.input, rates.output, rates.cached_input, rates.cache_write) == (4.0, 20.0, 0.4, 5.0)
+
+    for bad in ({"input": 4.0}, {"input": -1.0, "output": 2.0}, {"input": 1.0, "output": 2.0, "nope": 3.0}, []):
+        with pytest.raises(ConfigError, match="prices"):
+            parse_config({"repo": "https://github.com/o/r", "prices": {"m": bad}})
+
+
+_ANTHROPIC_MD = """
+| Model | Base Input Tokens | 5m Cache Writes | 1h Cache Writes | Cache Hits & Refreshes | Output Tokens |
+|---|---|---|---|---|---|
+| Claude Opus 5 | $5 / MTok | $6.25 / MTok | $10 / MTok | $0.50 / MTok | $25 / MTok |
+| Claude Sonnet 5 [through August 31, 2026](/docs/pricing#intro) | $2 / MTok | $2.50 / MTok | $4 / MTok | $0.20 / MTok | $10 / MTok |
+| Claude Sonnet 5 starting September 1, 2026 | $3 / MTok | $3.75 / MTok | $6 / MTok | $0.30 / MTok | $15 / MTok |
+| Claude Haiku 4.5 | $1 / MTok | $1.25 / MTok | $2 / MTok | $0.10 / MTok | $5 / MTok |
+
+| Model | Batch input | Batch output |
+|---|---|---|
+| Claude Opus 5 | $2.50 / MTok | $12.50 / MTok |
+"""
+
+_OPENAI_MD = """
+### Standard pricing data
+
+| Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |
+|---|---|---|---|---|---|---|---|---|
+| gpt-5.6-sol | $5.00 | $0.50 | $6.25 | $30.00 | $10.00 | $1.00 | $12.50 | $45.00 |
+| gpt-5.6-luna | $0.20 | $0.02 | $0.25 | $1.20 | $0.40 | $0.04 | $0.50 | $1.80 |
+| gpt-5.5 (<272K context length) | $5.00 | $0.50 | - | $30.00 | $10.00 | $1.00 | - | $45.00 |
+
+### Batch pricing data
+
+| Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |
+|---|---|---|---|---|---|---|---|---|
+| gpt-5.6-sol | $2.50 | $0.25 | $3.125 | $15.00 | $5.00 | $0.50 | $6.25 | $22.50 |
+"""
+
+
+def test_price_feed_picks_the_rate_in_effect_on_a_dated_row() -> None:
+    """A promotional rate is published as two rows; taking the first would misprice runs."""
+    intro = parse_anthropic(_ANTHROPIC_MD, today=date(2026, 8, 3))
+    assert intro["claude-sonnet-5"] == Rates(input=2.0, cached_input=0.2, cache_write=2.5, output=10.0)
+
+    after = parse_anthropic(_ANTHROPIC_MD, today=date(2026, 9, 1))
+    assert after["claude-sonnet-5"] == Rates(input=3.0, cached_input=0.3, cache_write=3.75, output=15.0)
+
+    # Display names become API model IDs, and the batch table is not mistaken for the base one.
+    assert intro["claude-haiku-4-5"].input == 1.0
+    assert intro["claude-opus-5"].output == 25.0
+
+
+def test_price_feed_reads_standard_short_context_and_ignores_the_other_tiers() -> None:
+    """Batch is half price and long context roughly double — picking either misprices runs."""
+    rates = parse_openai(_OPENAI_MD)
+    assert rates["gpt-5.6-sol"] == Rates(input=5.0, cached_input=0.5, cache_write=6.25, output=30.0)
+    assert rates["gpt-5.6-luna"].output == 1.2
+    # A row whose cache columns are "-" falls back to the standard multiples of input.
+    assert rates["gpt-5.5"] == Rates(input=5.0, cached_input=0.5, cache_write=6.25, output=30.0)
+
+
+def test_price_feed_reports_a_changed_cache_rate_not_just_input_and_output() -> None:
+    """On a cached workload the cache rate is most of the bill, so a diff must surface it."""
+    current = {"claude-opus-5": Rates(input=5.0, cached_input=0.5, cache_write=6.25, output=25.0)}
+    same = diff_rates(current, {"claude-opus-5": current["claude-opus-5"]})
+    assert same == []
+
+    cheaper_cache = Rates(input=5.0, cached_input=0.25, cache_write=6.25, output=25.0)
+    (change,) = diff_rates(current, {"claude-opus-5": cheaper_cache})
+    assert change.kind == "changed"
+    assert "cached_input $0.5→$0.25" in change.describe()
+    assert "input $" not in change.describe().replace("cached_input $", "")
+
+
+def test_price_feed_parsers_fail_loudly_on_an_unrecognized_page() -> None:
+    """A silent empty parse would leave every model unpriced with no explanation."""
+    for parse in (lambda md: parse_anthropic(md, today=date(2026, 8, 3)), parse_openai):
+        with pytest.raises(PriceFeedError, match="layout may have changed"):
+            parse("# Pricing\n\nWe have moved our prices to a new page.\n")
 
 
 def test_stderr_filter_keeps_first_of_each_line() -> None:
@@ -344,34 +868,6 @@ def test_improve_prompt_separates_loading_from_the_body() -> None:
 # --- auth preflight --------------------------------------------------------------------
 
 
-def test_auth_preflight(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # Point credential discovery at an empty throwaway dir and strip every auth variable,
-    # so the only auth in play is what the test sets.
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
-    for var in AUTH_ENV_VARS:
-        monkeypatch.delenv(var, raising=False)
-
-    # No variable and no credentials file → unauthenticated, and check_auth fails loudly.
-    assert auth_available() is False
-    with pytest.raises(EnvError, match="no Claude credentials"):
-        check_auth()
-
-    # An empty variable does not count.
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
-    assert auth_available() is False
-
-    # A non-empty auth variable authenticates.
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    assert auth_available() is True
-    check_auth()  # does not raise
-
-    # So does a seeded credentials file, even with no auth variable set.
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    (tmp_path / ".credentials.json").write_text("{}")
-    assert auth_available() is True
-    check_auth()
-
-
 def _clear_auth(monkeypatch: pytest.MonkeyPatch, config_dir: Path) -> None:
     """Isolate auth detection: empty credential dir, every auth variable stripped."""
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
@@ -452,6 +948,74 @@ def test_resolve_auth_mode_for_bench(tmp_path: Path, monkeypatch: pytest.MonkeyP
     # With an API credential, bench resolves to api.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     assert resolve_auth_mode("api", allow_session=False) == "api"
+
+
+def test_codex_auth_resolution_and_isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    real_home = tmp_path / "real-codex"
+    real_home.mkdir()
+    (real_home / "auth.json").write_text('{"tokens": {}}')
+    monkeypatch.setenv("CODEX_HOME", str(real_home))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+    monkeypatch.delenv("CODEX_API_KEY", raising=False)
+
+    assert session_auth_available("codex")
+    assert api_auth_available("codex")
+    assert resolve_auth_mode("auto", allow_session=True, provider="codex") == "session"
+    assert resolve_auth_mode("api", allow_session=False, provider="codex") == "api"
+
+    isolated = tmp_path / "isolated-codex"
+    env = build_agent_env(
+        config_dir=isolated,
+        home=tmp_path / "home",
+        auth_mode="session",
+        provider="codex",
+    )
+    assert (isolated / "auth.json").is_file()
+    assert env["CODEX_HOME"] == str(isolated)
+    assert env["CODEX_API_KEY"] == ""
+    assert env["OPENAI_API_KEY"] == ""
+
+    api_home = tmp_path / "api-codex"
+    api_env = build_agent_env(
+        config_dir=api_home,
+        home=tmp_path / "api-home",
+        auth_mode="api",
+        provider="codex",
+    )
+    assert not (api_home / "auth.json").exists()
+    assert api_env["CODEX_API_KEY"] == "sk-openai"
+
+
+def test_scrubbed_env_never_carries_the_other_providers_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run authenticates with one provider, so the other's keys must not ride the allowlist in.
+
+    ``CODEX_API_KEY``/``OPENAI_API_KEY`` and the Anthropic variables are all allowlisted, so
+    without an explicit blank an operator with both configured hands every Claude agent their
+    OpenAI key and every Codex agent their Anthropic key — ambient secrets in a web-enabled
+    agent, and two live credentials where the module promises exactly one.
+    """
+    _clear_auth(monkeypatch, tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+    home = tmp_path / "home"
+
+    for mode in ("session", "api", None):
+        claude = scrubbed_env(config_dir=tmp_path / "cfg", home=home, auth_mode=mode, provider="claude")
+        assert claude["OPENAI_API_KEY"] == ""
+        assert claude["CODEX_API_KEY"] == ""
+
+        codex = scrubbed_env(config_dir=tmp_path / "cfg", home=home, auth_mode=mode, provider="codex")
+        assert codex["ANTHROPIC_API_KEY"] == ""
+        assert codex["CLAUDE_CODE_OAUTH_TOKEN"] == ""
+
+    # The selected provider's own credential still survives its mode.
+    api = scrubbed_env(config_dir=tmp_path / "cfg", home=home, auth_mode="api", provider="codex")
+    assert api["CODEX_API_KEY"] == "sk-openai"
+    session = scrubbed_env(config_dir=tmp_path / "cfg", home=home, auth_mode="session", provider="codex")
+    assert session["CODEX_API_KEY"] == ""
 
 
 def test_scrubbed_env_auth_mode_filters_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

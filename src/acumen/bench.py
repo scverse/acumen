@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from acumen.agents import AgentProvider, provider_for_model
 from acumen.config import Config
 from acumen.env import AuthMode, Target
 from acumen.paths import SPLITS, RunKey, Split, arm_name, is_complete, run_dir
+from acumen.prices import Rates
 from acumen.runner import RunOutcome, run_once
 from acumen.skills import Skill
 from acumen.tasks import Task
@@ -106,6 +108,8 @@ async def run_matrix(
     runs_root: Path,
     max_concurrency: int,
     auth_mode: AuthMode = "api",
+    auth_modes: Mapping[AgentProvider, AuthMode] | None = None,
+    price_overrides: dict[str, Rates] | None = None,
     skill: Skill | None = None,
     skill_name: str | None = None,
     sandbox_base: Path | None = None,
@@ -177,13 +181,14 @@ async def run_matrix(
                 model=item.model,
                 max_turns=item.max_turns,
                 max_usd=item.max_usd,
-                auth_mode=auth_mode,
+                auth_mode=(auth_modes or {}).get(provider_for_model(item.model), auth_mode),
                 skill=skill,
                 skill_name=skill_name,
                 sandbox_base=sandbox_base,
                 keep_sandbox=keep_sandbox,
                 stderr=stderr,
                 env_passthrough=env_passthrough,
+                price_overrides=price_overrides,
             )
             if on_done is not None:
                 on_done(outcome)

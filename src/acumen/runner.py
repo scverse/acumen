@@ -1,4 +1,4 @@
-"""SDK invocation for a single benchmark run.
+"""Provider-neutral invocation for a single benchmark run.
 
 Runs one agent in one sandbox, captures its transcript, grades what it wrote, and emits
 ``result.json`` — the unit of record. Writing ``result.json`` last is deliberate: its
@@ -15,9 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
-
-from acumen.env import AuthMode, Target, sdk_version
+from acumen.agents import AgentOptions, AgentResult, provider_for_model, run_agent
+from acumen.env import AuthMode, Target, agent_version
 from acumen.grade import Grade, Reason, grade_run
 from acumen.paths import (
     ANSWER_FILE,
@@ -27,11 +26,12 @@ from acumen.paths import (
     TRANSCRIPT_JSONL,
     RunKey,
 )
+from acumen.prices import Rates, normalize_usage, price_run, pricer, rates_payload, resolve_rates
 from acumen.prompts import benchmark_prompt
 from acumen.sandbox import Sandbox, sandbox
 from acumen.skills import Skill
 from acumen.tasks import Task
-from acumen.transcript import locate_transcript, render_transcript
+from acumen.transcript import locate_transcript, render_agent_transcript
 
 #: Result subtypes the CLI reports on a cap breach, mapped to our reason taxonomy.
 _SUBTYPE_REASONS: dict[str, Reason] = {
@@ -50,7 +50,7 @@ class RunOutcome:
     payload: dict
 
 
-def _terminal_reason(message: ResultMessage) -> Reason | None:
+def _terminal_reason(message: AgentResult) -> Reason | None:
     """Map a cap breach or hard error onto a reason, or ``None`` if the agent finished.
 
     ``subtype`` is a free-form string from the CLI, so match defensively rather than
@@ -72,7 +72,7 @@ def _find_transcript(box: Sandbox, session_id: str) -> Path | None:
     return locate_transcript(box.config_dir, box.root, session_id)
 
 
-def _skill_fired(jsonl: Path, name: str) -> bool | None:
+def _skill_fired(jsonl: Path, name: str, *, provider: str = "claude") -> bool | None:
     """Return whether the agent loaded the skill called ``name``, read from the transcript.
 
     This is the evidence the skill arm actually used the skill — the skill arm must show it
@@ -94,6 +94,18 @@ def _skill_fired(jsonl: Path, name: str) -> bool | None:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if provider == "codex":
+            item = record.get("item")
+            if not isinstance(item, dict):
+                continue
+            # Codex loads repository skills from .agents/skills. The JSONL
+            # protocol exposes the command used to read the selected SKILL.md.
+            command = item.get("command")
+            if isinstance(command, str):
+                normalized = command.replace("\\", "/")
+                if f".agents/skills/{name}/SKILL.md" in normalized:
+                    return True
+            continue
         if record.get("type") != "assistant":
             continue
         content = record.get("message", {}).get("content")
@@ -113,15 +125,6 @@ def _collect_artifacts(box: Sandbox, run_dir: Path) -> None:
         src = box.root / name
         if src.is_file():
             shutil.copyfile(src, run_dir / name)
-
-
-def _usage_tokens(usage: dict | None) -> tuple[int, int]:
-    if not usage:
-        return 0, 0
-    inp = int(usage.get("input_tokens", 0) or 0)
-    inp += int(usage.get("cache_read_input_tokens", 0) or 0)
-    inp += int(usage.get("cache_creation_input_tokens", 0) or 0)
-    return inp, int(usage.get("output_tokens", 0) or 0)
 
 
 class StderrFilter:
@@ -159,8 +162,9 @@ def _build_options(
     model: str,
     max_turns: int,
     max_usd: float,
+    price_overrides: dict[str, Rates] | None = None,
     stderr: Callable[[str], None] | None = None,
-) -> ClaudeAgentOptions:
+) -> AgentOptions:
     """Assemble the SDK options for one run.
 
     These options are **identical for every arm** — baseline parity means the
@@ -179,15 +183,14 @@ def _build_options(
     append ``Skill(<name>)`` to ``allowed_tools`` in the skill arm only — an options-level
     difference between arms, which is the one thing parity forbids.
     """
-    return ClaudeAgentOptions(
-        cwd=str(box.root),
+    return AgentOptions(
+        cwd=box.root,
         env=box.env,
         model=model,
         max_turns=max_turns,
-        max_budget_usd=max_usd,
-        setting_sources=["project"],
-        permission_mode="bypassPermissions",
-        system_prompt={"type": "preset", "preset": "claude_code"},
+        max_usd=max_usd,
+        discover_skills=True,
+        price_usd=pricer(model, price_overrides),
         stderr=stderr,
     )
 
@@ -208,6 +211,7 @@ async def run_once(
     keep_sandbox: bool = False,
     stderr: Callable[[str], None] | None = None,
     env_passthrough: Sequence[str] | None = None,
+    price_overrides: dict[str, Rates] | None = None,
 ) -> RunOutcome:
     """Execute one benchmark run end to end and write its ``result.json``.
 
@@ -259,7 +263,8 @@ async def run_once(
     run_dir.mkdir(parents=True, exist_ok=True)
     split = task.split(key.split)
 
-    result: ResultMessage | None = None
+    provider = provider_for_model(model)
+    result: AgentResult | None = None
     error: str | None = None
 
     with sandbox(
@@ -269,6 +274,7 @@ async def run_once(
         keep=keep_sandbox,
         skill=skill,
         env_passthrough=env_passthrough,
+        provider=provider,
     ) as box:
         prompt = benchmark_prompt(
             split.prompt,
@@ -276,27 +282,34 @@ async def run_once(
             python=target.python,
             package=target.pkg_name,
         )
-        options = _build_options(box=box, model=model, max_turns=max_turns, max_usd=max_usd, stderr=stderr)
+        options = _build_options(
+            box=box,
+            model=model,
+            max_turns=max_turns,
+            max_usd=max_usd,
+            price_overrides=price_overrides,
+            stderr=stderr,
+        )
         try:
-            async for message in query(prompt=prompt, options=options):
-                if isinstance(message, ResultMessage):
-                    result = message
+            result = await run_agent(prompt, options=options)
         except Exception as err:  # noqa: BLE001 - a crashed agent is a recorded failure, not a crashed pass
             error = f"{type(err).__name__}: {err}"
 
         _collect_artifacts(box, run_dir)
-        if result is not None:
+        if result is not None and provider == "claude" and result.session_id is not None:
             jsonl = _find_transcript(box, result.session_id)
             if jsonl is not None:
                 shutil.copyfile(jsonl, run_dir / TRANSCRIPT_JSONL)
+        elif result is not None and provider == "codex":
+            (run_dir / TRANSCRIPT_JSONL).write_text("".join(f"{json.dumps(event)}\n" for event in result.transcript))
 
     rendered = False
     skill_loaded: bool | None = None
     expected_skill = skill.name if skill is not None else skill_name
     if (run_dir / TRANSCRIPT_JSONL).is_file():
-        rendered = render_transcript(run_dir / TRANSCRIPT_JSONL, run_dir / TRANSCRIPT_HTML)
+        rendered = render_agent_transcript(run_dir / TRANSCRIPT_JSONL, run_dir / TRANSCRIPT_HTML, provider=provider)
         if expected_skill is not None:
-            skill_loaded = _skill_fired(run_dir / TRANSCRIPT_JSONL, expected_skill)
+            skill_loaded = _skill_fired(run_dir / TRANSCRIPT_JSONL, expected_skill, provider=provider)
 
     grade: Grade = grade_run(run_dir, split.answer)
     if error is not None or result is None:
@@ -309,20 +322,32 @@ async def run_once(
         else:
             success, reason = grade.success, grade.reason
 
-    inp, out = _usage_tokens(result.usage if result else None)
+    usage = normalize_usage(result.usage if result else None, provider=provider)
+    # Tokens are the measurement; cost is derived from them at a frozen rate, so the two
+    # providers are priced by one arithmetic path and old runs stay reproducible when the
+    # rate table moves. The provider's own figure is kept alongside as a cross-check.
+    rates = resolve_rates(model, price_overrides)
+    computed = price_run(usage, rates)
+    provider_cost = result.total_cost_usd if result else None
     payload = {
         "task_id": key.task_id,
         "split": key.split,
         "skill": key.skill,
         "arm": key.arm,
         "model": model,
+        "agent": provider,
         "rep": key.rep,
         "success": success,
         "reason": reason,
         "turns": result.num_turns if result else 0,
-        "cost_usd": (result.total_cost_usd if result else None) or 0.0,
-        "input_tokens": inp,
-        "output_tokens": out,
+        "cost_usd": computed or 0.0,
+        "cost_available": computed is not None,
+        "provider_cost_usd": provider_cost,
+        "price_rates": rates_payload(rates),
+        "input_tokens": usage.input,
+        "output_tokens": usage.output,
+        "cache_read_tokens": usage.cache_read,
+        "cache_write_tokens": usage.cache_write,
         "duration_s": round((result.duration_ms if result else 0) / 1000, 2),
         "answer": grade.answer,
         "expected": split.answer.strip(),
@@ -332,7 +357,7 @@ async def run_once(
         "skill_name": skill.name if skill else None,
         # Evidence, not configuration: did the agent actually invoke the Skill tool?
         "skill_loaded": skill_loaded,
-        "sdk_version": sdk_version(),
+        "sdk_version": agent_version(provider),
         "session_id": result.session_id if result else None,
         "stop_reason": result.stop_reason if result else None,
         "subtype": result.subtype if result else None,

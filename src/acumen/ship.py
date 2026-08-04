@@ -32,11 +32,18 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
-
+from acumen.agents import AgentOptions, AgentProvider, AgentResult, provider_for_model, run_agent
 from acumen.config import Config
-from acumen.env import API_AUTH_ENV_VARS, SESSION_AUTH_ENV_VAR, AuthMode, Target, claude_cli_dir
+from acumen.env import (
+    API_AUTH_ENV_VARS,
+    CODEX_API_AUTH_ENV_VARS,
+    SESSION_AUTH_ENV_VAR,
+    AuthMode,
+    Target,
+    agent_cli_dir,
+)
 from acumen.logs import LiveLog
+from acumen.prices import pricer
 from acumen.procs import label_env, reap
 from acumen.prompts import ship_prompt
 from acumen.skills import Skill, content_files, load_skill
@@ -124,7 +131,7 @@ def _stage_skill_payload(skill: Skill, dest: Path) -> Path:
     return dest
 
 
-def _ship_env(target: Target, auth_mode: AuthMode) -> dict[str, str]:
+def _ship_env(target: Target, auth_mode: AuthMode, provider: AgentProvider = "claude") -> dict[str, str]:
     """The environment for the (unisolated) ship agent: the real env, target venv on PATH.
 
     Unlike the benchmark and meta-agents this is NOT scrubbed — the agent needs real
@@ -135,7 +142,9 @@ def _ship_env(target: Target, auth_mode: AuthMode) -> dict[str, str]:
     The one exception is the model credential: to bill the chosen ``auth_mode`` deterministically
     we neutralize the *other* mode's variables — ``"session"`` clears the metered API/cloud keys
     (the user's real ``~/.claude`` OAuth login then authenticates), ``"api"`` clears the
-    subscription OAuth token (the API key then wins). Everything non-credential is still carried
+    subscription OAuth token (the API key then wins). The other *provider's* credentials are
+    cleared too, whichever mode is chosen: they cannot authenticate this run, so carrying them
+    would only hand the agent a second API key. Everything non-credential is still carried
     through.
 
     The cleared variables are set to ``""``, not deleted: the SDK merges this mapping over
@@ -144,11 +153,19 @@ def _ship_env(target: Target, auth_mode: AuthMode) -> dict[str, str]:
     explicit empty value overrides the inherited one, which the CLI reads as unset.
     """
     env = dict(os.environ)
-    drop = API_AUTH_ENV_VARS if auth_mode == "session" else (SESSION_AUTH_ENV_VAR,)
+    if provider == "claude":
+        drop = [*CODEX_API_AUTH_ENV_VARS]
+        drop += API_AUTH_ENV_VARS if auth_mode == "session" else [SESSION_AUTH_ENV_VAR]
+    else:
+        drop = [*API_AUTH_ENV_VARS, SESSION_AUTH_ENV_VAR]
+        if auth_mode == "session":
+            drop += CODEX_API_AUTH_ENV_VARS
     for var in drop:
         env[var] = ""
+    if provider == "codex" and auth_mode == "api":
+        env["CODEX_API_KEY"] = os.environ.get("CODEX_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
     parts = [str(target.bin_dir)]
-    cli_dir = claude_cli_dir()
+    cli_dir = agent_cli_dir(provider)
     if cli_dir is not None:
         parts.append(str(cli_dir))
     existing = env.get("PATH", "")
@@ -239,33 +256,35 @@ async def ship_skill(
             skill_src=skill_src,
             mode=mode,
         )
-        options = ClaudeAgentOptions(
+        selected_model = model or cfg.ship_model
+        provider = provider_for_model(selected_model)
+        options = AgentOptions(
             # The agent edits the checkout in place, so its cwd IS the checkout.
-            cwd=str(target.src_dir),
+            cwd=target.src_dir,
             # Real environment — NOT scrubbed: git/gh creds + network + uv. Marked with the
             # holder so the teardown below can find whatever the agent leaves running; the
             # holder path appears nowhere else in this agent's environment.
-            env=label_env(_ship_env(target, auth_mode), holder),
-            model=model or cfg.ship_model,
+            env=label_env(_ship_env(target, auth_mode, provider), holder),
+            model=selected_model,
             # No default budget cap: only bound the agent if the caller asked.
             max_turns=max_turns,
-            max_budget_usd=max_usd,
+            max_usd=max_usd,
+            # Codex reports no billed figure, so a budget cap needs the run's own rate table.
+            price_usd=pricer(selected_model, cfg.prices),
             # It reads the staged skill payload to copy into the wheel.
-            add_dirs=[str(skill_src)],
+            add_dirs=(skill_src,),
             # No skill discovery: the shipper packages a skill, it does not consume one.
-            setting_sources=[],
-            permission_mode="bypassPermissions",
-            system_prompt={"type": "preset", "preset": "claude_code"},
+            discover_skills=False,
         )
 
-        result: ResultMessage | None = None
+        result: AgentResult | None = None
         agent_error: Exception | None = None
         try:
-            async for message in query(prompt=prompt, options=options):
-                if log is not None:
-                    log.append(message)
-                if isinstance(message, ResultMessage):
-                    result = message
+            result = await run_agent(
+                prompt,
+                options=options,
+                on_event=log.append if log is not None else None,
+            )
         except Exception as err:  # noqa: BLE001 - a failed ship is an error to report, re-raised below
             agent_error = err
         finally:

@@ -9,6 +9,7 @@ from typing import Any
 import yaml
 
 from .paths import PathError, slugify
+from .prices import Rates
 
 
 class ConfigError(ValueError):
@@ -42,6 +43,11 @@ class Config:
     improve_model: str = "claude-opus-5"
     tasks_model: str = "claude-opus-5"
     ship_model: str = "claude-opus-5"
+    #: Per-model token rates (USD per million), overriding or extending the built-in table
+    #: in :mod:`acumen.prices`. Name a model here when you are on negotiated rates, run
+    #: through a gateway, or use a model acumen does not ship a price for — an unpriced
+    #: model still records its tokens, but its ``cost_usd`` is left unset rather than zero.
+    prices: dict[str, Rates] = field(default_factory=dict)
 
     @property
     def is_local(self) -> bool:
@@ -67,6 +73,7 @@ _KNOWN = {
     "tasks_model",
     "ship_model",
     "skill_name",
+    "prices",
 }
 
 
@@ -129,6 +136,24 @@ def _str_list(raw: dict[str, Any], key: str, default: list[str]) -> list[str]:
     return list(value)
 
 
+def _prices(raw: dict[str, Any]) -> dict[str, Rates]:
+    """Validate the optional ``prices:`` block into rates keyed by model ID."""
+    if "prices" not in raw:
+        return {}
+    value = raw["prices"]
+    if not isinstance(value, dict):
+        raise ConfigError(f"'prices' must be a mapping of model to rates, got {value!r}")
+    table: dict[str, Rates] = {}
+    for model, rates in value.items():
+        if not isinstance(model, str) or not model.strip():
+            raise ConfigError(f"'prices' keys must be non-empty model IDs, got {model!r}")
+        try:
+            table[model.strip().lower()] = Rates.from_mapping(rates, model=model)
+        except ValueError as err:
+            raise ConfigError(f"'prices': {err}") from err
+    return table
+
+
 def parse_config(raw: Any) -> Config:
     """Validate an already-parsed ``config.yaml`` document.
 
@@ -175,6 +200,7 @@ def parse_config(raw: Any) -> Config:
         improve_model=_optional_str(raw, "improve_model", default_model),
         tasks_model=_optional_str(raw, "tasks_model", default_model),
         ship_model=_optional_str(raw, "ship_model", default_model),
+        prices=_prices(raw),
     )
 
 

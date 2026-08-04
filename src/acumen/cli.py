@@ -7,8 +7,10 @@ import asyncio
 import sys
 import time
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 
+from acumen.agents import AgentError, AgentProvider, check_agent_cli, provider_for_model
 from acumen.bench import build_matrix, pending, run_matrix, summarize
 from acumen.config import ConfigError, load_config
 from acumen.draft import DraftError, draft_skill
@@ -16,6 +18,16 @@ from acumen.env import DEFAULT_CACHE_ROOT, AuthMode, EnvError, prepare_target, r
 from acumen.improve import ImproveError, improve_skill
 from acumen.logs import LiveLog
 from acumen.paths import SPLITS
+from acumen.pricefeed import (
+    PRICE_SOURCES,
+    PRICE_TIER,
+    PriceFeedError,
+    diff_rates,
+    refresh,
+    shipped_rates,
+    to_yaml_block,
+)
+from acumen.prices import DEFAULT_RATES, RATES_AS_OF, Rates, resolve_rates
 from acumen.report import ReportError, build_report
 from acumen.runner import RunOutcome, StderrFilter
 from acumen.scaffold import InitError, scaffold
@@ -66,23 +78,56 @@ def _add_feedback_arg(parser: argparse.ArgumentParser, *, extra: str = "") -> No
 def _add_auth_arg(parser: argparse.ArgumentParser) -> None:
     """Add the ``--auth`` flag to a single-agent subcommand.
 
-    These commands spawn one agent, so they default to the Claude subscription ("session")
-    when a subscription login is present and fall back to the API key otherwise. ``bench`` has
+    These commands spawn one agent, so they default to the provider subscription ("session")
+    when a login is present and fall back to the API key otherwise. ``bench`` has
     no such flag — it always bills the API so its recorded ``cost_usd`` is real.
     """
     parser.add_argument(
         "--auth",
         choices=("auto", "session", "api"),
         default="auto",
-        help="which credential to bill: 'session' (Claude subscription), 'api' (Anthropic API), "
+        help="which credential to bill: 'session' (Claude/Codex subscription), 'api' (provider API), "
         "or 'auto' (default: session if you're logged in, else the API)",
     )
 
 
-def _print_auth(mode: AuthMode) -> None:
+def _print_auth(mode: AuthMode, provider: AgentProvider = "claude") -> None:
     """Report which credential the run will bill, so the choice is never silent."""
-    label = "Claude subscription (session)" if mode == "session" else "API key"
+    product = "Claude" if provider == "claude" else "Codex"
+    label = f"{product} subscription (session)" if mode == "session" else f"{product} API key"
     print(f"auth: {label}", flush=True)
+
+
+def _warn_codex_accounting(provider: AgentProvider) -> None:
+    """Say what a Codex cap can and cannot do before the spend, not after.
+
+    ``codex exec`` has no cap of its own, so acumen enforces both against the event stream.
+    That works exactly as advertised for turns, which stream. Usage does not: Codex reports it
+    once, when the turn ends, so ``max_usd`` can only be recognized after the money is spent.
+    It still records the run as a budget failure — the same outcome Claude would give it — but
+    the only cap that actually *bounds* a Codex run is ``max_turns``.
+    """
+    if provider == "codex":
+        print(
+            "note: Codex reports usage only when a turn ends, so max_usd marks an over-budget "
+            "run as a failure but cannot stop the spend — bound Codex runs with max_turns",
+            file=sys.stderr,
+        )
+
+
+def _warn_unpriced(models: set[str], overrides: dict[str, Rates]) -> None:
+    """Name models with no rates before the spend, not after.
+
+    An unpriced model still records its tokens; only ``cost_usd`` is left unset. Saying so
+    up front is what stops a missing rate from reading as a free model in the report.
+    """
+    unpriced = sorted(model for model in models if resolve_rates(model, overrides) is None)
+    if unpriced:
+        print(
+            f"note: no token rates for {', '.join(unpriced)} — these runs record tokens but no cost. "
+            f"Add a 'prices:' entry in config.yaml to price them (rates as of {RATES_AS_OF}).",
+            file=sys.stderr,
+        )
 
 
 def _print_log_result(log: LiveLog) -> None:
@@ -90,7 +135,7 @@ def _print_log_result(log: LiveLog) -> None:
     if log.html_rendered:
         print(f"log → {log.html_path}")
     else:
-        print("note: HTML log not rendered (claude-code-log missing?) — the jsonl log is complete", file=sys.stderr)
+        print("note: HTML log not rendered — the jsonl log is complete", file=sys.stderr)
 
 
 def _fmt_secs(seconds: float) -> str:
@@ -150,7 +195,8 @@ class _Progress:
         toks = int(p.get("input_tokens", 0)) + int(p.get("output_tokens", 0))
         cost = float(p.get("cost_usd", 0.0))
         dur = _fmt_secs(float(p.get("duration_s", 0.0)))
-        stats = f"{_fmt_tokens(toks)}tok ${cost:.2f} {dur}"
+        cost_label = f"${cost:.2f}" if p.get("cost_available", True) else "cost n/a"
+        stats = f"{_fmt_tokens(toks)}tok {cost_label} {dur}"
         print(
             f"[{self._stamp()}] {mark} {_key_label(outcome.key)}"
             f"  ({outcome.reason})  {stats}"
@@ -197,7 +243,12 @@ def _cmd_bench(args: argparse.Namespace) -> int:
         return 0
 
     # bench records real per-run cost, so it must bill the API — never the subscription.
-    auth_mode = resolve_auth_mode("api", allow_session=False)
+    providers = {provider_for_model(item.model) for item in todo}
+    auth_modes = {provider: resolve_auth_mode("api", allow_session=False, provider=provider) for provider in providers}
+    for provider in sorted(providers):
+        check_agent_cli(provider)
+        _warn_codex_accounting(provider)
+    _warn_unpriced({item.model for item in todo}, cfg.prices)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]} (venv {target.venv_dir})", flush=True)
@@ -210,7 +261,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
             target=target,
             runs_root=args.runs,
             max_concurrency=cfg.max_concurrency,
-            auth_mode=auth_mode,
+            auth_modes=auth_modes,
             skill=skill,
             skill_name=cfg.skill_name,
             keep_sandbox=args.keep_sandboxes,
@@ -218,6 +269,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
             on_start=progress.on_start,
             on_done=progress.on_done,
             env_passthrough=cfg.env_passthrough,
+            price_overrides=cfg.prices,
         )
     )
 
@@ -225,7 +277,11 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     counts = summarize(outcomes)
     breakdown = ", ".join(f"{reason}={n}" for reason, n in sorted(counts.items()))
     total_cost = sum(float(o.payload.get("cost_usd", 0.0)) for o in outcomes)
-    print(f"\n{passed}/{len(outcomes)} passed in {_fmt_secs(progress.elapsed)}  (${total_cost:.2f}, {breakdown})")
+    unpriced = sum(not o.payload.get("cost_available", True) for o in outcomes)
+    cost_summary = f"${total_cost:.2f}"
+    if unpriced:
+        cost_summary += f" + {unpriced} unpriced run(s)"
+    print(f"\n{passed}/{len(outcomes)} passed in {_fmt_secs(progress.elapsed)}  ({cost_summary}, {breakdown})")
 
     # The comparison is only meaningful if the skill actually reached the agent, so say
     # so rather than leaving it to be discovered later in the transcripts.
@@ -258,8 +314,11 @@ def _cmd_draft(args: argparse.Namespace) -> int:
         )
         return 2
 
-    auth_mode = resolve_auth_mode(args.auth, allow_session=True)
-    _print_auth(auth_mode)
+    provider = provider_for_model(cfg.draft_model)
+    check_agent_cli(provider)
+    auth_mode = resolve_auth_mode(args.auth, allow_session=True, provider=provider)
+    _print_auth(auth_mode, provider)
+    _warn_codex_accounting(provider)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
@@ -312,8 +371,11 @@ def _cmd_improve(args: argparse.Namespace) -> int:
     skill = load_skill(args.skills, parent, expect_name=cfg.skill_name)
     print(f"improving {skill.version} ({skill.name}, {skill.hash[:19]}…) with {cfg.improve_model}")
 
-    auth_mode = resolve_auth_mode(args.auth, allow_session=True)
-    _print_auth(auth_mode)
+    provider = provider_for_model(cfg.improve_model)
+    check_agent_cli(provider)
+    auth_mode = resolve_auth_mode(args.auth, allow_session=True, provider=provider)
+    _print_auth(auth_mode, provider)
+    _warn_codex_accounting(provider)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
@@ -369,8 +431,11 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
         )
         return 2
 
-    auth_mode = resolve_auth_mode(args.auth, allow_session=True)
-    _print_auth(auth_mode)
+    provider = provider_for_model(cfg.tasks_model)
+    check_agent_cli(provider)
+    auth_mode = resolve_auth_mode(args.auth, allow_session=True, provider=provider)
+    _print_auth(auth_mode, provider)
+    _warn_codex_accounting(provider)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
@@ -417,8 +482,11 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         else ("a GitHub URL — the change is delivered as a pull request")
     )
     print(f"shipping {args.version} of {cfg.skill_name} into {cfg.repo} ({where})")
-    auth_mode = resolve_auth_mode(args.auth, allow_session=True)
-    _print_auth(auth_mode)
+    provider = provider_for_model(cfg.ship_model)
+    check_agent_cli(provider)
+    auth_mode = resolve_auth_mode(args.auth, allow_session=True, provider=provider)
+    _print_auth(auth_mode, provider)
+    _warn_codex_accounting(provider)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
@@ -499,10 +567,61 @@ def _cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_prices(args: argparse.Namespace) -> int:
+    """Show the token rates cost is computed from, and optionally re-check them upstream."""
+    overrides: dict[str, Rates] = {}
+    if args.config.is_file():
+        overrides = load_config(args.config).prices
+
+    if not args.refresh:
+        print(f"rates (USD per million tokens), verified {RATES_AS_OF} — {PRICE_TIER}")
+        for model, rates in sorted({**DEFAULT_RATES, **overrides}.items()):
+            source = "config" if model in overrides else "built-in"
+            print(
+                f"  {model:28} in ${rates.input:<7} cached ${rates.cached_input:<7} "
+                f"write ${rates.cache_write:<7} out ${rates.output:<7} ({source})"
+            )
+        print("\nre-check against the providers' pricing pages with: acumen prices --refresh")
+        return 0
+
+    for name, url in PRICE_SOURCES.items():
+        print(f"fetching {name}: {url}", flush=True)
+    fetched = refresh(today=date.today())
+
+    current = {**shipped_rates(), **overrides}
+    # Default to the models actually in play — the pages list every model each provider
+    # has ever sold, and a wall of irrelevant diffs is a wall nobody reads.
+    if not args.all:
+        relevant = set(current) | (
+            {m.strip().lower() for m in load_config(args.config).models} if args.config.is_file() else set()
+        )
+        fetched = {model: rates for model, rates in fetched.items() if model in relevant}
+    changes = diff_rates(current, fetched)
+
+    if not changes:
+        print(f"\nup to date — {len(fetched)} model(s) match the table verified {RATES_AS_OF}")
+        return 0
+
+    print(f"\n{len(changes)} change(s) against the table verified {RATES_AS_OF} ({PRICE_TIER}):")
+    for change in changes:
+        print(change.describe())
+
+    block = to_yaml_block({change.model: change.after for change in changes})
+    if args.out is not None:
+        args.out.write_text(block)
+        print(f"\nwrote {args.out} — merge its 'prices:' block into config.yaml to adopt these")
+    else:
+        print("\nadopt by adding to config.yaml (or re-run with --out PATH):\n")
+        print(block, end="")
+    # Nothing is applied automatically: a mis-parsed tier or context band would otherwise
+    # silently re-price every future run.
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the ``acumen`` argument parser."""
     parser = argparse.ArgumentParser(
-        prog="acumen", description="Build, benchmark, and optimize Claude skills for Python packages."
+        prog="acumen", description="Build, benchmark, and optimize agentic skills for Python packages."
     )
     sub = parser.add_subparsers(dest="command", required=True)
     bench = sub.add_parser("bench", help="run a benchmark pass")
@@ -585,6 +704,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report.set_defaults(func=_cmd_report)
 
+    prices = sub.add_parser("prices", help="show the token rates cost is computed from, or re-check them")
+    prices.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml (for overrides)")
+    prices.add_argument("--refresh", action="store_true", help="fetch the providers' pricing pages and diff them")
+    prices.add_argument("--all", action="store_true", help="with --refresh, report every model, not just yours")
+    prices.add_argument("--out", type=Path, default=None, help="with --refresh, write the 'prices:' block here")
+    prices.set_defaults(func=_cmd_prices)
+
     init = sub.add_parser("init", help="scaffold a starter config.yaml and tasks.yaml")
     init.add_argument("--dir", type=Path, default=Path("."), dest="directory", help="directory to scaffold into")
     init.add_argument("--force", action="store_true", help="overwrite existing config.yaml / tasks.yaml")
@@ -607,6 +733,8 @@ def main(argv: list[str] | None = None) -> int:
         ConfigError,
         TaskError,
         EnvError,
+        AgentError,
+        PriceFeedError,
         SkillError,
         DraftError,
         ImproveError,

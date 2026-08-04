@@ -70,10 +70,21 @@ a command.
 - The target (`repo`: a GitHub URL or a local path) must be pip-installable and declare
   `[project].name` in `pyproject.toml`. A local `repo` path is resolved **relative to
   `config.yaml`**.
-- Credentials: `bench` **always bills the Anthropic API** and refuses to run without
-  `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN` / Bedrock / Vertex) — it records real
-  per-run `cost_usd`, and it has no `--auth` flag. `tasks`/`draft`/`improve`/`ship`
-  default to the Claude subscription if you are logged in (`--auth {auto,session,api}`).
+- Credentials: `bench` **always bills the selected provider API** and has no `--auth`
+  flag. Claude needs `ANTHROPIC_API_KEY` (or Anthropic provider credentials); Codex
+  needs `CODEX_API_KEY` or `OPENAI_API_KEY`. `tasks`/`draft`/`improve`/`ship` default
+  to the selected provider's logged-in subscription (`--auth {auto,session,api}`).
+  Both backends are optional: `pip install acumen[claude]` for Claude, plain `acumen` plus
+  the `codex` CLI for Codex. A model whose backend is missing fails preflight with the
+  install command.
+- **Codex caps are not equally strict.** `codex exec` has no cap of its own, so acumen
+  enforces both from its event stream. `max_turns` bounds the run (counted in completed
+  model actions, since one `codex exec` is a single Codex turn). `max_usd` cannot: Codex
+  reports usage only when a turn ends, so an over-budget run is recorded as a `budget`
+  failure but the spend already happened — bound Codex with `max_turns`.
+- **`cost_usd` is derived from token counts**, not from the provider — one arithmetic
+  path for both. Rates are frozen into each run; see them with `acumen prices`, re-check
+  them with `acumen prices --refresh`, override or extend via `prices:` in `config.yaml`.
 - The target is cloned + installed into a venv cached under `~/.cache/acumen`, keyed by
   (repo, ref). Use `--refresh-target` after changing the target's own source.
 
@@ -82,8 +93,8 @@ a command.
 1. **Grading is exact string match on `answer.md` after `strip()`, case-sensitive.**
    Nothing is normalized. `**TOKEN**` against `TOKEN` fails (recorded as `format_error`,
    not `wrong_answer`). Task answers must be one short unambiguous token.
-2. **A pass is models × tasks × splits × replicates.** The scaffolded config lists 3
-   models and `n_replicates: 3`, so *one* task costs 18 agent runs *per arm*. Check with
+2. **A pass is models × tasks × splits × replicates.** The scaffolded config lists 6
+   models and `n_replicates: 3`, so *one* task costs 36 agent runs *per arm*. Check with
    `acumen bench --dry-run` (it plans and exits, spending nothing) and agree the size with
    the user before spending. Trim with `models:`, `n_replicates: 1`, `--task ID`, `--split`.
 3. **`max_turns`/`max_usd` in `config.yaml` cap benchmark agents only.** `draft`,

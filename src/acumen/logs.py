@@ -24,21 +24,32 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from datetime import datetime
+from functools import cache
 from pathlib import Path
-from typing import Any, TextIO
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, TextIO
 
-from claude_agent_sdk import (
-    AssistantMessage,
-    ResultMessage,
-    SystemMessage,
-    TextBlock,
-    ThinkingBlock,
-    ToolResultBlock,
-    ToolUseBlock,
-    UserMessage,
-)
+from acumen.agents import AgentResult
+from acumen.transcript import locate_transcript, render_codex_events, render_transcript
 
-from acumen.transcript import locate_transcript, render_transcript
+if TYPE_CHECKING:
+    from claude_agent_sdk import AssistantMessage, ResultMessage, UserMessage
+
+
+@cache
+def _sdk() -> ModuleType | None:
+    """The Claude Agent SDK, or ``None`` on a Codex-only install.
+
+    The SDK's message classes are what a Claude run is normalized from, and there is no way to
+    recognize them without importing it — but a Codex-only install has no SDK and still logs.
+    Cached because :meth:`LiveLog.append` runs once per message.
+    """
+    try:
+        import claude_agent_sdk
+    except ModuleNotFoundError:
+        return None
+    return claude_agent_sdk
+
 
 #: tool_input keys, in priority order, whose value best summarizes a tool call in one line.
 _SUMMARY_KEYS = ("command", "file_path", "path", "notebook_path", "pattern", "url", "query", "description", "prompt")
@@ -140,13 +151,20 @@ class LiveLog:
             for line in self._render_lines(record):
                 self._echo(line)
 
-    def finalize(self, *, config_dir: Path, work_dir: Path, result: ResultMessage | None) -> bool:
-        """Locate the run's SDK-native transcript and render the HTML log from it.
+    def finalize(self, *, config_dir: Path, work_dir: Path, result: ResultMessage | AgentResult | None) -> bool:
+        """Render the HTML log from whatever transcript the run's provider produced.
 
-        Call before the throwaway config dir is removed — the native transcript still lives under
-        it at this point. A no-op that returns ``False`` if the run produced no result.
+        Call before the throwaway config dir is removed — a Claude run's native transcript still
+        lives under it at this point. Codex writes no transcript file of its own, so its HTML is
+        rendered from the event stream carried back on the result. A no-op that returns ``False``
+        if the run produced no result.
         """
         if result is None:
+            return False
+        if getattr(result, "provider", "claude") == "codex":
+            self.html_rendered = render_codex_events(getattr(result, "transcript", []), self.html_path)
+            return self.html_rendered
+        if not result.session_id:
             return False
         native = locate_transcript(config_dir, work_dir, result.session_id)
         if native is None or not native.is_file():
@@ -168,13 +186,20 @@ class LiveLog:
     # ── Normalization ──────────────────────────────────────────────────────────────────
 
     def _normalize(self, message: Any) -> dict[str, Any] | None:
-        if isinstance(message, AssistantMessage):
+        # Codex events are plain dicts, so they are recognized without the SDK — which is what
+        # lets a Codex-only install log at all.
+        if isinstance(message, dict):
+            return self._codex_event(message)
+        sdk = _sdk()
+        if sdk is None:
+            return None
+        if isinstance(message, sdk.AssistantMessage):
             return self._assistant_event(message)
-        if isinstance(message, UserMessage):
+        if isinstance(message, sdk.UserMessage):
             return self._user_event(message)
-        if isinstance(message, SystemMessage):
+        if isinstance(message, sdk.SystemMessage):
             return {"type": "system", "subtype": message.subtype}
-        if isinstance(message, ResultMessage):
+        if isinstance(message, sdk.ResultMessage):
             return {
                 "type": "result",
                 "is_error": bool(message.is_error),
@@ -186,17 +211,76 @@ class LiveLog:
             }
         return None
 
+    def _codex_event(self, message: dict[str, Any]) -> dict[str, Any] | None:
+        """Normalize one event from ``codex exec --json``."""
+        kind = message.get("type")
+        if kind == "thread.started":
+            return {"type": "system", "subtype": "thread.started", "session_id": message.get("thread_id")}
+        if kind == "turn.started":
+            return {"type": "system", "subtype": "turn.started"}
+        if kind == "turn.completed":
+            usage = message.get("usage")
+            return {"type": "result", "turns": 1, "cost_usd": None, "usage": usage}
+        if kind in {"error", "turn.failed"}:
+            return {
+                "type": "result",
+                "is_error": True,
+                "subtype": kind,
+                "error": message.get("message") or message.get("error"),
+            }
+        if kind not in {"item.started", "item.updated", "item.completed"}:
+            return None
+        item = message.get("item")
+        if not isinstance(item, dict):
+            return None
+        item_type = item.get("type")
+        if item_type == "agent_message":
+            text = item.get("text")
+            return {"type": "assistant", "text": text} if text else None
+        if item_type == "reasoning":
+            text = item.get("text")
+            return {"type": "assistant", "thinking": _truncate(str(text or ""), _THINKING_CAP)}
+        if item_type == "command_execution":
+            command = str(item.get("command") or "")
+            return {
+                "type": "assistant",
+                "tools": [
+                    {
+                        "id": item.get("id"),
+                        "name": "command_execution",
+                        "summary": _truncate(" ".join(command.split()), _SUMMARY_CAP),
+                        "status": item.get("status"),
+                    }
+                ],
+            }
+        if item_type == "file_change":
+            return {
+                "type": "assistant",
+                "tools": [
+                    {
+                        "id": item.get("id"),
+                        "name": "file_change",
+                        "summary": _truncate(str(item.get("changes") or ""), _SUMMARY_CAP),
+                        "status": item.get("status"),
+                    }
+                ],
+            }
+        return None
+
     def _assistant_event(self, message: AssistantMessage) -> dict[str, Any]:
+        # Only reached from _normalize, which has already established the SDK is importable.
+        sdk = _sdk()
+        assert sdk is not None
         text_parts: list[str] = []
         thinking_parts: list[str] = []
         tools: list[dict[str, Any]] = []
         for block in message.content:
-            if isinstance(block, TextBlock):
+            if isinstance(block, sdk.TextBlock):
                 if block.text.strip():
                     text_parts.append(block.text)
-            elif isinstance(block, ThinkingBlock):
+            elif isinstance(block, sdk.ThinkingBlock):
                 thinking_parts.append(block.thinking)
-            elif isinstance(block, ToolUseBlock):
+            elif isinstance(block, sdk.ToolUseBlock):
                 self._tool_names[block.id] = block.name
                 tools.append({"id": block.id, "name": block.name, "summary": _tool_summary(block.input)})
         event: dict[str, Any] = {"type": "assistant"}
@@ -212,12 +296,14 @@ class LiveLog:
         return event
 
     def _user_event(self, message: UserMessage) -> dict[str, Any] | None:
+        sdk = _sdk()
+        assert sdk is not None
         content = message.content
         if not isinstance(content, list):
             return None  # a plain user turn (our own prompt) — nothing worth an event
         results: list[dict[str, Any]] = []
         for block in content:
-            if isinstance(block, ToolResultBlock):
+            if isinstance(block, sdk.ToolResultBlock):
                 results.append(
                     {
                         "tool_use_id": block.tool_use_id,

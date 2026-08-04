@@ -15,13 +15,14 @@ acumen bench [--no-skill | --skill v1] [--split train|test]... [--task ID]...
 - `--dry-run` prints the planned matrix and exits **before** target prep and before any
   agent runs — free, and the right way to check the size of a pass.
 - `--replicates` / `--max-concurrency` override the config for this pass only.
-- Always bills the API (`ANTHROPIC_API_KEY` etc.); there is no `--auth` here, because the
-  recorded `cost_usd` must be real metered spend.
+- Always bills the selected provider's API (`ANTHROPIC_API_KEY` for Claude;
+  `CODEX_API_KEY`/`OPENAI_API_KEY` for Codex); there is no `--auth` here.
 - Ctrl-C is safe: completed runs are preserved and the next invocation resumes.
 
 **Arm parity is the whole point.** Both arms get an identical prompt, tools, caps, and
 environment; the only difference is that a skill arm copies the skill's content files into
-`<sandbox>/.claude/skills/<skill_name>/` where project settings discovery finds it.
+`<sandbox>/.claude/skills/<skill_name>/` for Claude or
+`<sandbox>/.agents/skills/<skill_name>/` for Codex, where project discovery finds it.
 `meta.json` is never copied. Each run gets a fresh empty sandbox with the target venv on
 PATH, a throwaway `HOME` and `CLAUDE_CONFIG_DIR` — no repo source, no user settings, no
 `CLAUDE.md` memories, no visibility of other runs.
@@ -39,14 +40,31 @@ holds five files:
 |---|---|
 | `answer.md` | What the agent wrote — the only thing graded |
 | `script.py` | The agent's reproduction script (absent if it ran no code) |
-| `transcript.jsonl` | SDK-native transcript |
-| `transcript.html` | Rendered transcript (via `claude-code-log`) |
+| `transcript.jsonl` | The provider's own transcript — SDK-native for Claude, the `codex exec` event stream for Codex |
+| `transcript.html` | Rendered transcript, written for both providers |
 | `result.json` | The unit of record — written **last** |
 
 `result.json` presence + non-zero size is what marks a run complete, which is what makes
 resume safe. Useful fields: `success`, `reason`, `answer`, `expected`, `model`, `turns`,
 `cost_usd`, `input_tokens`, `output_tokens`, `duration_s`, `skill_hash`, `skill_name`,
 `skill_loaded`, `pkg_version`, `commit`, `session_id`, `subtype`, `error`.
+
+**`cost_usd` is computed from tokens, not reported by the provider.** Each run records
+`input_tokens` (the total), `cache_read_tokens`, `cache_write_tokens`, and `output_tokens`;
+cost is those counts times the model's rates, which are frozen into the run as
+`price_rates` so old runs are never re-priced. The provider's own figure, where it exists,
+is kept alongside as `provider_cost_usd` for cross-checking. A model with no rate leaves
+`cost_available` false and `cost_usd` 0 — check the flag before summing. Inspect or
+re-check the rate table with `acumen prices` / `acumen prices --refresh`, and set
+`prices:` in `config.yaml` to price an unlisted model.
+
+`codex exec` has no cap of its own, so acumen enforces both from its event stream, at
+different resolutions. `max_turns` really does stop the run — counted in completed model
+actions (message, command, file change, tool/search call), because one `codex exec` is a
+single Codex turn however much work happens inside it. `max_usd` only marks the outcome:
+Codex reports usage once, when the turn ends, so the breach is visible after the spend, not
+before. The run is recorded `budget` either way; the CLI warns before the pass. A turn-capped
+Codex run is stopped mid-turn and so records no usage — a failure with zero tokens.
 
 ## Reasons
 

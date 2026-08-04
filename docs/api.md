@@ -133,7 +133,9 @@ conversion.
 
     LiveLog
     locate_transcript
+    render_agent_transcript
     render_transcript
+    render_codex_transcript
 ```
 
 ## Reporting

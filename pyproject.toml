@@ -22,8 +22,6 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-  "claude-agent-sdk>=0.2.116",
-  "claude-code-log",
   "matplotlib",
   "numpy",
   "pandas",
@@ -32,6 +30,14 @@ dependencies = [
   "scipy",
   # for debug logging (referenced from the issue template)
   "session-info2",
+]
+# Backends are optional and independent: install the ones you actually run. Claude needs a
+# Python SDK (and claude-code-log to render its transcripts); Codex is an external CLI, so it
+# adds no Python dependency at all — `codex` on PATH is the whole requirement.
+optional-dependencies.all = [ "acumen[claude]" ]
+optional-dependencies.claude = [
+  "claude-agent-sdk>=0.2.116",
+  "claude-code-log",
 ]
 # https://docs.pypi.org/project_metadata/#project-urls
 urls.Documentation = "https://acumen.readthedocs.io/"
@@ -85,6 +91,9 @@ envs.hatch-test.overrides.matrix.deps.env-vars = [
   { value = "allow", key = "UV_PRERELEASE", if = [ "pre" ] },
 ]
 envs.hatch-test.dependency-groups = [ "dev", "test" ]
+# The test suite covers both backends, so it installs every optional one. The Codex-only and
+# Claude-only import paths are covered from within the suite, by hiding a backend at import time.
+envs.hatch-test.features = [ "all" ]
 
 [tool.ruff]
 line-length = 120
