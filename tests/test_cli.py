@@ -9,16 +9,18 @@ single token is spent.
 from __future__ import annotations
 
 import csv
+from datetime import date
 from pathlib import Path
 
 import pytest
 
 from acumen.bench import BenchmarkInvalidError
-from acumen.cli import _Progress, build_parser, main
+from acumen.cli import _agent_prices, _Progress, build_parser, main
 from acumen.config import load_config
 from acumen.env import Target
 from acumen.paths import RunKey
-from acumen.prices import RATES_AS_OF
+from acumen.pricefeed import PriceFeedError
+from acumen.prices import Rates
 from acumen.runner import RunOutcome
 from acumen.tasks import load_tasks
 
@@ -37,6 +39,18 @@ def bench_args(project: Path, *extra: str) -> list[str]:
         str(project / "skills"),
         *extra,
     ]
+
+
+@pytest.fixture
+def stub_prices(monkeypatch: pytest.MonkeyPatch) -> dict[str, Rates]:
+    """Stand in for the live pricing pages, which ``bench`` reads before every pass.
+
+    Returns the fetched table so a test can assert on what the pass was priced by, or
+    mutate it to model a price change between passes.
+    """
+    fetched = {"claude-haiku-4-5-20251001": Rates(input=1.0, cached_input=0.1, cache_write=1.25, output=5.0)}
+    monkeypatch.setattr("acumen.pricefeed.refresh", lambda **_kwargs: fetched)
+    return fetched
 
 
 def test_parser_requires_a_command() -> None:
@@ -230,7 +244,12 @@ def test_bench_reports_a_missing_config(tmp_path: Path, capsys: pytest.CaptureFi
 
 
 def test_bench_runs_every_arm_when_none_is_selected(
-    project: Path, skills_root: Path, model: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    project: Path,
+    skills_root: Path,
+    model: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    stub_prices,
 ) -> None:
     seen: list[tuple[str | None, int]] = []
 
@@ -267,7 +286,7 @@ def test_bench_runs_every_arm_when_none_is_selected(
 
 
 def test_bench_runs_only_the_named_arm(
-    project: Path, skills_root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    project: Path, skills_root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, stub_prices
 ) -> None:
     seen: list[str | None] = []
 
@@ -299,7 +318,7 @@ def test_bench_runs_only_the_named_arm(
 
 
 def test_bench_exits_nonzero_and_prints_provider_exhaustion(
-    project: Path, model: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    project: Path, model: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, stub_prices
 ) -> None:
     key = RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=1)
     outcome = RunOutcome(
@@ -441,11 +460,176 @@ def test_ship_rejects_an_unknown_version(project: Path, skills_root: Path, capsy
     assert "no such skill version" in capsys.readouterr().err
 
 
-def test_prices_lists_the_rate_table_without_touching_the_network(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_prices_reads_the_live_pages_because_nothing_ships_with_the_package(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """`acumen prices` is the offline view; only --refresh reaches for the network."""
-    assert main(["prices", "--config", str(tmp_path / "absent.yaml")]) == 0
+    """There is no offline view to show: rates exist only on the providers' pages."""
+    fetched = {
+        "claude-haiku-4-5-20251001": Rates(input=1.0, cached_input=0.1, cache_write=1.25, output=5.0),
+        "gpt-5.6-sol": Rates(input=5.0, cached_input=0.5, cache_write=6.25, output=30.0),
+    }
+    monkeypatch.setattr("acumen.cli.refresh", lambda **_kwargs: fetched)
+
+    assert main(["prices", "--config", str(project / "config.yaml")]) == 0
+
     out = capsys.readouterr().out
-    assert "claude-opus-5" in out and "gpt-5.6-sol" in out
-    assert RATES_AS_OF in out
+    assert "claude-haiku-4-5-20251001" in out and "(fetched)" in out
+    assert date.today().isoformat() in out
+
+
+def test_prices_exits_nonzero_when_the_pages_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no shipped table there is nothing to print, so this is a failure, not a warning."""
+    monkeypatch.setattr(
+        "acumen.cli.refresh",
+        lambda **_kwargs: (_ for _ in ()).throw(PriceFeedError("could not fetch: timed out")),
+    )
+
+    assert main(["prices", "--config", str(tmp_path / "absent.yaml")]) == 2
+    assert "could not fetch" in capsys.readouterr().err
+
+
+def test_prices_refresh_flags_a_pin_that_has_drifted_from_the_published_price(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Pinned rates are the only ones that can go stale, so they are what --refresh checks."""
+    (project / "config.yaml").write_text(
+        (project / "config.yaml").read_text() + "prices:\n  gpt-5.6-sol:\n    input: 5.0\n    output: 30.0\n"
+    )
+    published = {"gpt-5.6-sol": Rates(input=8.0, cached_input=0.8, cache_write=10.0, output=48.0)}
+    monkeypatch.setattr("acumen.cli.refresh", lambda **_kwargs: published)
+
+    assert main(["prices", "--refresh", "--config", str(project / "config.yaml")]) == 0
+
+    out = capsys.readouterr().out
+    assert "1 pinned rate(s) differ" in out
+    assert "input $5.0→$8.0" in out
+
+
+def test_prices_refresh_says_nothing_can_drift_without_pins(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Unpinned rates are read live each run, so there is no drift to report."""
+    monkeypatch.setattr("acumen.cli.refresh", lambda **_kwargs: {})
+
+    assert main(["prices", "--refresh", "--config", str(project / "config.yaml")]) == 0
+    assert "nothing can drift" in capsys.readouterr().out
+
+
+def _stub_bench(project: Path, monkeypatch: pytest.MonkeyPatch, seen: list) -> None:
+    """Stand in for everything ``bench`` does after it has resolved its rates."""
+
+    async def fake_matrix(todo, **kwargs) -> list[RunOutcome]:
+        seen.append(kwargs["prices"])
+        return [
+            RunOutcome(key=item.key, success=True, reason="ok", payload={"cost_usd": 0.5, "skill_loaded": True})
+            for item in todo
+        ]
+
+    target = Target(
+        source="target",
+        ref="main",
+        src_dir=project / "src",
+        venv_dir=project / "venv",
+        commit="abc",
+        pkg_name="target",
+        pkg_version="1",
+    )
+    monkeypatch.setattr("acumen.cli.resolve_auth_mode", lambda *_a, **_k: "session")
+    monkeypatch.setattr("acumen.cli.check_agent_cli", lambda *_a, **_k: None)
+    monkeypatch.setattr("acumen.cli.prepare_target", lambda *_a, **_k: target)
+    monkeypatch.setattr("acumen.cli.run_matrix", fake_matrix)
+
+
+def test_bench_prices_its_runs_from_the_live_pages(
+    project: Path, skills_root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A pass takes its rates from what the providers publish on the day it runs.
+
+    Nothing ships with the package to fall back on, and the figure produced is frozen into
+    every result, so this fetch is the only thing standing between the report and a cost
+    column that means nothing.
+    """
+    fetched = {"claude-haiku-4-5-20251001": Rates(input=9.0, cached_input=0.9, cache_write=11.25, output=45.0)}
+    monkeypatch.setattr("acumen.pricefeed.refresh", lambda **_kwargs: fetched)
+    seen: list = []
+    _stub_bench(project, monkeypatch, seen)
+
+    assert main(bench_args(project)) == 0
+
+    assert seen and all(table is seen[0] for table in seen), "every arm must price by one table"
+    lookup = seen[0].lookup("claude-haiku-4-5-20251001")
+    assert lookup.rates.input == 9.0
+    assert lookup.source == "fetched"
+    assert lookup.as_of == date.today().isoformat()
+    assert "prices: 1 model(s) resolved" in capsys.readouterr().out
+
+
+def test_bench_refuses_to_run_when_the_pricing_pages_are_unreachable(
+    project: Path, skills_root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unreachable feed stops the pass before it spends anything.
+
+    There is no table to fall back to, so continuing would store a run with no cost at all
+    while still charging for it — the benchmark would spend real money to produce a report
+    missing one of its headline columns.
+    """
+
+    def unreachable(**_kwargs):
+        raise PriceFeedError("could not fetch https://example.invalid: timed out")
+
+    monkeypatch.setattr("acumen.pricefeed.refresh", unreachable)
+    seen: list = []
+    _stub_bench(project, monkeypatch, seen)
+
+    assert main(bench_args(project)) == 2
+    assert seen == [], "no run may start once pricing is known to be unresolvable"
+    err = capsys.readouterr().err
+    assert "could not fetch" in err
+    assert "'prices:' block in config.yaml" in err, "the error must name the way forward"
+
+
+def test_bench_warns_when_a_benched_model_is_not_published(
+    project: Path, skills_root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A successful fetch that does not cover your model still leaves it unpriced.
+
+    The pass runs — tokens are still recorded — but it must say so before the spend rather
+    than let a blank cost column read as a free model afterwards.
+    """
+    monkeypatch.setattr("acumen.pricefeed.refresh", lambda **_kwargs: {"some-other-model": _RATE})
+    seen: list = []
+    _stub_bench(project, monkeypatch, seen)
+
+    assert main(bench_args(project)) == 0
+
+    assert seen[0].lookup("claude-haiku-4-5-20251001") is None
+    err = capsys.readouterr().err
+    assert "no token rates for claude-haiku-4-5-20251001" in err
+    assert "record tokens but no cost" in err
+
+
+_RATE = Rates(input=1.0, cached_input=0.1, cache_write=1.25, output=5.0)
+
+
+def test_agent_commands_keep_working_when_pricing_is_unavailable(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``draft`` and friends report cost as progress, so an outage must not stop the work.
+
+    It is still announced, and for Codex the real consequence is named: ``max_usd`` is
+    derived from these rates, so an unpriced model has no enforceable budget cap.
+    """
+    monkeypatch.setattr(
+        "acumen.pricefeed.refresh",
+        lambda **_kwargs: (_ for _ in ()).throw(PriceFeedError("could not fetch: timed out")),
+    )
+    cfg = load_config(project / "config.yaml")
+
+    table = _agent_prices(cfg, model="gpt-5.6-sol")
+
+    assert table.lookup("gpt-5.6-sol") is None, "unpriced, rather than guessed from a shipped default"
+    err = capsys.readouterr().err
+    assert "reports no cost" in err
+    assert "max_usd cannot be enforced" in err, "the Codex budget-cap consequence must be named"

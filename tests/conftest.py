@@ -50,6 +50,23 @@ Call `target.run()` first.
 MODEL = "claude-haiku-4-5-20251001"
 
 
+@pytest.fixture(autouse=True)
+def no_price_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the suite honestly offline now that rates are only ever read live.
+
+    No rates ship with the package, so any command that prices anything reaches for the
+    providers' pricing pages. Without this a test would pass or fail on whether the
+    machine happened to have a network. Failing loudly instead forces each such test to
+    state which rates it means to run against, via the ``stub_prices`` fixture or its own
+    patch of ``pricefeed.refresh``.
+    """
+
+    def unavailable(url, **_kwargs):
+        raise AssertionError(f"test reached the network for {url}; stub the pricing fetch instead")
+
+    monkeypatch.setattr("acumen.pricefeed.fetch", unavailable)
+
+
 @pytest.fixture
 def target_pkg(tmp_path: Path) -> Path:
     """A minimal local package, so a config's local ``repo:`` path resolves."""

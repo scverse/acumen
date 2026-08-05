@@ -76,9 +76,23 @@ rates frozen into `price_rates` remain available for reproduction, including Cla
 five-minute and one-hour cache writes plus the legacy aggregate. A model with neither provider
 cost nor rates leaves `cost_available` false and `cost_usd` null. A run without rates leaves
 `inferred_cost_usd` null even when the provider supplied a value, so reports cannot mistake it
-for a free or cross-provider-comparable run. Inspect or re-check the rate table with `acumen
-prices` / `acumen prices --refresh`, and set `prices:` in `config.yaml` to price an unlisted
-model.
+for a free or cross-provider-comparable run.
+
+**No rates ship with the package.** They are read from the providers' pricing pages, because a
+compiled-in table is wrong from whatever date prices next move, and each run's cost is frozen
+when written rather than corrected later. `bench` resolves rates before it spends anything and
+exits 2 if the pages cannot be read. Each run records `price_source` (`config` or `fetched`) and
+`price_rates_as_of` next to the rates themselves, so passes months apart stay individually
+attributable and one report can mix them; the report flags arms priced on different dates, whose
+cost gap includes the price change rather than only the skill's effect.
+
+`draft`, `improve`, `tasks`, and `ship` also fetch, but degrade to unpriced rather than failing:
+their cost line is progress reporting. Note that Codex's `max_usd` is derived from these rates,
+so an unpriced Codex run has no enforceable budget cap — bound it with `max_turns`.
+
+Inspect today's rates with `acumen prices`. Set `prices:` in `config.yaml` to price a model the
+providers don't publish or to pin negotiated rates, which outrank a fetch; `acumen prices
+--refresh` reports pins that have drifted from the published price.
 
 Reports deliberately use `inferred_cost_usd` for every cost-per-run value and comparison, so
 Claude and Codex stay on the same pricing basis even when Claude supplies an SDK estimate. The

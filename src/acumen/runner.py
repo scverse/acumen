@@ -26,7 +26,7 @@ from acumen.paths import (
     TRANSCRIPT_JSONL,
     RunKey,
 )
-from acumen.prices import Rates, normalize_usage, price_run, pricer, rates_payload, resolve_cost, resolve_rates
+from acumen.prices import PriceTable, normalize_usage, price_provenance, price_run, pricer, resolve_cost
 from acumen.prompts import benchmark_prompt
 from acumen.sandbox import Sandbox, sandbox
 from acumen.skills import Skill
@@ -205,7 +205,7 @@ def _build_options(
     max_turns: int,
     max_usd: float,
     read_dirs: tuple[Path, ...] = (),
-    price_overrides: dict[str, Rates] | None = None,
+    prices: PriceTable | None = None,
     stderr: Callable[[str], None] | None = None,
 ) -> AgentOptions:
     """Assemble the SDK options for one run.
@@ -233,7 +233,7 @@ def _build_options(
         max_turns=max_turns,
         max_usd=max_usd,
         discover_skills=True,
-        price_usd=pricer(model, price_overrides),
+        price_usd=pricer(model, prices),
         read_dirs=read_dirs,
         stderr=stderr,
     )
@@ -255,7 +255,7 @@ async def run_once(
     keep_sandbox: bool = False,
     stderr: Callable[[str], None] | None = None,
     env_passthrough: Sequence[str] | None = None,
-    price_overrides: dict[str, Rates] | None = None,
+    prices: PriceTable | None = None,
 ) -> RunOutcome:
     """Execute one benchmark run end to end and write its ``result.json``.
 
@@ -333,7 +333,7 @@ async def run_once(
             max_turns=max_turns,
             max_usd=max_usd,
             read_dirs=(target.venv_dir,),
-            price_overrides=price_overrides,
+            prices=prices,
             stderr=stderr,
         )
         try:
@@ -375,8 +375,8 @@ async def run_once(
     # Preserve frozen-table inference for both providers, but prefer the SDK's value when it
     # exists. For session authentication that provider figure is API-equivalent, not
     # necessarily money charged on an invoice.
-    rates = resolve_rates(model, price_overrides)
-    inferred = price_run(usage, rates)
+    lookup = (prices or PriceTable()).lookup(model)
+    inferred = price_run(usage, None if lookup is None else lookup.rates)
     provider_cost = result.total_cost_usd if result else None
     cost = resolve_cost(provider_cost, inferred)
     payload = {
@@ -405,7 +405,7 @@ async def run_once(
         "inferred_cost_usd": cost.inferred_cost_usd,
         "cost_delta_usd": cost.cost_delta_usd,
         "cost_delta_pct": cost.cost_delta_pct,
-        "price_rates": rates_payload(rates),
+        **price_provenance(lookup),
         "input_tokens": usage.input,
         "output_tokens": usage.output,
         "cache_read_tokens": usage.cache_read,

@@ -1443,6 +1443,32 @@ class Report:
         return len(self.results)
 
 
+def _price_date_note(df: pd.DataFrame) -> str | None:
+    """Warn when the arms being compared were priced on different days.
+
+    Rates are resolved live and frozen per run, which keeps each figure true to what it
+    cost — but it also means arms benchmarked weeks apart carry different prices. The cost
+    comparison between them then mixes a skill effect with a price change, and the cheaper
+    arm may simply be the one that ran before a rise. Nothing here can separate the two,
+    so the report says so and leaves the reader to judge.
+
+    Only differences *between* arms are flagged. Resuming one arm across a price change
+    spreads the same ambiguity within it, which the per-run table already exposes.
+    """
+    if "price_rates_as_of" not in df.columns or "arm" not in df.columns:
+        return None
+    dated = df[df["price_rates_as_of"].notna()]
+    per_arm = {arm: set(group["price_rates_as_of"]) for arm, group in dated.groupby("arm")}
+    seen = set().union(*per_arm.values()) if per_arm else set()
+    if len(per_arm) < 2 or len(seen) < 2:
+        return None
+    spread = ", ".join(f"{arm_label(arm)} priced {'/'.join(sorted(dates))}" for arm, dates in sorted(per_arm.items()))
+    return (
+        f"arms were priced on different dates ({spread}); cost differences between them "
+        "include any change in provider pricing, not only the skill's effect"
+    )
+
+
 def _integrity_notes(df: pd.DataFrame) -> list[str]:
     """Flag arms whose ``skill_loaded`` disagrees with what the arm name claims.
 
@@ -1453,6 +1479,8 @@ def _integrity_notes(df: pd.DataFrame) -> list[str]:
 
     Occasional misses are normal and the per-run table already marks them, so a skill arm is
     only flagged once fewer than half its runs loaded the skill.
+
+    Cost carries its own comparability hazard, handled by :func:`_price_date_note`.
     """
     notes = []
     unpriced = int(df[_REPORT_COST_COLUMN].isna().sum())
@@ -1461,6 +1489,9 @@ def _integrity_notes(df: pd.DataFrame) -> list[str]:
             f"cost unavailable for {unpriced}/{len(df)} runs; cost charts and comparisons omit "
             "groups containing unpriced runs"
         )
+    price_dates = _price_date_note(df)
+    if price_dates is not None:
+        notes.append(price_dates)
     if "skill_loaded" not in df.columns:
         return notes
     for arm in _arms_in_order(df):

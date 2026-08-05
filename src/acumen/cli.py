@@ -24,11 +24,12 @@ from acumen.pricefeed import (
     PRICE_TIER,
     PriceFeedError,
     diff_rates,
+    fetch_table,
     refresh,
-    shipped_rates,
     to_yaml_block,
+    try_fetch_table,
 )
-from acumen.prices import DEFAULT_RATES, RATES_AS_OF, Rates, resolve_rates
+from acumen.prices import PriceTable, Rates
 from acumen.report import ReportError, build_report
 from acumen.runner import RunOutcome, StderrFilter
 from acumen.scaffold import InitError, is_scaffold_tasks, scaffold
@@ -121,19 +122,53 @@ def _warn_codex_accounting(provider: AgentProvider) -> None:
         )
 
 
-def _warn_unpriced(models: set[str], overrides: dict[str, Rates]) -> None:
+def _warn_unpriced(models: set[str], prices: PriceTable) -> None:
     """Name models with no rates before the spend, not after.
 
     An unpriced model still records its tokens; only ``cost_usd`` is left unset. Saying so
     up front is what stops a missing rate from reading as a free model in the report.
     """
-    unpriced = sorted(model for model in models if resolve_rates(model, overrides) is None)
+    unpriced = sorted(model for model in models if prices.lookup(model) is None)
     if unpriced:
         print(
-            f"note: no token rates for {', '.join(unpriced)} — these runs record tokens but no cost. "
-            f"Add a 'prices:' entry in config.yaml to price them (rates as of {RATES_AS_OF}).",
+            f"note: no token rates for {', '.join(unpriced)}. These runs record tokens but no "
+            "cost; add a 'prices:' entry in config.yaml to price them.",
             file=sys.stderr,
         )
+
+
+def _bench_prices(cfg: Config) -> PriceTable:
+    """Resolve the rates this pass will be priced by, before it spends anything.
+
+    Raises :class:`PriceFeedError` upward: cost is a headline metric of the report and is
+    frozen into every result, so a pass that cannot establish rates should not run.
+    """
+    for name, url in PRICE_SOURCES.items():
+        print(f"prices: fetching {name} ({url})", flush=True)
+    table = fetch_table(cfg.prices)
+    print(f"prices: {len(table.fetched)} model(s) resolved as of {table.fetched_as_of} ({PRICE_TIER})")
+    return table
+
+
+def _agent_prices(cfg: Config, *, model: str | None = None) -> PriceTable:
+    """Rates for one interactive agent command, degrading to unpriced if the pages are down.
+
+    Unlike a benchmark, these commands report cost as progress rather than storing it as
+    evidence, so a pricing outage should not stop the work. It is still said out loud, and
+    the Codex consequence is named: ``max_usd`` is enforced from these rates, so an
+    unpriced model has no budget cap at all.
+    """
+    table, failure = try_fetch_table(cfg.prices)
+    if failure is None:
+        return table
+    print(f"warning: could not fetch pricing ({failure}); this run reports no cost", file=sys.stderr)
+    if model is not None and provider_for_model(model) == "codex" and table.lookup(model) is None:
+        print(
+            f"warning: max_usd cannot be enforced for {model} without rates. Bound this run "
+            "with max_turns, or pin rates in config.yaml under 'prices:'.",
+            file=sys.stderr,
+        )
+    return table
 
 
 def _print_log_result(log: LiveLog) -> None:
@@ -354,7 +389,20 @@ def _cmd_bench(args: argparse.Namespace) -> int:
             "rates, not metered spend; each run records its auth_mode",
             file=sys.stderr,
         )
-    _warn_unpriced({item.model for item in todo}, cfg.prices)
+    # Before the target is built and before any agent runs: an unreachable pricing page
+    # must cost nothing, and a pass must never be priced by a table it cannot date.
+    try:
+        prices = _bench_prices(cfg)
+    except PriceFeedError as err:
+        print(f"error: {err}", file=sys.stderr)
+        print(
+            "Each run's cost is frozen into its result, so a pass that cannot establish "
+            "rates would store figures nothing backs. Retry when the pages are reachable, "
+            "or pin rates with a 'prices:' block in config.yaml.",
+            file=sys.stderr,
+        )
+        return 2
+    _warn_unpriced({item.model for item in todo}, prices)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]} (venv {target.venv_dir})", flush=True)
@@ -384,7 +432,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
                     on_start=progress.on_start,
                     on_done=progress.on_done,
                     env_passthrough=cfg.env_passthrough,
-                    price_overrides=cfg.prices,
+                    prices=prices,
                 )
             )
             collected.extend(outcomes)
@@ -436,6 +484,7 @@ def _cmd_draft(args: argparse.Namespace) -> int:
         result = asyncio.run(
             draft_skill(
                 cfg=cfg,
+                prices=_agent_prices(cfg, model=cfg.draft_model),
                 target=target,
                 skills_root=args.skills,
                 auth_mode=auth_mode,
@@ -492,6 +541,7 @@ def _cmd_improve(args: argparse.Namespace) -> int:
         result = asyncio.run(
             improve_skill(
                 cfg=cfg,
+                prices=_agent_prices(cfg, model=cfg.improve_model),
                 target=target,
                 skills_root=args.skills,
                 runs_root=args.runs,
@@ -561,6 +611,7 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
         result = asyncio.run(
             generate_tasks(
                 cfg=cfg,
+                prices=_agent_prices(cfg, model=cfg.tasks_model),
                 target=target,
                 out_path=out,
                 auth_mode=auth_mode,
@@ -613,6 +664,7 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         result = asyncio.run(
             ship_skill(
                 cfg=cfg,
+                prices=_agent_prices(cfg, model=cfg.ship_model),
                 target=target,
                 skills_root=args.skills,
                 version=args.version,
@@ -679,41 +731,55 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_prices(args: argparse.Namespace) -> int:
-    """Show the token rates cost is computed from, and optionally re-check them upstream."""
-    overrides: dict[str, Rates] = {}
-    if args.config.is_file():
-        overrides = load_config(args.config).prices
+    """Show the rates cost is computed from, or check pinned rates against the pages.
 
-    if not args.refresh:
-        print(f"rates (USD per million tokens), verified {RATES_AS_OF} — {PRICE_TIER}")
-        for model, rates in sorted({**DEFAULT_RATES, **overrides}.items()):
-            source = "config" if model in overrides else "built-in"
-            print(
-                f"  {model:28} in ${rates.input:<7} cached ${rates.cached_input:<7} "
-                f"write ${rates.cache_write:<7} out ${rates.output:<7} ({source})"
-            )
-        print("\nre-check against the providers' pricing pages with: acumen prices --refresh")
-        return 0
+    Both modes read the providers' pages, since that is the only place rates come from.
+    ``--refresh`` differs in what it prints: the models whose published price disagrees
+    with a ``prices:`` pin in ``config.yaml``, which are the only rates that can drift
+    unnoticed once everything else is read live.
+    """
+    overrides: dict[str, Rates] = {}
+    models: set[str] = set()
+    if args.config.is_file():
+        cfg = load_config(args.config)
+        overrides, models = cfg.prices, {m.strip().lower() for m in cfg.models}
 
     for name, url in PRICE_SOURCES.items():
         print(f"fetching {name}: {url}", flush=True)
-    fetched = refresh(today=date.today())
+    try:
+        fetched = refresh(today=date.today())
+    except PriceFeedError as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
 
-    current = {**shipped_rates(), **overrides}
-    # Default to the models actually in play — the pages list every model each provider
-    # has ever sold, and a wall of irrelevant diffs is a wall nobody reads.
-    if not args.all:
-        relevant = set(current) | (
-            {m.strip().lower() for m in load_config(args.config).models} if args.config.is_file() else set()
-        )
-        fetched = {model: rates for model, rates in fetched.items() if model in relevant}
-    changes = diff_rates(current, fetched)
-
-    if not changes:
-        print(f"\nup to date — {len(fetched)} model(s) match the table verified {RATES_AS_OF}")
+    if not args.refresh:
+        table = PriceTable(overrides=overrides, fetched=fetched, fetched_as_of=date.today().isoformat())
+        shown = sorted(set(fetched) | set(overrides)) if args.all else sorted(models | set(overrides))
+        print(f"\nrates (USD per million tokens) as of {table.fetched_as_of} — {PRICE_TIER}")
+        for model in shown:
+            found = table.lookup(model)
+            if found is None:
+                print(f"  {model:28} unpriced (not published; add it under 'prices:' to price it)")
+                continue
+            print(
+                f"  {model:28} in ${found.rates.input:<7} cached ${found.rates.cached_input:<7} "
+                f"write ${found.rates.cache_write:<7} out ${found.rates.output:<7} ({found.source})"
+            )
+        if not args.all:
+            print(f"\n{len(fetched)} model(s) published in total; show them all with --all")
         return 0
 
-    print(f"\n{len(changes)} change(s) against the table verified {RATES_AS_OF} ({PRICE_TIER}):")
+    # Only pinned rates can disagree with a page: everything else is read live each run.
+    if not overrides:
+        print("\nno 'prices:' pins in config.yaml, so nothing can drift — rates are read live each run")
+        return 0
+    changes = diff_rates(overrides, {m: r for m, r in fetched.items() if m in overrides})
+
+    if not changes:
+        print(f"\nup to date — all {len(overrides)} pinned rate(s) match what the providers publish")
+        return 0
+
+    print(f"\n{len(changes)} pinned rate(s) differ from the published price ({PRICE_TIER}):")
     for change in changes:
         print(change.describe())
 
@@ -722,10 +788,10 @@ def _cmd_prices(args: argparse.Namespace) -> int:
         args.out.write_text(block)
         print(f"\nwrote {args.out} — merge its 'prices:' block into config.yaml to adopt these")
     else:
-        print("\nadopt by adding to config.yaml (or re-run with --out PATH):\n")
+        print("\nadopt by updating config.yaml (or re-run with --out PATH):\n")
         print(block, end="")
-    # Nothing is applied automatically: a mis-parsed tier or context band would otherwise
-    # silently re-price every future run.
+    # Never applied automatically: a pin is a deliberate statement, and a mis-parsed tier
+    # or context band would otherwise overwrite it with a plausible wrong number.
     return 0
 
 

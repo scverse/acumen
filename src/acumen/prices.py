@@ -2,10 +2,10 @@
 
 The Claude SDK reports an API-equivalent dollar cost while ``codex exec`` reports none.
 Acumen therefore preserves two measurements: the provider value when one exists and a
-reproducible inference from this frozen rate table. The provider value is canonical;
-inference is the fallback and remains alongside it for comparison.
+reproducible inference from a rate table. The provider value is canonical; inference is
+the fallback and remains alongside it for comparison.
 
-Two properties this design depends on:
+Three properties this design depends on:
 
 **The breakdown must survive.** Cached input is billed at a tenth of the base rate and
 cache writes at 1.25x, so collapsing reads, writes, and fresh input into a single
@@ -17,23 +17,25 @@ reads — the breakdown is the difference between a right answer and a wrong one
 against a July one must not silently re-price the old one. :func:`price_run` is called
 once, when the run finishes, and the rates it used are written into ``result.json``
 beside the figure they produced.
+
+**What was frozen must have been right when it froze.** Freezing is only worth doing if
+the rates were current at the time, so this module ships **no rate table of its own**.
+Rates come from the providers' live pricing pages (see :mod:`acumen.pricefeed`) or from
+the operator's ``prices:`` config, assembled into a :class:`PriceTable`. A baked-in table
+would only ever be right on the day it was written, and a wrong rate that has been frozen
+into a result is indistinguishable from a right one unless the provenance travels with it
+— so each run records where its rates came from and how old they were.
+
+A model no layer prices is recorded **unpriced**, which is a first-class state throughout:
+``cost_usd`` is ``None``, never ``0.0``, and reports show it as unknown rather than free.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
-
-#: The date :data:`DEFAULT_RATES` was last verified against each provider's own pricing
-#: page. Shown in the report so a stale table is visible rather than assumed current.
-RATES_AS_OF = "2026-08-03"
-
-#: Where the numbers came from, for the next person who has to re-verify them.
-RATE_SOURCES = (
-    "https://platform.claude.com/docs/en/pricing",
-    "https://developers.openai.com/api/docs/pricing",
-)
 
 
 @dataclass(frozen=True)
@@ -97,58 +99,81 @@ class Rates:
 _CENTS = 6
 
 
-def _rates(
-    input_: float,
-    output: float,
-    *,
-    cached: float | None = None,
-    write: float | None = None,
-    split_writes: bool = False,
-) -> Rates:
-    """Both providers price cache reads at 0.1x input and writes at 1.25x."""
-    write_rate = round(input_ * 1.25, _CENTS) if write is None else write
-    return Rates(
-        input=input_,
-        cached_input=round(input_ * 0.1, _CENTS) if cached is None else cached,
-        cache_write=write_rate,
-        output=output,
-        cache_write_5m=write_rate if split_writes else None,
-        cache_write_1h=round(input_ * 2, _CENTS) if split_writes else None,
-    )
+#: A trailing dated-snapshot suffix, e.g. the ``-20251001`` of ``claude-haiku-4-5-20251001``.
+_SNAPSHOT = re.compile(r"-\d{8}$")
 
 
-#: USD per million tokens, verified :data:`RATES_AS_OF` against :data:`RATE_SOURCES`.
-#: Override or extend from ``config.yaml`` (``prices:``) rather than editing this — a
-#: model missing here is recorded unpriced, never guessed at.
-DEFAULT_RATES: dict[str, Rates] = {
-    # Anthropic. Sonnet 5 carries an introductory rate through 2026-08-31; the standard
-    # $3/$15 resumes after it, so re-verify this row rather than trusting it past then.
-    "claude-opus-5": _rates(5.00, 25.00, split_writes=True),
-    "claude-opus-4-8": _rates(5.00, 25.00, split_writes=True),
-    "claude-opus-4-7": _rates(5.00, 25.00, split_writes=True),
-    "claude-sonnet-5": _rates(2.00, 10.00, split_writes=True),
-    "claude-sonnet-4-6": _rates(3.00, 15.00, split_writes=True),
-    "claude-haiku-4-5": _rates(1.00, 5.00, split_writes=True),
-    "claude-haiku-4-5-20251001": _rates(1.00, 5.00, split_writes=True),
-    # OpenAI.
-    "gpt-5.6-sol": _rates(5.00, 30.00),
-    "gpt-5.6-terra": _rates(2.00, 12.00),
-    "gpt-5.6-luna": _rates(0.20, 1.20),
-}
+def _keys(model: str) -> tuple[str, ...]:
+    """The forms ``model`` may be keyed under, most specific first.
 
+    Two normalizations, each covering a way the same model gets named differently:
 
-def resolve_rates(model: str, overrides: dict[str, Rates] | None = None) -> Rates | None:
-    """Find the rates for ``model``, or ``None`` if it is not priced.
-
-    Config overrides win over the built-in table, so an operator on negotiated rates or a
-    gateway can price their own traffic. A provider-qualified ID (``openai/gpt-5.6-sol``)
-    falls back to its bare form, which keeps proxy configurations priceable.
+    - A provider-qualified ID (``openai/gpt-5.6-sol``) falls back to its bare form, which
+      keeps proxy and gateway configurations priceable.
+    - A dated snapshot (``claude-haiku-4-5-20251001``) falls back to its family
+      (``claude-haiku-4-5``). Providers publish one rate per family and pin the snapshot
+      for reproducibility, so the pages never list the dated ID that a benchmark pins to.
+      Without this, pinning a snapshot — which is the right thing to do — would silently
+      leave every run unpriced.
     """
-    for table in (overrides or {}, DEFAULT_RATES):
-        for key in (model, model.strip().lower(), model.rsplit("/", 1)[-1].strip().lower()):
-            if key in table:
-                return table[key]
-    return None
+    bare = model.rsplit("/", 1)[-1].strip().lower()
+    return tuple(dict.fromkeys((model, model.strip().lower(), bare, _SNAPSHOT.sub("", bare))))
+
+
+#: Rate provenance, most authoritative first. ``config`` is a deliberate operator
+#: statement about their own billing and outranks a published page; ``fetched`` is what
+#: the provider published on the day of the run.
+CONFIG, FETCHED = "config", "fetched"
+
+
+@dataclass(frozen=True)
+class RateLookup:
+    """One model's rates together with where they came from and how current they are.
+
+    ``as_of`` is ``None`` for a ``config`` rate: an operator's own numbers carry no
+    verification date, and inventing one would claim currency nothing established.
+    """
+
+    rates: Rates
+    source: str
+    as_of: str | None
+
+
+@dataclass(frozen=True)
+class PriceTable:
+    """The rates one command prices its runs by.
+
+    Two layers: ``overrides`` from ``config.yaml``, then ``fetched`` from the providers'
+    live pricing pages. Config wins, because only the operator knows what they are
+    actually billed — a negotiated rate or a gateway's markup is not on any public page.
+
+    There is deliberately no third layer of built-in defaults. Published prices move, so a
+    table compiled into a release is wrong from some unknowable date onward, and because
+    each run's cost is frozen at write time that wrongness would be preserved rather than
+    corrected on the next run. An empty table prices nothing, which is the honest outcome
+    when no rates could be established.
+    """
+
+    overrides: dict[str, Rates] = field(default_factory=dict)
+    fetched: dict[str, Rates] = field(default_factory=dict)
+    fetched_as_of: str | None = None
+
+    def lookup(self, model: str) -> RateLookup | None:
+        """Resolve ``model`` through the layers, or ``None`` if no layer prices it."""
+        layers: tuple[tuple[str, dict[str, Rates], str | None], ...] = (
+            (CONFIG, self.overrides, None),
+            (FETCHED, self.fetched, self.fetched_as_of),
+        )
+        for source, table, as_of in layers:
+            for key in _keys(model):
+                if key in table:
+                    return RateLookup(rates=table[key], source=source, as_of=as_of)
+        return None
+
+    def rates(self, model: str) -> Rates | None:
+        """Just the rates, for callers that do not record provenance."""
+        found = self.lookup(model)
+        return None if found is None else found.rates
 
 
 @dataclass(frozen=True)
@@ -242,13 +267,14 @@ def price_usage(
     *,
     model: str,
     provider: str = "claude",
-    overrides: dict[str, Rates] | None = None,
+    prices: PriceTable | None = None,
 ) -> float | None:
-    """Price a provider usage payload through the shared model-rate table."""
-    return price_run(normalize_usage(usage, provider=provider), resolve_rates(model, overrides))
+    """Price a provider usage payload through ``prices``, or the built-in table."""
+    rates = (prices or PriceTable()).rates(model)
+    return price_run(normalize_usage(usage, provider=provider), rates)
 
 
-def pricer(model: str, overrides: dict[str, Rates] | None = None) -> Callable[[dict], float | None]:
+def pricer(model: str, prices: PriceTable | None = None) -> Callable[[dict], float | None]:
     """A usage→USD hook for a provider that reports no billed figure of its own.
 
     Codex cannot enforce a budget cap without one: it reports tokens, so the cap has to be
@@ -256,7 +282,7 @@ def pricer(model: str, overrides: dict[str, Rates] | None = None) -> Callable[[d
     could be stopped at a budget it is not billed against. Returns ``None`` for an unpriced
     model, which callers must read as "no cap can be enforced", never as "free".
     """
-    return lambda usage: price_usage(usage, model=model, provider="codex", overrides=overrides)
+    return lambda usage: price_usage(usage, model=model, provider="codex", prices=prices)
 
 
 def price_run(usage: Usage, rates: Rates | None) -> float | None:
@@ -327,3 +353,18 @@ def resolve_cost(provider_cost_usd: float | None, inferred_cost_usd: float | Non
 def rates_payload(rates: Rates | None) -> dict[str, float] | None:
     """The rates as they go into ``result.json`` — the run's frozen price provenance."""
     return None if rates is None else asdict(rates)
+
+
+def price_provenance(lookup: RateLookup | None) -> dict[str, Any]:
+    """The ``result.json`` fields describing what a run was priced by.
+
+    Recorded per run rather than per pass because a matrix can mix models across layers:
+    one on negotiated config rates, another on what the page published that morning.
+    Without the source and date, two runs months apart are indistinguishable from two
+    priced by the same stale table, which is the whole reason for freezing rates at all.
+    """
+    return {
+        "price_rates": rates_payload(None if lookup is None else lookup.rates),
+        "price_source": None if lookup is None else lookup.source,
+        "price_rates_as_of": None if lookup is None else lookup.as_of,
+    }

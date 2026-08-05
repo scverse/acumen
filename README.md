@@ -118,7 +118,7 @@ which has no cap of its own — acumen enforces both against its event stream:
   Claude gives it — but bound Codex spend with `max_turns`. acumen prints this before the pass.
 
 **Reports compare inferred cost per run.** Every run records its token breakdown — fresh
-input, cache reads, cache writes, and output — and Acumen prices it with the frozen rate table
+input, cache reads, cache writes, and output — and Acumen prices it with the rate table
 stored in `result.json`. That gives Claude and Codex one comparable basis and prevents an old
 benchmark from being silently re-priced. The result itself retains both
 `provider_cost_usd` (when the backend supplies one) and `inferred_cost_usd`; its compatibility
@@ -126,17 +126,36 @@ field `cost_usd` remains provider-first. The report's sidecar CSV calls the form
 `recorded_cost_usd` and keeps it separate from `inferred_cost_usd`, while every displayed cost
 and comparison uses the inferred value.
 
+**Rates are read from the providers' pricing pages, never shipped with the package.** Prices
+move, and each run's cost is frozen into its `result.json` and never recomputed, so a table
+compiled into a release would store numbers that were already wrong. `bench` resolves rates
+before it spends anything and **fails the pass** if the pages cannot be read: cost is a headline
+metric, and a benchmark that cannot establish rates has not earned the numbers it would print.
+`draft`, `improve`, `tasks`, and `ship` fetch too but degrade to unpriced instead — their cost
+line is progress reporting, not stored evidence.
+
+Alongside the rates themselves each run records `price_source` (`config` or `fetched`) and
+`price_rates_as_of`, so a pass run in August and another in October stay individually
+attributable and one report can cover both without restating either. When arms in a report were
+priced on different dates, the report says so: the cost gap between them includes the price
+change, not only the skill's effect.
+
 ```bash
-acumen prices              # the rates in use, and where each came from
-acumen prices --refresh    # re-check them against the providers' pricing pages
+acumen prices              # the rates in use today, and where each came from
+acumen prices --refresh    # check pinned rates against what the providers publish
 ```
 
-`--refresh` fetches both providers' published tables and prints a diff for you to accept —
-it never rewrites anything, because picking the wrong tier or context band would silently
-misprice every future run. Adopt changes by pasting the emitted block into `config.yaml`
-under `prices:`, which is also how you price a model acumen doesn't ship a rate for, or
-override rates for a gateway. A model with no rate records its tokens and leaves inferred
-report cost unavailable — never zero, which would read as free.
+Pin rates with a `prices:` block in `config.yaml` to price a model the providers don't publish,
+to price a gateway, or to record negotiated rates — pins outrank a live fetch, since only you
+know what you are billed. They are also the only rates that can drift unnoticed, which is what
+`--refresh` checks; it prints a diff for you to accept and never rewrites anything, because
+picking the wrong tier or context band would silently misprice future runs. A model no layer
+prices records its tokens and leaves report cost unavailable — never zero, which would read as
+free.
+
+> One consequence worth knowing: Codex's `max_usd` cap is enforced from these same rates, so an
+> unpriced model under Codex has no enforceable budget cap. Bound those runs with `max_turns`,
+> or pin the rates.
 
 `draft`, `improve`, `tasks`, and `ship` each drive a long autonomous agent. Every run writes a
 live `logs/acumen-<command>-<datetime>.jsonl` (one event per step, flushed as it goes — so you

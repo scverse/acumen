@@ -43,7 +43,7 @@ from acumen.paths import (
     arm_name,
     parse_run_dir,
 )
-from acumen.prices import price_usage, pricer, resolve_cost
+from acumen.prices import PriceTable, price_usage, pricer, resolve_cost
 from acumen.procs import label_env, reap
 from acumen.prompts import improve_prompt
 from acumen.skills import (
@@ -421,6 +421,7 @@ async def improve_skill(
     runs_root: Path,
     tasks: list[Task],
     auth_mode: AuthMode = "session",
+    prices: PriceTable | None = None,
     parent_version: str | None = None,
     model: str | None = None,
     max_turns: int | None = None,
@@ -488,6 +489,7 @@ async def improve_skill(
         rationale_path = work / "rationale.md"
         home = holder / "home"
         selected_model = model or cfg.improve_model
+        table = prices if prices is not None else PriceTable(overrides=cfg.prices)
         provider = provider_for_model(selected_model)
         config_dir = home / (".claude" if provider == "claude" else ".codex")
         for path in (work, home, config_dir, home / "tmp"):
@@ -530,7 +532,7 @@ async def improve_skill(
             max_turns=max_turns,
             max_usd=max_usd,
             # Codex reports no billed figure, so a budget cap needs the run's own rate table.
-            price_usd=pricer(selected_model, cfg.prices),
+            price_usd=pricer(selected_model, table),
             read_dirs=(target.venv_dir,),
             write_dirs=(work,),
             discover_skills=True,
@@ -581,7 +583,12 @@ async def improve_skill(
             parent=parent.version,
             cost_usd=resolve_cost(
                 result.total_cost_usd,
-                price_usage(result.usage, model=selected_model, provider=result.provider, overrides=cfg.prices),
+                price_usage(
+                    result.usage,
+                    model=selected_model,
+                    provider=result.provider,
+                    prices=table,
+                ),
             ).cost_usd,
             turns=result.num_turns,
             n_train_runs=len(train_runs),

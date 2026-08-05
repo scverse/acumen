@@ -11,7 +11,7 @@ from acumen.agents import AgentProvider, provider_for_model
 from acumen.config import Config
 from acumen.env import AuthMode, Target
 from acumen.paths import SPLITS, RunKey, Split, arm_name, is_complete, run_dir
-from acumen.prices import Rates
+from acumen.prices import PriceTable
 from acumen.runner import RunOutcome, run_once
 from acumen.skills import Skill
 from acumen.tasks import Task
@@ -133,7 +133,7 @@ async def run_matrix(
     max_concurrency: int,
     auth_mode: AuthMode = "api",
     auth_modes: Mapping[AgentProvider, AuthMode] | None = None,
-    price_overrides: dict[str, Rates] | None = None,
+    prices: PriceTable | None = None,
     skill: Skill | None = None,
     skill_name: str | None = None,
     sandbox_base: Path | None = None,
@@ -163,7 +163,11 @@ async def run_matrix(
     auth_mode
         Which credential every run authenticates with. Under ``"session"``, the recorded
         Claude's SDK value is API-equivalent rather than necessarily metered spend;
-        Codex uses frozen-table token inference.
+        Codex uses token inference against ``prices``.
+    prices
+        The rates every run in this pass is priced by, and which each records alongside its
+        cost. One table for the whole matrix, resolved once before any spend, so a pass is
+        never priced by two different sets of numbers. Defaults to the built-in table.
     skill
         The skill every run in this matrix installs, or ``None`` for the baseline. One
         matrix is one arm, so this is a property of the pass rather than of a run.
@@ -223,7 +227,7 @@ async def run_matrix(
                 keep_sandbox=keep_sandbox,
                 stderr=stderr,
                 env_passthrough=env_passthrough,
-                price_overrides=price_overrides,
+                prices=prices,
             )
             if on_done is not None:
                 on_done(outcome)

@@ -46,7 +46,7 @@ from acumen.agents import AgentOptions, AgentResult, provider_for_model, run_age
 from acumen.config import Config
 from acumen.env import AuthMode, Target, build_agent_env
 from acumen.logs import LiveLog
-from acumen.prices import price_usage, pricer, resolve_cost
+from acumen.prices import PriceTable, price_usage, pricer, resolve_cost
 from acumen.procs import label_env, reap
 from acumen.prompts import taskgen_prompt
 from acumen.tasks import Task, TaskError, load_tasks
@@ -290,6 +290,7 @@ async def generate_tasks(
     target: Target,
     out_path: Path,
     auth_mode: AuthMode = "session",
+    prices: PriceTable | None = None,
     model: str | None = None,
     max_turns: int | None = None,
     max_usd: float | None = None,
@@ -343,6 +344,7 @@ async def generate_tasks(
         work = holder / "work"
         home = holder / "home"
         selected_model = model or cfg.tasks_model
+        table = prices if prices is not None else PriceTable(overrides=cfg.prices)
         provider = provider_for_model(selected_model)
         config_dir = home / (".claude" if provider == "claude" else ".codex")
         for path in (work, home, config_dir, home / "tmp"):
@@ -381,7 +383,7 @@ async def generate_tasks(
             max_turns=max_turns,
             max_usd=max_usd,
             # Codex reports no billed figure, so a budget cap needs the run's own rate table.
-            price_usd=pricer(selected_model, cfg.prices),
+            price_usd=pricer(selected_model, table),
             # The generator reads the target source, like the drafter; benchmark agents
             # never do. It points at the *filtered* copy, not the real checkout.
             read_dirs=(source_copy, target.venv_dir),
@@ -431,7 +433,12 @@ async def generate_tasks(
             out_path=out_path,
             cost_usd=resolve_cost(
                 result.total_cost_usd,
-                price_usage(result.usage, model=selected_model, provider=result.provider, overrides=cfg.prices),
+                price_usage(
+                    result.usage,
+                    model=selected_model,
+                    provider=result.provider,
+                    prices=table,
+                ),
             ).cost_usd,
             turns=result.num_turns,
             log_jsonl=log.jsonl_path if log is not None else None,

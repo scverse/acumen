@@ -1,20 +1,28 @@
-"""Refresh :data:`acumen.prices.DEFAULT_RATES` from the providers' own pricing pages.
+"""Read per-model token rates from the providers' own pricing pages.
 
-Rates drift — OpenAI cut one tier by 80% in July 2026, and Claude Sonnet 5's introductory
-rate expires 2026-08-31 — so a table baked into a release goes stale on its own. This
-module fetches both providers' published prices and reports what changed.
+This is where acumen's rates come from. Nothing is compiled into the package: prices drift
+— OpenAI cut one tier by 80% in July 2026, and Claude Sonnet 5's introductory rate expires
+2026-08-31 — so a baked-in table is wrong from some date nobody notices, and since each
+run's cost is frozen when it is written, that wrongness is stored rather than outgrown.
 
-**This runs on request, never during a benchmark.** ``acumen bench`` reads the frozen
-table and touches the network only to run agents. Three reasons that separation is
-deliberate rather than timid:
+Two callers, with deliberately different failure behaviour:
 
-- A benchmark that re-prices itself from a live page is not reproducible, and one that
-  fails because a docs site moved is worse than one using a table labelled with its age.
-- Parsing has to choose a tier (standard, not batch/flex/fast), a context band (short —
-  the long-context band is priced ~2x and its threshold is not stated per model), and,
-  for dated rows, which side of the date we are on. Each is a place a silent mis-parse
-  yields a plausible wrong number, and cost is a headline metric of the report.
-- So the output is a **diff for a human to accept**, not an overwrite.
+- ``acumen bench`` calls :func:`fetch_table` before it spends anything and **fails the
+  pass** if the pages cannot be read. Cost is a headline metric of the report and is
+  frozen into every result, so a benchmark that cannot establish rates has not earned the
+  numbers it would print.
+- ``draft``, ``improve``, ``tasks`` and ``ship`` call :func:`try_fetch_table`, which
+  **degrades to unpriced**. Their dollar figure is progress reporting for one interactive
+  run, not stored evidence, so losing it is worth less than losing the run.
+
+Live rates do not make a pass unreproducible: each run records the rates it used, their
+source, and their date (:func:`~acumen.prices.price_provenance`), and nothing re-prices a
+stored result afterwards.
+
+Parsing has to choose a tier (standard, not batch/flex/fast), a context band (short — the
+long-context band is priced ~2x and its threshold is not stated per model), and, for dated
+rows, which side of the date we are on. Each is a place a silent mis-parse yields a
+plausible wrong number, which is why the parsers raise rather than return partial tables.
 
 Both providers publish Markdown alongside their HTML, which is what makes this tractable:
 these are documented tables, not scraped page furniture.
@@ -28,7 +36,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from acumen.prices import DEFAULT_RATES, Rates
+from acumen.prices import PriceTable, Rates
 
 #: The Markdown pricing pages. Both are the ``.md`` twin of the human docs page — append
 #: ``.md`` to a docs URL on either site.
@@ -225,17 +233,69 @@ class RateChange:
         return f"  ~ {self.model}: {', '.join(moved)}"
 
 
-def refresh(*, today: date, fetcher=fetch) -> dict[str, Rates]:
-    """Fetch and parse both providers' published rates."""
-    markdown = {name: fetcher(url) for name, url in PRICE_SOURCES.items()}
+def refresh(*, today: date, fetcher=None) -> dict[str, Rates]:
+    """Fetch and parse both providers' published rates.
+
+    ``fetcher`` defaults to :func:`fetch` at call time rather than in the signature, so a
+    test can replace the module's one network primitive and have every caller honour it.
+    """
+    get = fetcher or fetch
+    markdown = {name: get(url) for name, url in PRICE_SOURCES.items()}
     return {**parse_anthropic(markdown["anthropic"], today=today), **parse_openai(markdown["openai"])}
+
+
+def fetch_table(
+    overrides: dict[str, Rates] | None = None,
+    *,
+    today: date | None = None,
+    fetcher=None,
+) -> PriceTable:
+    """The rate table a benchmark prices itself by, resolved against the live pages.
+
+    Raises :class:`PriceFeedError` if either page cannot be fetched or parsed. There is
+    nothing to fall back to by design, and a benchmark blocked on a docs-site outage is
+    recoverable in a way a stored cost that is quietly wrong is not.
+    """
+    when = today or date.today()
+    return PriceTable(
+        overrides=dict(overrides or {}),
+        fetched=refresh(today=when, fetcher=fetcher),
+        fetched_as_of=when.isoformat(),
+    )
+
+
+def try_fetch_table(
+    overrides: dict[str, Rates] | None = None,
+    *,
+    today: date | None = None,
+    fetcher=None,
+) -> tuple[PriceTable, str | None]:
+    """:func:`fetch_table`, degraded to config-only rates instead of raising.
+
+    Returns the table and, when the fetch failed, the reason — callers are expected to
+    surface it, since the visible consequence is a run reporting no cost. For the
+    interactive commands that is an acceptable trade: their cost line is progress
+    reporting, and refusing to draft a skill because a pricing page is down would be
+    stopping the work over a number nobody is depending on.
+
+    The caveat callers must weigh: an unpriced model cannot have a ``max_usd`` cap
+    enforced against it under Codex, whose budget cap is derived from these same rates.
+    """
+    try:
+        return fetch_table(overrides, today=today, fetcher=fetcher), None
+    except PriceFeedError as err:
+        return PriceTable(overrides=dict(overrides or {})), str(err)
 
 
 def diff_rates(current: dict[str, Rates], fetched: dict[str, Rates]) -> list[RateChange]:
     """Models whose published rates differ from ``current``, plus ones it doesn't cover.
 
-    Only models present in the fetch are reported: a model missing from the page has been
-    retired or renamed, which is not something to silently drop from a working table.
+    ``current`` is the operator's pinned ``prices:`` block: those are the only rates that
+    can silently disagree with a provider, since everything else is read live. A pin that
+    has drifted from the published price is worth seeing before the next pass uses it.
+
+    Only models present in the fetch are reported: a pin for a model that is no longer
+    published may well be deliberate, and is not something to nag about.
     """
     changes = [
         RateChange(model=model, before=current.get(model), after=rates)
@@ -259,8 +319,3 @@ def to_yaml_block(rates: dict[str, Rates]) -> str:
             lines.append(f"    cache_write_1h: {rate.cache_write_1h}")
         lines.append(f"    output: {rate.output}")
     return "\n".join(lines) + "\n"
-
-
-def shipped_rates() -> dict[str, Rates]:
-    """The table a refresh is compared against."""
-    return dict(DEFAULT_RATES)

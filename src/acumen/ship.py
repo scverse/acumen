@@ -45,7 +45,7 @@ from acumen.env import (
     seed_credentials,
 )
 from acumen.logs import LiveLog
-from acumen.prices import price_usage, pricer, resolve_cost
+from acumen.prices import PriceTable, price_usage, pricer, resolve_cost
 from acumen.procs import label_env, reap
 from acumen.prompts import ship_prompt
 from acumen.skills import Skill, content_files, load_skill
@@ -203,6 +203,7 @@ async def ship_skill(
     skills_root: Path,
     version: str,
     auth_mode: AuthMode = "session",
+    prices: PriceTable | None = None,
     model: str | None = None,
     max_turns: int | None = None,
     max_usd: float | None = None,
@@ -256,6 +257,7 @@ async def ship_skill(
     try:
         skill_src = _stage_skill_payload(skill, holder / "skill")
         selected_model = model or cfg.ship_model
+        table = prices if prices is not None else PriceTable(overrides=cfg.prices)
         provider = provider_for_model(selected_model)
         home = holder / "home"
         config_dir = home / (".claude" if provider == "claude" else ".codex")
@@ -285,7 +287,7 @@ async def ship_skill(
             max_turns=max_turns,
             max_usd=max_usd,
             # Codex reports no billed figure, so a budget cap needs the run's own rate table.
-            price_usd=pricer(selected_model, cfg.prices),
+            price_usd=pricer(selected_model, table),
             # It reads the staged skill payload to copy into the wheel.
             read_dirs=(skill_src, target.venv_dir),
             write_dirs=(target.src_dir, holder),
@@ -322,7 +324,12 @@ async def ship_skill(
             summary=result.result or "",
             cost_usd=resolve_cost(
                 result.total_cost_usd,
-                price_usage(result.usage, model=selected_model, provider=result.provider, overrides=cfg.prices),
+                price_usage(
+                    result.usage,
+                    model=selected_model,
+                    provider=result.provider,
+                    prices=table,
+                ),
             ).cost_usd,
             turns=result.num_turns,
             log_jsonl=log.jsonl_path if log is not None else None,

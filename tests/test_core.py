@@ -56,17 +56,17 @@ from acumen.grade import grade_answer, grade_run
 from acumen.improve import ImproveError, _write_material, collect_train_runs, load_rates
 from acumen.logs import LiveLog
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
-from acumen.pricefeed import PriceFeedError, diff_rates, parse_anthropic, parse_openai
+from acumen.pricefeed import PriceFeedError, diff_rates, fetch_table, parse_anthropic, parse_openai
 from acumen.prices import (
-    DEFAULT_RATES,
+    PriceTable,
     Rates,
     Usage,
     normalize_usage,
+    price_provenance,
     price_run,
     price_usage,
     pricer,
     resolve_cost,
-    resolve_rates,
 )
 from acumen.procs import label_env, reap, supported, survivors
 from acumen.prompts import draft_prompt, feedback_block, improve_prompt
@@ -597,7 +597,11 @@ def test_codex_stops_at_the_budget_cap(tmp_path: Path) -> None:
         ],
     )
     # gpt-5.6-sol bills $5/M input, so a million fresh input tokens is $5 against a $1 cap.
-    options = _codex_options(tmp_path, max_usd=1.0, price_usd=pricer("gpt-5.6-sol"))
+    prices = PriceTable(
+        fetched={"gpt-5.6-sol": Rates(input=5.0, cached_input=0.5, cache_write=6.25, output=30.0)},
+        fetched_as_of="2026-08-04",
+    )
+    options = _codex_options(tmp_path, max_usd=1.0, price_usd=pricer("gpt-5.6-sol", prices))
     result = asyncio.run(run_agent("go", options=options))
 
     assert result.is_error
@@ -1062,8 +1066,7 @@ def test_price_run_bills_each_cache_class_at_its_own_rate() -> None:
     mostly cache reads, billed at a tenth of the base rate.
     """
     usage = Usage(input=200_000, cache_read=180_000, cache_write=15_000, output=4_000)
-    rates = resolve_rates("claude-opus-5")
-    assert rates is not None
+    rates = Rates(input=5.0, cached_input=0.5, cache_write=6.25, output=25.0)
     # 5k @ $5 + 180k @ $0.50 + 15k @ $6.25 + 4k @ $25, per million.
     assert price_run(usage, rates) == pytest.approx(0.30875)
     collapsed = (usage.input * rates.input + usage.output * rates.output) / 1_000_000
@@ -1071,10 +1074,15 @@ def test_price_run_bills_each_cache_class_at_its_own_rate() -> None:
 
 
 def test_price_usage_prices_codex_meta_agent_tokens_when_provider_cost_is_absent() -> None:
+    prices = PriceTable(
+        fetched={"gpt-5.6-sol": Rates(input=5.0, cached_input=0.5, cache_write=6.25, output=30.0)},
+        fetched_as_of="2026-08-04",
+    )
     cost = price_usage(
         {"input_tokens": 1_000_000, "cached_input_tokens": 0, "output_tokens": 1_000_000},
         model="gpt-5.6-sol",
         provider="codex",
+        prices=prices,
     )
 
     assert cost == pytest.approx(35.0)
@@ -1082,7 +1090,7 @@ def test_price_usage_prices_codex_meta_agent_tokens_when_provider_cost_is_absent
 
 def test_price_run_leaves_an_unpriced_model_unpriced_rather_than_free() -> None:
     """``None`` is not ``0.0`` — a model with no rates must not read as a free one."""
-    assert resolve_rates("some-local-llm") is None
+    assert PriceTable().lookup("some-local-llm") is None
     assert price_run(Usage(input=1, cache_read=0, cache_write=0, output=1), None) is None
 
 
@@ -1217,6 +1225,10 @@ def test_benchmark_persists_provider_first_cost_for_nested_claude_agents(
             model="claude-opus-5",
             max_turns=5,
             max_usd=2.0,
+            prices=PriceTable(
+                fetched={"claude-opus-5": Rates(input=5.0, cached_input=0.5, cache_write=6.25, output=25.0)},
+                fetched_as_of="2026-08-04",
+            ),
         )
     )
 
@@ -1232,14 +1244,144 @@ def test_benchmark_persists_provider_first_cost_for_nested_claude_agents(
     assert persisted["agent"] == "claude"
 
 
-def test_resolve_rates_accepts_provider_qualified_ids_and_config_overrides() -> None:
-    assert resolve_rates("openai/gpt-5.6-sol") == resolve_rates("gpt-5.6-sol")
-    assert resolve_rates("Claude-Opus-5") == resolve_rates("claude-opus-5")
+def test_price_table_matches_provider_qualified_and_differently_cased_ids() -> None:
+    """A gateway or proxy names the same model differently; it is still that model."""
+    published = Rates(input=7.0, cached_input=0.7, cache_write=8.75, output=35.0)
+    table = PriceTable(fetched={"gpt-5.6-sol": published}, fetched_as_of="2026-09-15")
 
-    overrides = {"claude-opus-5": Rates(input=1.0, cached_input=0.1, cache_write=1.25, output=2.0)}
-    assert resolve_rates("claude-opus-5", overrides).input == 1.0
-    # An override for one model doesn't shadow the built-in table for the others.
-    assert resolve_rates("gpt-5.6-luna", overrides) == DEFAULT_RATES["gpt-5.6-luna"]
+    assert table.rates("openai/gpt-5.6-sol") is published
+    assert table.rates("GPT-5.6-Sol") is published
+    assert table.lookup("no-such-model") is None
+
+
+def test_price_table_prices_a_dated_snapshot_at_its_family_rate() -> None:
+    """Providers publish one rate per family and never list the dated snapshot IDs.
+
+    Pinning a snapshot is the reproducible thing to do, and ``acumen init`` scaffolds one,
+    so without this fallback a default project would bench an entirely unpriced model.
+    """
+    published = Rates(input=1.0, cached_input=0.1, cache_write=1.25, output=5.0)
+    table = PriceTable(fetched={"claude-haiku-4-5": published}, fetched_as_of="2026-09-15")
+
+    assert table.rates("claude-haiku-4-5-20251001") is published
+    assert table.rates("anthropic/claude-haiku-4-5-20251001") is published
+    # A version suffix that is not a date is part of the name, not a snapshot.
+    assert table.lookup("claude-haiku-4-5-turbo") is None
+
+
+def test_price_table_ranks_config_over_fetched() -> None:
+    """A pinned rate is the operator stating what *they* are billed, which no page knows.
+
+    With nothing baked into the package, these are the only two sources there are: what
+    the provider publishes today, and what the operator says overrides it.
+    """
+    negotiated = Rates(input=1.0, cached_input=0.1, cache_write=1.25, output=2.0)
+    published = Rates(input=7.0, cached_input=0.7, cache_write=8.75, output=35.0)
+    table = PriceTable(
+        overrides={"claude-opus-5": negotiated},
+        fetched={"claude-opus-5": published, "gpt-5.6-sol": published},
+        fetched_as_of="2026-09-15",
+    )
+
+    assert table.lookup("claude-opus-5").rates is negotiated
+    assert table.lookup("gpt-5.6-sol").rates is published
+    # A model no layer prices is unpriced, never guessed at from a shipped default.
+    assert table.lookup("claude-sonnet-4-6") is None
+
+
+def test_an_empty_price_table_prices_nothing_rather_than_guessing() -> None:
+    """No rates ship with the package, so an unfetched table is honestly empty.
+
+    The alternative — a compiled-in table — is wrong from whatever date the providers next
+    move their prices, and since each run's cost is frozen when written, that wrongness is
+    stored rather than corrected on the next run.
+    """
+    assert PriceTable().lookup("claude-opus-5") is None
+    assert price_usage({"input_tokens": 10_000, "output_tokens": 1_000}, model="claude-opus-5") is None
+
+
+def test_price_table_dates_a_fetched_rate_but_not_an_operators_own() -> None:
+    """A config rate has no verification date, and inventing one would claim currency."""
+    table = PriceTable(
+        overrides={"my-gateway": Rates(input=1.0, cached_input=0.1, cache_write=1.25, output=2.0)},
+        fetched={"gpt-5.6-sol": Rates(input=7.0, cached_input=0.7, cache_write=8.75, output=35.0)},
+        fetched_as_of="2026-09-15",
+    )
+
+    assert price_provenance(table.lookup("my-gateway")) == {
+        "price_rates": {
+            "input": 1.0,
+            "cached_input": 0.1,
+            "cache_write": 1.25,
+            "output": 2.0,
+            "cache_write_5m": None,
+            "cache_write_1h": None,
+        },
+        "price_source": "config",
+        "price_rates_as_of": None,
+    }
+    fetched = price_provenance(table.lookup("gpt-5.6-sol"))
+    assert (fetched["price_source"], fetched["price_rates_as_of"]) == ("fetched", "2026-09-15")
+    # An unpriced model still produces the keys, so results have one shape to read.
+    assert price_provenance(None) == {"price_rates": None, "price_source": None, "price_rates_as_of": None}
+
+
+def test_two_passes_months_apart_keep_the_rates_each_was_priced_by() -> None:
+    """The point of recording rates per run: a later pass must not restate an earlier one.
+
+    Same model, same tokens, two months and a price rise apart. Both figures stay valid
+    because each carries the rate that produced it, which is what lets one report mix them.
+    """
+    usage = {"input_tokens": 1_000_000, "output_tokens": 100_000}
+    august = PriceTable(
+        fetched={"gpt-5.6-sol": Rates(input=5.0, cached_input=0.5, cache_write=6.25, output=30.0)},
+        fetched_as_of="2026-08-04",
+    )
+    october = PriceTable(
+        fetched={"gpt-5.6-sol": Rates(input=8.0, cached_input=0.8, cache_write=10.0, output=48.0)},
+        fetched_as_of="2026-10-04",
+    )
+
+    then = price_usage(usage, model="gpt-5.6-sol", provider="codex", prices=august)
+    now = price_usage(usage, model="gpt-5.6-sol", provider="codex", prices=october)
+
+    assert then == pytest.approx(5.0 + 3.0)
+    assert now == pytest.approx(8.0 + 4.8)
+    assert price_provenance(august.lookup("gpt-5.6-sol"))["price_rates_as_of"] == "2026-08-04"
+    assert price_provenance(october.lookup("gpt-5.6-sol"))["price_rates_as_of"] == "2026-10-04"
+
+
+def test_fetch_table_dates_the_fetch_and_keeps_config_on_top() -> None:
+    """What ``bench`` builds: live rates, dated, with the operator's own still winning."""
+    pages = {"anthropic": _ANTHROPIC_MD, "openai": _OPENAI_MD}
+    mine = {"gpt-5.6-sol": Rates(input=1.0, cached_input=0.1, cache_write=1.25, output=2.0)}
+
+    table = fetch_table(
+        mine,
+        today=date(2026, 9, 15),
+        fetcher=lambda url: pages["anthropic" if "claude" in url else "openai"],
+    )
+
+    assert table.fetched_as_of == "2026-09-15"
+    # The page priced this one at $5 input; the operator's own rate still wins.
+    assert table.fetched["gpt-5.6-sol"].input == 5.0
+    assert table.lookup("gpt-5.6-sol").source == "config"
+    assert table.lookup("gpt-5.6-sol").rates.input == 1.0
+    # Everything else comes from the fetch, dated by it.
+    sonnet = table.lookup("claude-sonnet-5")
+    assert (sonnet.source, sonnet.as_of) == ("fetched", "2026-09-15")
+    # 2026-09-15 is past the introductory window, so the standard rate applies.
+    assert sonnet.rates.input == 3.0
+
+
+def test_fetch_table_raises_rather_than_pricing_a_pass_from_a_stale_table() -> None:
+    """Bench turns this into a refusal: a wrong cost, once frozen into a result, stays wrong."""
+
+    def unreachable(url, **_kwargs):
+        raise PriceFeedError(f"could not fetch {url}: timed out")
+
+    with pytest.raises(PriceFeedError, match="could not fetch"):
+        fetch_table({}, today=date(2026, 9, 15), fetcher=unreachable)
 
 
 def test_config_prices_block_validates_and_defaults_the_cache_rates() -> None:
@@ -1912,6 +2054,37 @@ def test_load_warning_needs_most_of_the_arm_to_miss(
     notes = _integrity_notes(load_results(runs_root))
 
     assert bool(notes) is warned
+
+
+def test_arms_priced_on_different_dates_are_flagged_as_not_cost_comparable(
+    runs_root: Path, model: str, make_result
+) -> None:
+    """Benching arms weeks apart confounds the skill's effect with a change in list price.
+
+    Rates are resolved live and frozen per run, so each figure is true to what it cost —
+    but the difference *between* arms then contains both effects, and nothing downstream
+    can separate them. The report says so rather than presenting the gap as the skill's.
+    """
+    for arm, as_of in (("noskill", "2026-08-04"), ("skill_v1", "2026-10-04")):
+        for split in ("train", "test"):
+            key = RunKey(arm=arm, split=split, model=model, task_id="example_task", rep=1)
+            make_result(runs_root, key, price_rates_as_of=as_of, price_source="fetched")
+
+    (note,) = [n for n in _integrity_notes(load_results(runs_root)) if "priced on different dates" in n]
+    assert "2026-08-04" in note and "2026-10-04" in note
+    assert "not only the skill's effect" in note
+
+
+def test_one_pass_priced_on_one_date_is_not_flagged(runs_root: Path, model: str, make_result) -> None:
+    """The note must stay quiet on the ordinary case, or it teaches people to ignore it."""
+    for arm in ("noskill", "skill_v1"):
+        for split in ("train", "test"):
+            key = RunKey(arm=arm, split=split, model=model, task_id="example_task", rep=1)
+            make_result(runs_root, key, price_rates_as_of="2026-08-04", price_source="fetched")
+
+    notes = _integrity_notes(load_results(runs_root))
+
+    assert not any("priced on different dates" in note for note in notes)
 
 
 def test_unpriced_runs_are_unknown_in_reports_not_zero_cost(

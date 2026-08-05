@@ -19,6 +19,19 @@ and this project adheres to [Semantic Versioning][].
   at its own rate. The rates used are frozen into `result.json`.
 - Add `acumen prices` to show the rate table and `acumen prices --refresh` to diff it
   against the providers' published pricing, plus a `prices:` config key to override it.
+- Ship no rate table at all: rates are read from the providers' pricing pages on every
+  command that prices something, since a table compiled into a release is wrong from
+  whatever date prices next move, and each run's cost is frozen when written rather than
+  corrected later. `prices:` in `config.yaml` still overrides, and still wins.
+- Fail `acumen bench` when the pricing pages cannot be read, before anything is spent:
+  cost is a headline metric of the report, so a pass that cannot establish rates should
+  not run. `draft`, `improve`, `tasks`, and `ship` degrade to unpriced instead, warning
+  that Codex's `max_usd` cannot be enforced without rates.
+- Record `price_source` and `price_rates_as_of` next to `price_rates` in every
+  `result.json`, so runs benchmarked months apart remain individually attributable and a
+  single report can mix them without restating either.
+- Flag arms in a report that were priced on different dates: the cost difference between
+  them includes any change in provider pricing, not only the skill's effect.
 - Render an HTML transcript for Codex runs too, from the `codex exec` event stream.
 - Run the whole comparison from one `acumen bench`: with no arm selected it now covers
   every arm the project has — the baseline plus each version in `skills/` — benching them
