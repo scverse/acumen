@@ -262,7 +262,7 @@ def load_results(runs_root: Path) -> pd.DataFrame:
     # New results carry an explicit availability flag; legacy results predate it and their
     # numeric cost remains usable. An unavailable price is NaN inside pandas so every normal
     # aggregation propagates "unknown" instead of silently treating the run as free.
-    available = df.get("cost_available", pd.Series(True, index=df.index)).fillna(True).astype(bool)
+    available = df.get("cost_available", pd.Series(True, index=df.index)).astype("boolean").fillna(True).astype(bool)
     df["cost_usd"] = pd.to_numeric(df["cost_usd"], errors="coerce")
     df.loc[~available, "cost_usd"] = math.nan
     if "provider_cost_usd" not in df.columns:
@@ -306,7 +306,10 @@ def _loaded_flags(df: pd.DataFrame) -> pd.Series:
     """
     if "skill_loaded" not in df.columns:
         return pd.Series(False, index=df.index, dtype=bool)
-    return df["skill_loaded"].fillna(False).astype(bool)
+    # Convert to pandas' nullable BooleanDtype before filling. Filling an object-dtype
+    # bool/None series currently downcasts silently and emits a FutureWarning; making the
+    # conversion explicit is stable under pandas' future no-silent-downcasting behavior.
+    return df["skill_loaded"].astype("boolean").fillna(False).astype(bool)
 
 
 def arm_metrics(df: pd.DataFrame) -> pd.DataFrame:

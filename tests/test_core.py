@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import time
+import warnings
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date
@@ -77,6 +78,7 @@ from acumen.report import (
     _best_cells,
     _holm,
     _integrity_notes,
+    _loaded_flags,
     _loaded_rank,
     _pareto_front,
     _pareto_steps,
@@ -2036,6 +2038,17 @@ def test_skill_loaded_column_counts_undetermined_runs_as_not_loaded(runs_root: P
         plt.close(figure)
 
     assert widths == [0.0, 0.5]  # the baseline loaded nothing; one of two skill runs is determined
+
+
+def test_loaded_flags_fill_missing_values_without_object_downcast_warning() -> None:
+    values = pd.DataFrame({"skill_loaded": pd.Series([True, None, False], dtype=object)})
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        flags = _loaded_flags(values)
+
+    assert flags.dtype == bool
+    assert flags.tolist() == [True, False, False]
 
 
 @pytest.mark.parametrize(("loads", "warned"), [((True, True, False), False), ((True, False, False), True)])
