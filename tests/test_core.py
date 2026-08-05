@@ -38,7 +38,7 @@ from acumen.agents import (
     provider_for_model,
     run_agent,
 )
-from acumen.bench import build_matrix, pending
+from acumen.bench import BenchmarkInvalidError, PlannedRun, build_matrix, pending, run_matrix
 from acumen.config import Config, ConfigError, derive_skill_name, load_config, parse_config
 from acumen.env import (
     AUTH_ENV_VARS,
@@ -53,7 +53,7 @@ from acumen.env import (
     session_auth_available,
 )
 from acumen.grade import grade_answer, grade_run
-from acumen.improve import _write_material, collect_train_runs, load_rates
+from acumen.improve import ImproveError, _write_material, collect_train_runs, load_rates
 from acumen.logs import LiveLog
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
 from acumen.pricefeed import PriceFeedError, diff_rates, parse_anthropic, parse_openai
@@ -93,7 +93,7 @@ from acumen.report import (
     skill_tests,
     tradeoff_figure,
 )
-from acumen.runner import StderrFilter, _skill_fired, _terminal_reason, run_once
+from acumen.runner import RunOutcome, StderrFilter, _provider_exhaustion_error, _skill_fired, _terminal_reason, run_once
 from acumen.sandbox import Sandbox
 from acumen.ship import _ship_env
 from acumen.skills import SkillError, load_skill, read_meta, skill_hash, write_meta
@@ -145,6 +145,9 @@ def test_is_complete_needs_a_result_file(tmp_path: Path) -> None:
     assert not is_complete(tmp_path)
     (tmp_path / "result.json").write_text("{}")
     assert is_complete(tmp_path)
+
+    (tmp_path / "result.json").write_text('{"valid": false}')
+    assert not is_complete(tmp_path)
 
 
 # --- config / tasks --------------------------------------------------------------------
@@ -625,6 +628,213 @@ def test_codex_cap_subtypes_map_onto_the_same_reasons_as_claude(subtype: str, re
     """A cap breach must record the same reason whichever provider hit it."""
     result = _codex_terminal([], -15, 10, subtype)
     assert _terminal_reason(result) == reason
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "You've hit your usage limit · resets at 5pm",
+        "insufficient_quota: exceeded your current quota",
+        "Your credit balance is too low to access the Anthropic API",
+        "HTTP 402 payment required; purchase more credits",
+    ],
+)
+def test_provider_quota_and_credit_exhaustion_is_infrastructure_invalid(detail: str) -> None:
+    result = AgentResult(
+        provider="codex",
+        is_error=True,
+        subtype="turn.failed",
+        errors=[detail],
+        session_id=None,
+        result="",
+        num_turns=0,
+        total_cost_usd=None,
+        duration_ms=1,
+        usage={},
+    )
+    assert _provider_exhaustion_error(result) is not None
+
+
+def test_transient_rate_limit_and_acumen_caps_are_not_provider_exhaustion() -> None:
+    throttled = AgentResult(
+        provider="claude",
+        is_error=True,
+        subtype="error",
+        errors=["429 rate limit exceeded; retry after 2 seconds"],
+        session_id=None,
+        result="",
+        num_turns=0,
+        total_cost_usd=None,
+        duration_ms=1,
+        usage={},
+    )
+    capped = replace(throttled, subtype="error_max_budget_usd", errors=["acumen stopped at its spending limit"])
+    assert _provider_exhaustion_error(throttled) is None
+    assert _provider_exhaustion_error(capped) is None
+
+
+def test_provider_exhaustion_result_is_diagnostic_not_complete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    box_root = tmp_path / "box"
+    box_root.mkdir()
+    box = Sandbox(
+        root=box_root,
+        home=tmp_path / "home",
+        config_dir=tmp_path / "codex-home",
+        env={},
+        authenticated=True,
+        provider="codex",
+    )
+
+    @contextmanager
+    def fake_sandbox(*_args, **_kwargs):
+        yield box
+
+    async def exhausted(*_args, **_kwargs) -> AgentResult:
+        return AgentResult(
+            provider="codex",
+            is_error=True,
+            subtype="turn.failed",
+            errors=["insufficient_quota: purchase more credits"],
+            session_id=None,
+            result="",
+            num_turns=0,
+            total_cost_usd=None,
+            duration_ms=10,
+            usage={},
+        )
+
+    monkeypatch.setattr("acumen.runner.sandbox", fake_sandbox)
+    monkeypatch.setattr("acumen.runner.run_agent", exhausted)
+    monkeypatch.setattr("acumen.runner._collect_artifacts", lambda *_args: None)
+    monkeypatch.setattr("acumen.runner.agent_version", lambda _provider: "test")
+    directory = tmp_path / "run"
+    outcome = asyncio.run(
+        run_once(
+            key=RunKey(arm="noskill", split="test", model="gpt-5.6-sol", task_id="task", rep=1),
+            task=Task(id="task", train=TaskSplit("prompt", "OK"), test=TaskSplit("prompt", "OK")),
+            target=Target(
+                source="target",
+                ref="main",
+                src_dir=tmp_path / "src",
+                venv_dir=tmp_path / "venv",
+                commit="abc",
+                pkg_name="target",
+                pkg_version="1",
+            ),
+            run_dir=directory,
+            model="gpt-5.6-sol",
+            max_turns=1,
+            max_usd=1.0,
+        )
+    )
+
+    persisted = json.loads((directory / "result.json").read_text())
+    assert outcome.reason == "provider_exhausted"
+    assert persisted["valid"] is False
+    assert not is_complete(directory)
+
+
+def test_run_matrix_cancels_remaining_cells_when_provider_is_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = Task(id="quota", train=TaskSplit("prompt", "OK"), test=TaskSplit("prompt", "OK"))
+    planned = [
+        PlannedRun(
+            key=RunKey(arm="noskill", split="test", model="gpt-5.6-sol", task_id=f"task_{index}", rep=1),
+            task=task,
+            model="gpt-5.6-sol",
+            max_turns=1,
+            max_usd=1.0,
+        )
+        for index in range(3)
+    ]
+    cancelled: list[str] = []
+
+    async def fake_run_once(*, key: RunKey, **_kwargs: object) -> RunOutcome:
+        if key.task_id == "task_0":
+            await asyncio.sleep(0)  # let sibling Codex cells become in-flight
+            return RunOutcome(
+                key=key,
+                success=False,
+                reason="provider_exhausted",
+                payload={"agent": "codex", "auth_mode": "session", "error": "usage limit reached"},
+            )
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(key.task_id)
+
+    monkeypatch.setattr("acumen.bench.run_once", fake_run_once)
+    target = Target(
+        source="target",
+        ref="main",
+        src_dir=tmp_path / "src",
+        venv_dir=tmp_path / "venv",
+        commit="abc",
+        pkg_name="target",
+        pkg_version="1",
+    )
+
+    with pytest.raises(BenchmarkInvalidError, match="benchmark invalid"):
+        asyncio.run(run_matrix(planned, target=target, runs_root=tmp_path / "runs", max_concurrency=3))
+    assert set(cancelled) == {"task_1", "task_2"}
+
+
+def test_run_matrix_continues_other_provider_after_one_is_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = Task(id="mixed", train=TaskSplit("prompt", "OK"), test=TaskSplit("prompt", "OK"))
+
+    def planned(model: str, task_id: str) -> PlannedRun:
+        return PlannedRun(
+            key=RunKey(arm="noskill", split="test", model=model, task_id=task_id, rep=1),
+            task=task,
+            model=model,
+            max_turns=1,
+            max_usd=1.0,
+        )
+
+    matrix = [
+        planned("gpt-5.6-sol", "codex_quota"),
+        planned("claude-opus-5", "claude_first"),
+        planned("gpt-5.6-sol", "codex_queued"),
+        planned("claude-opus-5", "claude_queued"),
+    ]
+    completed: list[str] = []
+    cancelled: list[str] = []
+
+    async def fake_run_once(*, key: RunKey, **_kwargs: object) -> RunOutcome:
+        if key.task_id == "codex_quota":
+            return RunOutcome(
+                key=key,
+                success=False,
+                reason="provider_exhausted",
+                payload={"agent": "codex", "auth_mode": "session", "error": "usage limit reached"},
+            )
+        if key.model.startswith("gpt-"):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(key.task_id)
+        await asyncio.sleep(0)
+        completed.append(key.task_id)
+        return RunOutcome(key=key, success=True, reason="ok", payload={})
+
+    monkeypatch.setattr("acumen.bench.run_once", fake_run_once)
+    target = Target(
+        source="target",
+        ref="main",
+        src_dir=tmp_path / "src",
+        venv_dir=tmp_path / "venv",
+        commit="abc",
+        pkg_name="target",
+        pkg_version="1",
+    )
+
+    with pytest.raises(BenchmarkInvalidError, match="other providers continued"):
+        asyncio.run(run_matrix(matrix, target=target, runs_root=tmp_path / "runs", max_concurrency=2))
+    assert completed == ["claude_first", "claude_queued"]
+    assert cancelled == []  # the queued Codex cell was cancelled before it was submitted
 
 
 def test_codex_transcript_renders_its_own_html(tmp_path: Path) -> None:
@@ -1234,6 +1444,14 @@ def test_collect_train_runs_carries_load_status(project: Path, make_result) -> N
     assert [r.skill_loaded for r in runs].count(None) == 1
 
 
+def test_improver_refuses_provider_exhaustion_evidence(project: Path, make_result) -> None:
+    key = RunKey(arm="skill_v1", split="train", model="gpt-5.6-sol", task_id="example_task", rep=1)
+    make_result(project / "runs", key, valid=False, reason="provider_exhausted", success=False)
+
+    with pytest.raises(ImproveError, match="infrastructure-invalid benchmark result"):
+        collect_train_runs(project / "runs", "skill_v1", load_tasks(project / "tasks.yaml"))
+
+
 def test_load_rates_split_by_model_and_count_undetermined(project: Path, make_result) -> None:
     """Rates are per model, since the load rate varies more by model than by skill version."""
     rates = load_rates(_train_evidence(project, make_result, [True, True, False, None]))
@@ -1580,6 +1798,14 @@ def test_build_agent_env_seeds_only_in_session_mode(tmp_path: Path, monkeypatch:
     api_cfg = tmp_path / "api_cfg"
     build_agent_env(config_dir=api_cfg, home=home, auth_mode="api")
     assert not (api_cfg / ".credentials.json").exists()  # not seeded
+
+
+def test_reports_refuse_provider_exhaustion_results(runs_root: Path, model: str, make_result) -> None:
+    key = RunKey(arm="noskill", split="train", model=model, task_id="quota", rep=1)
+    make_result(runs_root, key, valid=False, reason="provider_exhausted", success=False)
+
+    with pytest.raises(ReportError, match="infrastructure-invalid provider quota/credit"):
+        load_results(runs_root)
 
 
 def test_resolve_palette_overrides_by_id_and_by_label() -> None:

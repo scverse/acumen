@@ -39,6 +39,29 @@ _SUBTYPE_REASONS: dict[str, Reason] = {
     "error_max_turns": "max_turns",
 }
 
+# Provider/account exhaustion is a failure of the benchmark infrastructure, not evidence
+# about the model. Keep these deliberately narrower than generic 429/rate-limit wording:
+# transient throttling is not proof that the account has no remaining usage or credit.
+_PROVIDER_EXHAUSTION_MARKERS = (
+    "usage limit",
+    "usage_limit",
+    "hit your limit",
+    "quota exceeded",
+    "quota_exceeded",
+    "exceeded your current quota",
+    "insufficient_quota",
+    "billing_hard_limit",
+    "credit balance",
+    "out of credits",
+    "no credits remaining",
+    "credits are exhausted",
+    "purchase more credits",
+    "payment required",
+    "spending limit",
+    "spend limit",
+    "token quota",
+)
+
 
 @dataclass(frozen=True)
 class RunOutcome:
@@ -65,6 +88,25 @@ def _terminal_reason(message: AgentResult) -> Reason | None:
         return "max_turns"
     if message.is_error or subtype.startswith("error"):
         return "error"
+    return None
+
+
+def _provider_exhaustion_error(message: AgentResult | None, error: str | None = None) -> str | None:
+    """Return provider quota/credit evidence, excluding Acumen's intentional caps.
+
+    Both adapters preserve provider error text, but their subtype vocabularies differ and
+    change over time. Matching the stable billing/quota concepts keeps the classification
+    provider-neutral while avoiding a false match on ordinary transient rate limiting.
+    """
+    if message is not None and (message.subtype or "").lower() in _SUBTYPE_REASONS:
+        return None
+    parts = [error or ""]
+    if message is not None:
+        parts.extend([message.subtype or "", *(message.errors or [])])
+    detail = "\n".join(str(part) for part in parts if part).strip()
+    lowered = detail.lower()
+    if any(marker in lowered for marker in _PROVIDER_EXHAUSTION_MARKERS):
+        return detail
     return None
 
 
@@ -316,7 +358,10 @@ async def run_once(
             skill_loaded = _skill_fired(run_dir / TRANSCRIPT_JSONL, expected_skill, provider=provider)
 
     grade: Grade = grade_run(run_dir, split.answer)
-    if error is not None or result is None:
+    exhaustion = _provider_exhaustion_error(result, error)
+    if exhaustion is not None:
+        success, reason = False, "provider_exhausted"
+    elif error is not None or result is None:
         success, reason = False, "error"
     else:
         terminal = _terminal_reason(result)
@@ -349,6 +394,9 @@ async def run_once(
         "rep": key.rep,
         "success": success,
         "reason": reason,
+        # Provider quota/credit exhaustion invalidates the measurement. Keeping a diagnostic
+        # result is useful, but reports and resume must never treat it as benchmark evidence.
+        "valid": reason != "provider_exhausted",
         "turns": result.num_turns if result else 0,
         "cost_usd": cost.cost_usd,
         "cost_available": cost.available,
@@ -378,7 +426,7 @@ async def run_once(
         "stop_reason": result.stop_reason if result else None,
         "subtype": result.subtype if result else None,
         "transcript_html": rendered,
-        "error": error or (result.errors if result else None),
+        "error": exhaustion or error or (result.errors if result else None),
     }
     (run_dir / RESULT_FILE).write_text(json.dumps(payload, indent=2) + "\n")
     return RunOutcome(key=key, success=success, reason=reason, payload=payload)

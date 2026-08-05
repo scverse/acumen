@@ -115,9 +115,11 @@ a command.
    train/test gap in the report is the overfitting signal you are watching for.
 8. **Task prompts must not name the target package** — the harness already tells the agent
    which package to use and that it is installed.
-9. **Resume is automatic**: a run is "complete" when its `result.json` exists and is
-   non-empty, and completed runs are skipped. `--no-resume` re-runs them. Renaming a task
-   `id` orphans its old runs (the id is a path component).
+9. **Resume is automatic**: a valid run is "complete" when its `result.json` exists and is
+   non-empty, and completed runs are skipped. `--no-resume` re-runs them. Provider usage/credit
+   exhaustion writes a diagnostic `valid: false` result, cancels only that provider's remaining
+   cells while other providers finish, and remains pending; replenish the credential and rerun
+   the same command. Renaming a task `id` orphans its old runs (the id is a path component).
 10. **Confirm the skill actually loaded.** `bench` prints `skill loaded in N/M runs` from
     per-run `skill_loaded` evidence, and warns when a skill arm never fired the Skill tool
     (that arm measures nothing) or when the baseline did.

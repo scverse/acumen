@@ -21,6 +21,12 @@ acumen bench [--no-skill | --skill v1] [--split train|test]... [--task ID]...
   Each run records the resolved mode; under `session`, `inferred_cost_usd` is the equivalent
   API-rate cost computed from tokens, not money charged to the subscription.
 - Ctrl-C is safe: completed runs are preserved and the next invocation resumes.
+- Provider account/session usage exhaustion or an API account without credit invalidates the
+  pass rather than counting against the agent. Acumen prints the provider error, cancels the
+  remaining cells for that provider, lets every other provider finish its running and queued
+  cells, exits non-zero, and records the triggering cell as `valid: false` for diagnosis.
+  Reports and `improve` refuse that evidence; after replenishing the credential, rerun the same
+  command and automatic resume retries invalid and cancelled cells.
 
 **Arm parity is the whole point.** Both arms get an identical prompt, tools, caps, and
 environment; the only difference is that a skill arm copies the skill's content files into
@@ -50,7 +56,7 @@ holds five files:
 `result.json` presence + non-zero size is what marks a run complete, which is what makes
 resume safe. Useful fields: `success`, `reason`, `answer`, `expected`, `model`, `turns`,
 `cost_usd`, `input_tokens`, `output_tokens`, `duration_s`, `skill_hash`, `skill_name`,
-`skill_loaded`, `pkg_version`, `commit`, `session_id`, `subtype`, `error`.
+`skill_loaded`, `pkg_version`, `commit`, `session_id`, `subtype`, `valid`, `error`.
 
 **`cost_usd` prefers the provider's value and falls back to token inference.** Each run records
 `provider_cost_usd`, `inferred_cost_usd`, `cost_source`, and the absolute/relative delta when
@@ -87,6 +93,7 @@ Codex run is stopped mid-turn and so records no usage — a failure with zero to
 | `no_answer_file` | The agent never wrote `answer.md` |
 | `budget` / `max_turns` | Cap breached — a **failure regardless** of what `answer.md` contains |
 | `error` | The agent crashed or produced no result |
+| `provider_exhausted` | Provider usage/credit ran out; infrastructure-invalid, never agent evidence |
 
 A run of `format_error`s means the harness's answer-format instruction is losing to the
 task prompt; a run of `no_answer_file` usually means the task is too big for `max_turns`.

@@ -22,7 +22,7 @@ import shutil
 import sys
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -264,11 +264,29 @@ async def _run_claude(
     from claude_agent_sdk import ResultMessage, query
 
     result: ResultMessage | None = None
-    async for message in query(prompt=prompt, options=_claude_options(options)):
-        if on_event is not None:
-            on_event(message)
-        if isinstance(message, ResultMessage):
-            result = message
+    noise: list[str] = []
+
+    def capture_stderr(line: str) -> None:
+        noise.append(line)
+        if options.stderr is not None:
+            options.stderr(line)
+        else:
+            print(line, file=sys.stderr, flush=True)
+
+    try:
+        async for message in query(prompt=prompt, options=_claude_options(replace(options, stderr=capture_stderr))):
+            if on_event is not None:
+                on_event(message)
+            if isinstance(message, ResultMessage):
+                result = message
+    except Exception as err:
+        # SDK connection/process exceptions can be generic while the actionable quota or
+        # billing message was emitted only on stderr. Preserve it so the benchmark runner can
+        # classify infrastructure exhaustion instead of blaming the agent.
+        detail = "\n".join(line.strip() for line in noise if line.strip())
+        if detail:
+            raise AgentError(f"{err}\nClaude stderr:\n{detail}") from err
+        raise
     if result is None:
         raise AgentError("the Claude agent produced no result message")
     return _from_claude(result)
@@ -514,6 +532,7 @@ def _codex_terminal(
     duration_ms: int,
     capped: str | None = None,
     sandbox_failure: str | None = None,
+    stderr_lines: Sequence[str] = (),
 ) -> AgentResult:
     session_id: str | None = None
     final = ""
@@ -564,6 +583,8 @@ def _codex_terminal(
         )
     else:
         is_error = returncode != 0 or bool(errors)
+        if returncode != 0:
+            errors.extend(line.strip() for line in stderr_lines if line.strip() and line.strip() not in errors)
         if returncode != 0 and not errors:
             errors.append(f"codex exited with status {returncode}")
     return AgentResult(
@@ -671,7 +692,7 @@ async def _run_codex(
         stderr_task.cancel()
         raise
     duration_ms = round((time.monotonic() - started) * 1000)
-    return _codex_terminal(events, returncode, duration_ms, capped, _sandbox_failure(noise))
+    return _codex_terminal(events, returncode, duration_ms, capped, _sandbox_failure(noise), noise)
 
 
 async def run_agent(

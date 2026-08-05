@@ -147,6 +147,11 @@ def collect_train_runs(runs_root: Path, arm: str, tasks: list[Task]) -> list[Tra
             data = json.loads(result_path.read_text())
         except (OSError, ValueError) as err:
             raise ImproveError(f"cannot read {result_path}: {err}") from err
+        if data.get("valid", True) is False:
+            raise ImproveError(
+                "cannot improve from an infrastructure-invalid benchmark result: "
+                f"{result_path}. Replenish the provider credential and resume the benchmark first."
+            )
         key = parse_run_dir(runs_root, result_path.parent)
         task = by_id.get(key.task_id)
         if task is None:

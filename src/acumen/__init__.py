@@ -12,7 +12,7 @@ from acumen.agents import (
     provider_for_model,
     run_agent,
 )
-from acumen.bench import PlannedRun, build_matrix, pending, run_matrix, summarize
+from acumen.bench import BenchmarkInvalidError, PlannedRun, build_matrix, pending, run_matrix, summarize
 from acumen.config import Config, ConfigError, load_config, parse_config
 from acumen.draft import DraftError, DraftResult, draft_skill
 from acumen.env import (
@@ -87,6 +87,7 @@ __all__ = [
     "AgentOptions",
     "AgentProvider",
     "AgentResult",
+    "BenchmarkInvalidError",
     "Config",
     "ConfigError",
     "DraftError",

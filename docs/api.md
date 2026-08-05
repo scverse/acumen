@@ -81,6 +81,7 @@ so `from acumen import build_report` works.
     :toctree: generated
 
     PlannedRun
+    BenchmarkInvalidError
     build_matrix
     pending
     run_matrix

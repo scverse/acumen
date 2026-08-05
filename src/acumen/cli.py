@@ -11,7 +11,7 @@ from datetime import date
 from pathlib import Path
 
 from acumen.agents import AgentError, AgentProvider, check_agent_cli, provider_for_model
-from acumen.bench import build_matrix, pending, run_matrix, summarize
+from acumen.bench import BenchmarkInvalidError, build_matrix, pending, run_matrix, summarize
 from acumen.config import ConfigError, load_config
 from acumen.draft import DraftError, draft_skill
 from acumen.env import DEFAULT_CACHE_ROOT, AuthMode, EnvError, prepare_target, resolve_auth_mode
@@ -191,7 +191,7 @@ class _Progress:
         self.running -= 1
         if outcome.success:
             self.passed += 1
-        mark = "✓ pass" if outcome.success else "✗ FAIL"
+        mark = "⚠ INVALID" if outcome.reason == "provider_exhausted" else ("✓ pass" if outcome.success else "✗ FAIL")
         p = outcome.payload
         toks = int(p.get("input_tokens", 0)) + int(p.get("output_tokens", 0))
         dur = _fmt_secs(float(p.get("duration_s", 0.0)))
@@ -204,6 +204,8 @@ class _Progress:
             f"  [{self.done}/{self.total} done, {self.passed} passed]",
             flush=True,
         )
+        if outcome.reason == "provider_exhausted":
+            print(f"error: provider usage/credit exhausted: {p.get('error') or 'no provider detail'}", file=sys.stderr)
 
 
 def _fmt_tokens(value: int) -> str:
@@ -268,23 +270,32 @@ def _cmd_bench(args: argparse.Namespace) -> int:
 
     print(f"running {len(todo)} runs, up to {cfg.max_concurrency} at a time:", flush=True)
     progress = _Progress(len(todo))
-    outcomes = asyncio.run(
-        run_matrix(
-            todo,
-            target=target,
-            runs_root=args.runs,
-            max_concurrency=cfg.max_concurrency,
-            auth_modes=auth_modes,
-            skill=skill,
-            skill_name=cfg.skill_name,
-            keep_sandbox=args.keep_sandboxes,
-            stderr=StderrFilter(),
-            on_start=progress.on_start,
-            on_done=progress.on_done,
-            env_passthrough=cfg.env_passthrough,
-            price_overrides=cfg.prices,
+    try:
+        outcomes = asyncio.run(
+            run_matrix(
+                todo,
+                target=target,
+                runs_root=args.runs,
+                max_concurrency=cfg.max_concurrency,
+                auth_modes=auth_modes,
+                skill=skill,
+                skill_name=cfg.skill_name,
+                keep_sandbox=args.keep_sandboxes,
+                stderr=StderrFilter(),
+                on_start=progress.on_start,
+                on_done=progress.on_done,
+                env_passthrough=cfg.env_passthrough,
+                price_overrides=cfg.prices,
+            )
         )
-    )
+    except BenchmarkInvalidError as err:
+        print(f"\nerror: {err}", file=sys.stderr)
+        print(
+            "Fix or replenish that credential, then rerun the same command; invalid and "
+            "cancelled cells remain pending.",
+            file=sys.stderr,
+        )
+        return 2
 
     passed = sum(1 for o in outcomes if o.success)
     counts = summarize(outcomes)

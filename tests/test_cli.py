@@ -13,8 +13,10 @@ from pathlib import Path
 
 import pytest
 
+from acumen.bench import BenchmarkInvalidError
 from acumen.cli import _Progress, build_parser, main
 from acumen.config import load_config
+from acumen.env import Target
 from acumen.paths import RunKey
 from acumen.prices import RATES_AS_OF
 from acumen.runner import RunOutcome
@@ -61,6 +63,30 @@ def test_progress_prints_unavailable_cost_without_casting_null(capsys: pytest.Ca
     )
 
     assert "cost n/a" in capsys.readouterr().out
+
+
+def test_progress_prints_provider_exhaustion_as_invalid(capsys: pytest.CaptureFixture[str], model: str) -> None:
+    progress = _Progress(1)
+    progress.running = 1
+    progress.on_done(
+        RunOutcome(
+            key=RunKey(arm="noskill", split="test", model=model, task_id="task", rep=1),
+            success=False,
+            reason="provider_exhausted",
+            payload={
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost_usd": None,
+                "cost_available": False,
+                "duration_s": 0.1,
+                "error": "usage limit reached",
+            },
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert "INVALID" in captured.out and "FAIL" not in captured.out
+    assert "usage limit reached" in captured.err
 
 
 def test_init_writes_files_the_loaders_accept(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
@@ -161,6 +187,41 @@ def test_bench_with_a_skill_loads_that_version(project: Path, skills_root: Path,
 def test_bench_reports_a_missing_config(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     assert main(["bench", "--config", str(tmp_path / "nope.yaml"), "--dry-run"]) == 2
     assert "error:" in capsys.readouterr().err
+
+
+def test_bench_exits_nonzero_and_prints_provider_exhaustion(
+    project: Path, model: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    key = RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=1)
+    outcome = RunOutcome(
+        key=key,
+        success=False,
+        reason="provider_exhausted",
+        payload={"agent": "claude", "auth_mode": "session", "error": "You've hit your usage limit"},
+    )
+
+    async def invalid_matrix(*_args: object, **_kwargs: object) -> list[RunOutcome]:
+        raise BenchmarkInvalidError(outcome)
+
+    target = Target(
+        source="target",
+        ref="main",
+        src_dir=project / "src",
+        venv_dir=project / "venv",
+        commit="abc",
+        pkg_name="target",
+        pkg_version="1",
+    )
+    monkeypatch.setattr("acumen.cli.resolve_auth_mode", lambda *_args, **_kwargs: "session")
+    monkeypatch.setattr("acumen.cli.check_agent_cli", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("acumen.cli.prepare_target", lambda *_args, **_kwargs: target)
+    monkeypatch.setattr("acumen.cli.run_matrix", invalid_matrix)
+
+    assert main(bench_args(project)) == 2
+    err = capsys.readouterr().err
+    assert "benchmark invalid" in err
+    assert "You've hit your usage limit" in err
+    assert "invalid and cancelled cells remain pending" in err
 
 
 def test_report_writes_html_and_csv(project: Path, runs_root: Path, capsys: pytest.CaptureFixture) -> None:

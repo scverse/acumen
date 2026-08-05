@@ -7,6 +7,7 @@ needs to know where a run lives asks this module.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -154,11 +155,15 @@ def parse_run_dir(runs_root: Path, path: Path) -> RunKey:
 def is_complete(directory: Path) -> bool:
     """Return whether a run directory holds a complete run.
 
-    A readable ``result.json`` is what marks a run done — this is the check that makes
-    resuming a pass work.
+    A readable ``result.json`` is what normally marks a run done. Infrastructure-invalid
+    results explicitly carry ``valid: false`` and remain pending, so fixing the provider
+    quota and rerunning retries them without requiring ``--no-resume``.
     """
     result = directory / RESULT_FILE
     try:
-        return result.is_file() and result.stat().st_size > 0
-    except OSError:
+        if not result.is_file() or result.stat().st_size == 0:
+            return False
+        data = json.loads(result.read_text())
+        return isinstance(data, dict) and data.get("valid", True) is not False
+    except (OSError, ValueError):
         return False

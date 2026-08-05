@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning][].
   metered billing; cost is now derived from token counts, which a subscription run reports
   just as fully. `result.json` records the run's `auth_mode`, since under `session` the figure
   is what the run would have cost at API rates rather than metered spend.
+- Treat exhausted provider subscription usage and API credit as benchmark-invalid
+  infrastructure failures: print the provider error, cancel only that provider's remaining
+  cells while other providers finish, exit non-zero, and refuse to report or improve from the
+  invalid evidence. Resuming automatically retries the invalid and cancelled cells after the
+  credential is replenished.
 
 ### Fixed
 

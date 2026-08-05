@@ -16,7 +16,16 @@ from typing import Literal
 
 from acumen.paths import ANSWER_FILE
 
-Reason = Literal["ok", "wrong_answer", "format_error", "no_answer_file", "budget", "max_turns", "error"]
+Reason = Literal[
+    "ok",
+    "wrong_answer",
+    "format_error",
+    "no_answer_file",
+    "budget",
+    "max_turns",
+    "error",
+    "provider_exhausted",
+]
 
 _FENCE_RE = re.compile(r"^\s*```[^\n]*\n(?P<body>.*?)\n?\s*```\s*$", re.DOTALL)
 _HEADER_LINE_RE = re.compile(r"^\s*#+\s")

@@ -99,6 +99,13 @@ tokens, so Acumen can calculate the same API-rate estimate for either. Under `se
 estimate is what the run *would* have cost at API rates, not money billed — so each run records
 its `auth_mode` alongside the figure.
 
+If the selected subscription runs out of usage or the API account runs out of credit, Acumen
+invalidates the pass instead of scoring that as an agent failure: it prints the provider error,
+cancels remaining cells for that provider, lets other providers finish all running and queued
+cells, and exits non-zero. Replenish the credential and rerun the same command; automatic resume
+retries the invalid and cancelled cells. Reports and `improve` refuse invalid quota/credit
+evidence.
+
 `max_turns` and `max_usd` apply to both providers, but they are not equally strict for Codex,
 which has no cap of its own — acumen enforces both against its event stream:
 

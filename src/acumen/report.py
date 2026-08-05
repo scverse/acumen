@@ -231,11 +231,15 @@ def load_results(runs_root: Path) -> pd.DataFrame:
         raise ReportError(f"no runs directory: {runs_root}")
 
     rows: list[dict] = []
+    invalid: list[Path] = []
     for result_path in sorted(runs_root.rglob(RESULT_FILE)):
         try:
             data = json.loads(result_path.read_text())
         except (OSError, json.JSONDecodeError) as err:
             raise ReportError(f"cannot read {result_path}: {err}") from err
+        if data.get("valid", True) is False:
+            invalid.append(result_path)
+            continue
         # Legacy results predate the dual-cost schema. Their sole ``cost_usd`` value was
         # inferred from tokens, so it is a valid fallback only when the newer field is
         # absent (not when a modern result explicitly records inference as unavailable).
@@ -244,6 +248,13 @@ def load_results(runs_root: Path) -> pd.DataFrame:
         data["transcript_path"] = (result_path.parent / TRANSCRIPT_HTML).resolve()
         rows.append(data)
 
+    if invalid:
+        sample = ", ".join(str(path) for path in invalid[:3])
+        more = f" (+{len(invalid) - 3} more)" if len(invalid) > 3 else ""
+        raise ReportError(
+            "benchmark contains infrastructure-invalid provider quota/credit result(s); "
+            f"replenish the credential and resume the benchmark before reporting: {sample}{more}"
+        )
     if not rows:
         raise ReportError(f"no {RESULT_FILE} files under {runs_root} — run `acumen bench` first")
 
