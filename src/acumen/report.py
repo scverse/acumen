@@ -69,7 +69,7 @@ ACCENT = "#b2ac9e"  # the light warm tone, for table tints and notes
 # gate — deuteranopia 14.9, protanopia 8.2, normal-vision 23.7 — so the two providers stay
 # distinguishable in every vision type. Train/test already spends the texture channel, so
 # colour is the only thing carrying provider identity here; it has to work on its own.
-_MODEL_ORDER = ("fable", "opus", "sonnet", "haiku", "sol", "luna", "terra")
+_MODEL_ORDER = ("fable", "opus", "sonnet", "haiku", "sol", "terra", "luna")
 _MODEL_COLOR = {
     # Anthropic — the warm ramp.
     "fable": "#d86f53",  # Claude orange — most potent, darkest/most saturated
@@ -77,9 +77,9 @@ _MODEL_COLOR = {
     "sonnet": "#e8a794",  # lighter still
     "haiku": "#eec0b0",  # lightest — least potent
     # OpenAI — the cool ramp, stepped over the same lightness span.
-    "sol": "#005661",  # darkest
-    "luna": "#007782",
-    "terra": "#0099a3",  # lightest
+    "sol": "#005661",  # most potent, darkest
+    "terra": "#007782",
+    "luna": "#0099a3",  # lightest — least potent
 }
 _OTHER_MODEL_COLOR = "#8a8378"  # neutral fallback for an unrecognised model id
 
@@ -461,7 +461,7 @@ def resolve_palette(models: Sequence[str], overrides: Mapping[str, str] | None =
 def _models_in_order(df: pd.DataFrame) -> list[str]:
     """Models present, grouped by provider and most-potent first, then any others.
 
-    Anthropic's tiers lead (fable, opus, sonnet, haiku), then OpenAI's (sol, luna, terra), so
+    Anthropic's tiers lead (fable, opus, sonnet, haiku), then OpenAI's (sol, terra, luna), so
     each provider's ramp reads as a run of one hue rather than being interleaved with the other.
     """
 
