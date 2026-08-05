@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning][].
 - Add `acumen prices` to show the rate table and `acumen prices --refresh` to diff it
   against the providers' published pricing, plus a `prices:` config key to override it.
 - Render an HTML transcript for Codex runs too, from the `codex exec` event stream.
+- Run the whole comparison from one `acumen bench`: with no arm selected it now covers
+  every arm the project has — the baseline plus each version in `skills/` — benching them
+  one after another against a single prepared target, with per-arm counts and tallies and a
+  combined total. `--dry-run` plans the same set for free, and `--no-skill` / `--skill vN`
+  still restrict the pass to one arm. A version in `skills/` that fails to load stops the
+  pass at planning rather than being dropped from the comparison.
 
 ### Changed
 

@@ -11,10 +11,20 @@ acumen bench [--no-skill | --skill v1] [--split train|test]... [--task ID]...
              [--cache ~/.cache/acumen]
 ```
 
-- Neither `--no-skill` nor `--skill` → the **baseline** arm (they are mutually exclusive).
-- `--split` and `--task` are repeatable; omitted means all.
+- Neither `--no-skill` nor `--skill` → **every arm the project has**: the baseline plus each
+  version in `skills/`, benched one arm after another against one prepared target. That is
+  the whole comparison in one command, and also the largest thing `bench` can spend, so
+  check it with `--dry-run` first. Name an arm (`--no-skill` / `--skill vN`, mutually
+  exclusive) to run just that one.
+- Arms run sequentially; within an arm, runs go `max_concurrency` at a time. Each arm prints
+  its own tally, then a combined one. Completed runs are skipped per arm as usual, so adding
+  `skills/v3` and rerunning `acumen bench` benches only v3.
+- A version in `skills/` that fails to load stops the pass at planning, before target prep
+  and before any spend, rather than being silently dropped from the comparison.
+- `--split` and `--task` are repeatable; omitted means all. They apply to every arm.
 - `--dry-run` prints the planned matrix and exits **before** target prep and before any
-  agent runs — free, and the right way to check the size of a pass.
+  agent runs — free, and the right way to check the size of a pass. It covers the same arms
+  the real run would, with per-arm counts and a total.
 - `--replicates` / `--max-concurrency` override the config for this pass only.
 - `--auth auto` (default) prefers a stored account/subscription login, then falls back to
   metered API credentials. Use `--auth session` or `--auth api` to require one explicitly.

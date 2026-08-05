@@ -48,6 +48,7 @@ acumen draft                     # generate skills/v1 from the package source, o
 acumen bench --skill v1          # benchmark the skill against the baseline
 acumen improve                   # generate skills/v2 from v1's train results, or write by hand
 acumen bench --skill v2
+acumen bench                     # or: every arm at once (baseline + each skills/vN)
 acumen report                    # aggregate every run into report.html
 
 # 4. Once a version proves out, ship it into the package itself:

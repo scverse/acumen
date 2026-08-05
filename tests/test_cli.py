@@ -176,6 +176,46 @@ def test_bench_dry_run_skips_completed_runs(
     assert "1 already complete, 1 to run" in out
 
 
+def test_bench_dry_run_plans_every_arm_when_none_is_selected(
+    project: Path, skills_root: Path, model: str, capsys: pytest.CaptureFixture
+) -> None:
+    assert main(bench_args(project, "--dry-run")) == 0
+
+    out = capsys.readouterr().out
+    # The baseline and every version on disk, each with its own counts, plus the run list.
+    assert "arm noskill:" in out
+    assert "arm skill_v1:" in out
+    assert "skill v1: target" in out
+    assert "total: 4 runs planned, 4 to run across 2 arms" in out
+    assert f"noskill/train/{model}/example_task/rep_1" in out
+    assert f"skill_v1/train/{model}/example_task/rep_1" in out
+
+
+def test_bench_dry_run_stays_on_one_arm_when_the_baseline_is_explicit(
+    project: Path, skills_root: Path, capsys: pytest.CaptureFixture
+) -> None:
+    assert main(bench_args(project, "--no-skill", "--dry-run")) == 0
+
+    out = capsys.readouterr().out
+    assert "arm noskill:" in out
+    assert "skill_v1" not in out
+    assert "total:" not in out
+
+
+def test_bench_refuses_a_version_that_will_not_load_before_spending(
+    project: Path, skills_root: Path, capsys: pytest.CaptureFixture
+) -> None:
+    # A broken version in skills/ is an arm that cannot run, so the whole pass stops at
+    # planning rather than half-running and failing once money is on the line.
+    (skills_root / "v2").mkdir()
+    (skills_root / "v2" / "SKILL.md").write_text("no frontmatter here\n")
+    assert main(bench_args(project, "--dry-run")) == 2
+    assert "missing a non-empty 'name'" in capsys.readouterr().err
+
+    # The healthy arms are still benchable by naming them.
+    assert main(bench_args(project, "--skill", "v1", "--dry-run")) == 0
+
+
 def test_bench_with_a_skill_loads_that_version(project: Path, skills_root: Path, capsys: pytest.CaptureFixture) -> None:
     assert main(bench_args(project, "--skill", "v1", "--dry-run")) == 0
 
@@ -187,6 +227,75 @@ def test_bench_with_a_skill_loads_that_version(project: Path, skills_root: Path,
 def test_bench_reports_a_missing_config(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     assert main(["bench", "--config", str(tmp_path / "nope.yaml"), "--dry-run"]) == 2
     assert "error:" in capsys.readouterr().err
+
+
+def test_bench_runs_every_arm_when_none_is_selected(
+    project: Path, skills_root: Path, model: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    seen: list[tuple[str | None, int]] = []
+
+    async def fake_matrix(todo, **kwargs) -> list[RunOutcome]:
+        skill = kwargs["skill"]
+        seen.append((None if skill is None else skill.version, len(todo)))
+        return [
+            RunOutcome(key=item.key, success=True, reason="ok", payload={"cost_usd": 0.5, "skill_loaded": True})
+            for item in todo
+        ]
+
+    target = Target(
+        source="target",
+        ref="main",
+        src_dir=project / "src",
+        venv_dir=project / "venv",
+        commit="abc",
+        pkg_name="target",
+        pkg_version="1",
+    )
+    monkeypatch.setattr("acumen.cli.resolve_auth_mode", lambda *_args, **_kwargs: "session")
+    monkeypatch.setattr("acumen.cli.check_agent_cli", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("acumen.cli.prepare_target", lambda *_args, **_kwargs: target)
+    monkeypatch.setattr("acumen.cli.run_matrix", fake_matrix)
+
+    assert main(bench_args(project)) == 0
+
+    # One matrix per arm, each carrying its own skill: the baseline, then v1.
+    assert seen == [(None, 2), ("v1", 2)]
+    out = capsys.readouterr().out
+    assert "total: 4 runs planned, 4 to run across 2 arms" in out
+    assert "=== arm skill_v1: 2 runs ===" in out
+    assert "all 2 arms: 4/4 passed" in out
+
+
+def test_bench_runs_only_the_named_arm(
+    project: Path, skills_root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    seen: list[str | None] = []
+
+    async def fake_matrix(todo, **kwargs) -> list[RunOutcome]:
+        skill = kwargs["skill"]
+        seen.append(None if skill is None else skill.version)
+        return [RunOutcome(key=item.key, success=True, reason="ok", payload={}) for item in todo]
+
+    target = Target(
+        source="target",
+        ref="main",
+        src_dir=project / "src",
+        venv_dir=project / "venv",
+        commit="abc",
+        pkg_name="target",
+        pkg_version="1",
+    )
+    monkeypatch.setattr("acumen.cli.resolve_auth_mode", lambda *_args, **_kwargs: "session")
+    monkeypatch.setattr("acumen.cli.check_agent_cli", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("acumen.cli.prepare_target", lambda *_args, **_kwargs: target)
+    monkeypatch.setattr("acumen.cli.run_matrix", fake_matrix)
+
+    assert main(bench_args(project, "--no-skill")) == 0
+
+    assert seen == [None]
+    out = capsys.readouterr().out
+    assert "skill_v1" not in out
+    assert "total:" not in out
 
 
 def test_bench_exits_nonzero_and_prints_provider_exhaustion(

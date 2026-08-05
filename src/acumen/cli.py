@@ -6,18 +6,19 @@ import argparse
 import asyncio
 import sys
 import time
-from dataclasses import replace
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 
 from acumen.agents import AgentError, AgentProvider, check_agent_cli, provider_for_model
-from acumen.bench import BenchmarkInvalidError, build_matrix, pending, run_matrix, summarize
-from acumen.config import ConfigError, load_config
+from acumen.bench import BenchmarkInvalidError, PlannedRun, build_matrix, pending, run_matrix, summarize
+from acumen.config import Config, ConfigError, load_config
 from acumen.draft import DraftError, draft_skill
 from acumen.env import DEFAULT_CACHE_ROOT, AuthMode, EnvError, prepare_target, resolve_auth_mode
 from acumen.improve import ImproveError, improve_skill
 from acumen.logs import LiveLog
-from acumen.paths import SPLITS
+from acumen.paths import SPLITS, arm_name
 from acumen.pricefeed import (
     PRICE_SOURCES,
     PRICE_TIER,
@@ -32,9 +33,9 @@ from acumen.report import ReportError, build_report
 from acumen.runner import RunOutcome, StderrFilter
 from acumen.scaffold import InitError, is_scaffold_tasks, scaffold
 from acumen.ship import ShipError, ship_skill
-from acumen.skills import SkillError, available_versions, latest_version, load_skill
+from acumen.skills import Skill, SkillError, available_versions, latest_version, load_skill
 from acumen.taskgen import TaskGenError, generate_tasks
-from acumen.tasks import TaskError, load_tasks
+from acumen.tasks import Task, TaskError, load_tasks
 
 
 def _add_bench_args(parser: argparse.ArgumentParser) -> None:
@@ -42,8 +43,8 @@ def _add_bench_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml")
     parser.add_argument("--runs", type=Path, default=Path("runs"), help="root of the run tree")
     arm = parser.add_mutually_exclusive_group()
-    arm.add_argument("--no-skill", action="store_true", help="run the baseline arm (the default)")
-    arm.add_argument("--skill", metavar="VERSION", help="run with a skill version, e.g. v1")
+    arm.add_argument("--no-skill", action="store_true", help="run the baseline arm alone")
+    arm.add_argument("--skill", metavar="VERSION", help="run one skill version alone, e.g. v1")
     parser.add_argument("--split", choices=SPLITS, action="append", help="restrict to a split (repeatable)")
     parser.add_argument("--task", metavar="ID", action="append", help="restrict to a task id (repeatable)")
     parser.add_argument("--max-concurrency", type=int, help="override config max_concurrency")
@@ -53,7 +54,11 @@ def _add_bench_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--keep-sandboxes", action="store_true", help="leave run sandboxes on disk")
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     parser.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
-    parser.add_argument("--dry-run", action="store_true", help="print the matrix and exit without running agents")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the matrix and exit without running agents, over the same arms the real pass would cover",
+    )
     _add_auth_arg(parser)
 
 
@@ -222,6 +227,101 @@ def _fmt_cost(value: float | None) -> str:
     return f"${value:.2f}" if value is not None else "cost n/a"
 
 
+@dataclass(frozen=True)
+class _Arm:
+    """One arm of a pass: its version, its loaded skill, and its matrix."""
+
+    version: str | None  # None => the noskill baseline
+    skill: Skill | None
+    planned: list[PlannedRun]
+    todo: list[PlannedRun]
+
+    @property
+    def name(self) -> str:
+        return arm_name(self.version)
+
+
+def _resolve_arms(cfg: Config, tasks: Sequence[Task], args: argparse.Namespace) -> list[_Arm]:
+    """Build the arms this invocation covers, loading every skill before anything is spent.
+
+    Naming an arm (``--skill vN`` / ``--no-skill``) covers that one alone. Naming none covers
+    the whole project: the baseline plus every version in ``skills/``, which is the comparison
+    the report wants anyway. A version that will not load raises here, before target prep, so a
+    broken skill costs nothing rather than surfacing part-way through a paid pass.
+    """
+    if args.skill is not None:
+        versions: list[str | None] = [args.skill]
+    elif args.no_skill:
+        versions = [None]
+    else:
+        versions = [None, *available_versions(args.skills)]
+
+    arms = []
+    for version in versions:
+        skill = None if version is None else load_skill(args.skills, version, expect_name=cfg.skill_name)
+        planned = build_matrix(cfg, tasks, skill=version, splits=args.split or SPLITS, task_ids=args.task)
+        todo = pending(planned, args.runs, resume=not args.no_resume)
+        arms.append(_Arm(version=version, skill=skill, planned=planned, todo=todo))
+    return arms
+
+
+def _print_plan(arms: Sequence[_Arm]) -> None:
+    """Print what each arm holds, and the total when a pass spans several."""
+    width = max(len(f"arm {arm.name}:") for arm in arms) if len(arms) > 1 else 0
+    indent = "    " if len(arms) > 1 else ""
+    for arm in arms:
+        label = f"arm {arm.name}:".ljust(width)
+        complete = len(arm.planned) - len(arm.todo)
+        print(f"{label} {len(arm.planned)} runs planned, {complete} already complete, {len(arm.todo)} to run")
+        if arm.skill is not None:
+            print(f"{indent}skill {arm.skill.version}: {arm.skill.name} ({arm.skill.hash[:19]}…)")
+    if len(arms) > 1:
+        planned = sum(len(arm.planned) for arm in arms)
+        todo = sum(len(arm.todo) for arm in arms)
+        print(f"total: {planned} runs planned, {todo} to run across {len(arms)} arms")
+
+
+def _print_runs(todo: Sequence[PlannedRun]) -> None:
+    for item in todo:
+        k = item.key
+        print(f"  {k.arm}/{k.split}/{k.model}/{k.task_id}/rep_{k.rep}")
+
+
+def _print_run_summary(outcomes: Sequence[RunOutcome], elapsed: float, *, label: str = "") -> None:
+    """Print the pass tally: how many passed, how long, what it cost, why runs failed."""
+    passed = sum(1 for o in outcomes if o.success)
+    counts = summarize(outcomes)
+    breakdown = ", ".join(f"{reason}={n}" for reason, n in sorted(counts.items()))
+    priced = [
+        float(o.payload["cost_usd"])
+        for o in outcomes
+        if o.payload.get("cost_available", True) and o.payload.get("cost_usd") is not None
+    ]
+    total_cost = sum(priced)
+    unpriced = len(outcomes) - len(priced)
+    cost_summary = f"${total_cost:.2f}" if priced else "cost n/a"
+    if unpriced and priced:
+        cost_summary += f" + {unpriced} unpriced run(s)"
+    elif unpriced:
+        cost_summary += f" ({unpriced} unpriced run(s))"
+    prefix = f"{label}: " if label else ""
+    print(f"\n{prefix}{passed}/{len(outcomes)} passed in {_fmt_secs(elapsed)}  ({cost_summary}, {breakdown})")
+
+
+def _print_skill_loading(outcomes: Sequence[RunOutcome], arm: _Arm, skill_name: str) -> None:
+    """Say whether the skill reached the agent — the comparison means nothing otherwise."""
+    loaded = sum(1 for o in outcomes if o.payload.get("skill_loaded"))
+    if arm.skill is not None:
+        print(f"skill loaded in {loaded}/{len(outcomes)} runs")
+        if loaded == 0:
+            print(
+                f"warning: {arm.name} never loaded the skill — that arm is not measuring the skill",
+                file=sys.stderr,
+            )
+    elif loaded:
+        print(f"warning: {skill_name} loaded in {loaded} baseline runs", file=sys.stderr)
+
+
 def _cmd_bench(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     tasks = load_tasks(args.tasks)
@@ -230,23 +330,14 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     if args.replicates:
         cfg = replace(cfg, n_replicates=args.replicates)
 
-    version = args.skill  # None => the noskill baseline
-    skill = None
-    if version is not None:
-        skill = load_skill(args.skills, version, expect_name=cfg.skill_name)
-
-    planned = build_matrix(cfg, tasks, skill=version, splits=args.split or SPLITS, task_ids=args.task)
-    todo = pending(planned, args.runs, resume=not args.no_resume)
-
-    arm = "noskill" if version is None else f"skill_{version}"
-    print(f"arm {arm}: {len(planned)} runs planned, {len(planned) - len(todo)} already complete, {len(todo)} to run")
-    if skill is not None:
-        print(f"skill {skill.version}: {skill.name} ({skill.hash[:19]}…)")
+    arms = _resolve_arms(cfg, tasks, args)
+    _print_plan(arms)
     if args.dry_run:
-        for item in todo:
-            k = item.key
-            print(f"  {k.arm}/{k.split}/{k.model}/{k.task_id}/rep_{k.rep}")
+        for arm in arms:
+            _print_runs(arm.todo)
         return 0
+
+    todo = [item for arm in arms for item in arm.todo]
     if not todo:
         return 0
 
@@ -268,26 +359,37 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]} (venv {target.venv_dir})", flush=True)
 
+    # Arms run one after another: every run in a matrix shares one skill, and a sequential
+    # pass keeps each arm's tally readable while the progress counter spans the whole thing.
+    running = [arm for arm in arms if arm.todo]
     print(f"running {len(todo)} runs, up to {cfg.max_concurrency} at a time:", flush=True)
     progress = _Progress(len(todo))
+    collected: list[RunOutcome] = []
     try:
-        outcomes = asyncio.run(
-            run_matrix(
-                todo,
-                target=target,
-                runs_root=args.runs,
-                max_concurrency=cfg.max_concurrency,
-                auth_modes=auth_modes,
-                skill=skill,
-                skill_name=cfg.skill_name,
-                keep_sandbox=args.keep_sandboxes,
-                stderr=StderrFilter(),
-                on_start=progress.on_start,
-                on_done=progress.on_done,
-                env_passthrough=cfg.env_passthrough,
-                price_overrides=cfg.prices,
+        for arm in running:
+            if len(running) > 1:
+                print(f"\n=== arm {arm.name}: {len(arm.todo)} runs ===", flush=True)
+            started = time.monotonic()
+            outcomes = asyncio.run(
+                run_matrix(
+                    arm.todo,
+                    target=target,
+                    runs_root=args.runs,
+                    max_concurrency=cfg.max_concurrency,
+                    auth_modes=auth_modes,
+                    skill=arm.skill,
+                    skill_name=cfg.skill_name,
+                    keep_sandbox=args.keep_sandboxes,
+                    stderr=StderrFilter(),
+                    on_start=progress.on_start,
+                    on_done=progress.on_done,
+                    env_passthrough=cfg.env_passthrough,
+                    price_overrides=cfg.prices,
+                )
             )
-        )
+            collected.extend(outcomes)
+            _print_run_summary(outcomes, time.monotonic() - started, label=arm.name if len(running) > 1 else "")
+            _print_skill_loading(outcomes, arm, cfg.skill_name)
     except BenchmarkInvalidError as err:
         print(f"\nerror: {err}", file=sys.stderr)
         print(
@@ -297,35 +399,8 @@ def _cmd_bench(args: argparse.Namespace) -> int:
         )
         return 2
 
-    passed = sum(1 for o in outcomes if o.success)
-    counts = summarize(outcomes)
-    breakdown = ", ".join(f"{reason}={n}" for reason, n in sorted(counts.items()))
-    priced = [
-        float(o.payload["cost_usd"])
-        for o in outcomes
-        if o.payload.get("cost_available", True) and o.payload.get("cost_usd") is not None
-    ]
-    total_cost = sum(priced)
-    unpriced = len(outcomes) - len(priced)
-    cost_summary = f"${total_cost:.2f}" if priced else "cost n/a"
-    if unpriced and priced:
-        cost_summary += f" + {unpriced} unpriced run(s)"
-    elif unpriced:
-        cost_summary += f" ({unpriced} unpriced run(s))"
-    print(f"\n{passed}/{len(outcomes)} passed in {_fmt_secs(progress.elapsed)}  ({cost_summary}, {breakdown})")
-
-    # The comparison is only meaningful if the skill actually reached the agent, so say
-    # so rather than leaving it to be discovered later in the transcripts.
-    loaded = sum(1 for o in outcomes if o.payload.get("skill_loaded"))
-    if skill is not None:
-        print(f"skill loaded in {loaded}/{len(outcomes)} runs")
-        if loaded == 0:
-            print(
-                "warning: the skill never loaded — this arm is not measuring the skill",
-                file=sys.stderr,
-            )
-    elif loaded:
-        print(f"warning: {cfg.skill_name} loaded in {loaded} baseline runs", file=sys.stderr)
+    if len(running) > 1:
+        _print_run_summary(collected, progress.elapsed, label=f"all {len(running)} arms")
     print(f"runs written to {args.runs.resolve()}")
     return 0
 
@@ -660,7 +735,13 @@ def build_parser() -> argparse.ArgumentParser:
         prog="acumen", description="Build, benchmark, and optimize agentic skills for Python packages."
     )
     sub = parser.add_subparsers(dest="command", required=True)
-    bench = sub.add_parser("bench", help="run a benchmark pass")
+    bench = sub.add_parser(
+        "bench",
+        help="run a benchmark pass over every arm, or one named arm",
+        description="Bench every arm the project has (the baseline plus each version in skills/), "
+        "or a single arm with --no-skill / --skill vN. Completed runs are skipped, so rerunning "
+        "only costs the cells that are missing.",
+    )
     _add_bench_args(bench)
     bench.set_defaults(func=_cmd_bench)
 
