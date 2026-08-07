@@ -25,6 +25,9 @@ dependency_groups: []                 # PEP 735 groups from the target's pyproje
 pip_packages: []                      # packages the target declares nowhere, e.g. [harmonypy]
 python: "3.12"                        # interpreter for the target's throwaway venv
 env_passthrough: []                   # extra env vars agents may keep (e.g. [OMP_NUM_THREADS]); the agent env is otherwise a clean allowlist
+allowed_domains: []                   # hosts agents may reach, e.g. ["zenodo.org", "*.ebi.ac.uk"]; empty leaves egress open
+                                      # naming any host denies every other one — a host the target needs but you left out
+                                      # aborts the pass rather than scoring as a wrong answer. Private addresses are always denied.
 
 models: [claude-opus-5, claude-sonnet-5, claude-haiku-4-5-20251001, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna]   # Claude + Codex benchmark models; a pass is models x tasks x reps x splits
 n_replicates: 3                       # runs per (model, task, split) cell
