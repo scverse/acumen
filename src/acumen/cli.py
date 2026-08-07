@@ -6,23 +6,38 @@ import argparse
 import asyncio
 import sys
 import time
-from dataclasses import replace
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from datetime import date
 from pathlib import Path
 
-from acumen.bench import build_matrix, pending, run_matrix, summarize
-from acumen.config import ConfigError, load_config
+from acumen.agents import AgentError, AgentProvider, check_agent_cli, provider_for_model
+from acumen.bench import BenchmarkInvalidError, PlannedRun, build_matrix, pending, run_matrix, summarize
+from acumen.config import Config, ConfigError, load_config
 from acumen.draft import DraftError, draft_skill
 from acumen.env import DEFAULT_CACHE_ROOT, AuthMode, EnvError, prepare_target, resolve_auth_mode
+from acumen.grade import INVALID_REASONS
 from acumen.improve import ImproveError, improve_skill
 from acumen.logs import LiveLog
-from acumen.paths import SPLITS
+from acumen.paths import SPLITS, arm_name
+from acumen.pricefeed import (
+    PRICE_SOURCES,
+    PRICE_TIER,
+    PriceFeedError,
+    diff_rates,
+    fetch_table,
+    refresh,
+    to_yaml_block,
+    try_fetch_table,
+)
+from acumen.prices import PriceTable, Rates
 from acumen.report import ReportError, build_report
 from acumen.runner import RunOutcome, StderrFilter
-from acumen.scaffold import InitError, scaffold
+from acumen.scaffold import InitError, is_scaffold_tasks, scaffold
 from acumen.ship import ShipError, ship_skill
-from acumen.skills import SkillError, available_versions, latest_version, load_skill
+from acumen.skills import Skill, SkillError, available_versions, latest_version, load_skill
 from acumen.taskgen import TaskGenError, generate_tasks
-from acumen.tasks import TaskError, load_tasks
+from acumen.tasks import Task, TaskError, load_tasks
 
 
 def _add_bench_args(parser: argparse.ArgumentParser) -> None:
@@ -30,8 +45,8 @@ def _add_bench_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml")
     parser.add_argument("--runs", type=Path, default=Path("runs"), help="root of the run tree")
     arm = parser.add_mutually_exclusive_group()
-    arm.add_argument("--no-skill", action="store_true", help="run the baseline arm (the default)")
-    arm.add_argument("--skill", metavar="VERSION", help="run with a skill version, e.g. v1")
+    arm.add_argument("--no-skill", action="store_true", help="run the baseline arm alone")
+    arm.add_argument("--skill", metavar="VERSION", help="run one skill version alone, e.g. v1")
     parser.add_argument("--split", choices=SPLITS, action="append", help="restrict to a split (repeatable)")
     parser.add_argument("--task", metavar="ID", action="append", help="restrict to a task id (repeatable)")
     parser.add_argument("--max-concurrency", type=int, help="override config max_concurrency")
@@ -41,7 +56,12 @@ def _add_bench_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--keep-sandboxes", action="store_true", help="leave run sandboxes on disk")
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     parser.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
-    parser.add_argument("--dry-run", action="store_true", help="print the matrix and exit without running agents")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the matrix and exit without running agents, over the same arms the real pass would cover",
+    )
+    _add_auth_arg(parser)
 
 
 def _add_log_args(parser: argparse.ArgumentParser) -> None:
@@ -64,25 +84,92 @@ def _add_feedback_arg(parser: argparse.ArgumentParser, *, extra: str = "") -> No
 
 
 def _add_auth_arg(parser: argparse.ArgumentParser) -> None:
-    """Add the ``--auth`` flag to a single-agent subcommand.
+    """Add the ``--auth`` flag to a command that spawns agents.
 
-    These commands spawn one agent, so they default to the Claude subscription ("session")
-    when a subscription login is present and fall back to the API key otherwise. ``bench`` has
-    no such flag — it always bills the API so its recorded ``cost_usd`` is real.
+    Every agentic command defaults to the provider subscription ("session") when a login is
+    present and falls back to the API key otherwise — ``bench`` included, since it prices runs
+    from their token counts rather than from a billed figure only the API reports.
     """
     parser.add_argument(
         "--auth",
         choices=("auto", "session", "api"),
         default="auto",
-        help="which credential to bill: 'session' (Claude subscription), 'api' (Anthropic API), "
+        help="which credential to bill: 'session' (Claude/Codex subscription), 'api' (provider API), "
         "or 'auto' (default: session if you're logged in, else the API)",
     )
 
 
-def _print_auth(mode: AuthMode) -> None:
+def _print_auth(mode: AuthMode, provider: AgentProvider = "claude") -> None:
     """Report which credential the run will bill, so the choice is never silent."""
-    label = "Claude subscription (session)" if mode == "session" else "API key"
+    product = "Claude" if provider == "claude" else "Codex"
+    label = f"{product} subscription (session)" if mode == "session" else f"{product} API key"
     print(f"auth: {label}", flush=True)
+
+
+def _warn_codex_accounting(provider: AgentProvider) -> None:
+    """Say what a Codex cap can and cannot do before the spend, not after.
+
+    ``codex exec`` has no cap of its own, so acumen enforces both against the event stream.
+    That works exactly as advertised for turns, which stream. Usage does not: Codex reports it
+    once, when the turn ends, so ``max_usd`` can only be recognized after the money is spent.
+    It still records the run as a budget failure — the same outcome Claude would give it — but
+    the only cap that actually *bounds* a Codex run is ``max_turns``.
+    """
+    if provider == "codex":
+        print(
+            "note: Codex reports usage only when a turn ends, so max_usd marks an over-budget "
+            "run as a failure but cannot stop the spend — bound Codex runs with max_turns",
+            file=sys.stderr,
+        )
+
+
+def _warn_unpriced(models: set[str], prices: PriceTable) -> None:
+    """Name models with no rates before the spend, not after.
+
+    An unpriced model still records its tokens; only ``cost_usd`` is left unset. Saying so
+    up front is what stops a missing rate from reading as a free model in the report.
+    """
+    unpriced = sorted(model for model in models if prices.lookup(model) is None)
+    if unpriced:
+        print(
+            f"note: no token rates for {', '.join(unpriced)}. These runs record tokens but no "
+            "cost; add a 'prices:' entry in config.yaml to price them.",
+            file=sys.stderr,
+        )
+
+
+def _bench_prices(cfg: Config) -> PriceTable:
+    """Resolve the rates this pass will be priced by, before it spends anything.
+
+    Raises :class:`PriceFeedError` upward: cost is a headline metric of the report and is
+    frozen into every result, so a pass that cannot establish rates should not run.
+    """
+    for name, url in PRICE_SOURCES.items():
+        print(f"prices: fetching {name} ({url})", flush=True)
+    table = fetch_table(cfg.prices)
+    print(f"prices: {len(table.fetched)} model(s) resolved as of {table.fetched_as_of} ({PRICE_TIER})")
+    return table
+
+
+def _agent_prices(cfg: Config, *, model: str | None = None) -> PriceTable:
+    """Rates for one interactive agent command, degrading to unpriced if the pages are down.
+
+    Unlike a benchmark, these commands report cost as progress rather than storing it as
+    evidence, so a pricing outage should not stop the work. It is still said out loud, and
+    the Codex consequence is named: ``max_usd`` is enforced from these rates, so an
+    unpriced model has no budget cap at all.
+    """
+    table, failure = try_fetch_table(cfg.prices)
+    if failure is None:
+        return table
+    print(f"warning: could not fetch pricing ({failure}); this run reports no cost", file=sys.stderr)
+    if model is not None and provider_for_model(model) == "codex" and table.lookup(model) is None:
+        print(
+            f"warning: max_usd cannot be enforced for {model} without rates. Bound this run "
+            "with max_turns, or pin rates in config.yaml under 'prices:'.",
+            file=sys.stderr,
+        )
+    return table
 
 
 def _print_log_result(log: LiveLog) -> None:
@@ -90,7 +177,7 @@ def _print_log_result(log: LiveLog) -> None:
     if log.html_rendered:
         print(f"log → {log.html_path}")
     else:
-        print("note: HTML log not rendered (claude-code-log missing?) — the jsonl log is complete", file=sys.stderr)
+        print("note: HTML log not rendered — the jsonl log is complete", file=sys.stderr)
 
 
 def _fmt_secs(seconds: float) -> str:
@@ -145,18 +232,28 @@ class _Progress:
         self.running -= 1
         if outcome.success:
             self.passed += 1
-        mark = "✓ pass" if outcome.success else "✗ FAIL"
         p = outcome.payload
+        invalid = outcome.reason in INVALID_REASONS
+        mark = "⚠ INVALID" if invalid else ("✓ pass" if outcome.success else "✗ FAIL")
         toks = int(p.get("input_tokens", 0)) + int(p.get("output_tokens", 0))
-        cost = float(p.get("cost_usd", 0.0))
         dur = _fmt_secs(float(p.get("duration_s", 0.0)))
-        stats = f"{_fmt_tokens(toks)}tok ${cost:.2f} {dur}"
+        cost_available = p.get("cost_available", True) and p.get("cost_usd") is not None
+        cost_label = f"${float(p['cost_usd']):.2f}" if cost_available else "cost n/a"
+        stats = f"{_fmt_tokens(toks)}tok {cost_label} {dur}"
         print(
             f"[{self._stamp()}] {mark} {_key_label(outcome.key)}"
             f"  ({outcome.reason})  {stats}"
             f"  [{self.done}/{self.total} done, {self.passed} passed]",
             flush=True,
         )
+        if outcome.reason == "provider_exhausted":
+            print(f"error: provider usage/credit exhausted: {p.get('error') or 'no provider detail'}", file=sys.stderr)
+        elif outcome.reason == "sandbox_blocked":
+            print(
+                "error: the agent sandbox refused an outbound host; egress is meant to be "
+                f"unrestricted, so this is a harness bug: {p.get('error') or 'no sandbox detail'}",
+                file=sys.stderr,
+            )
 
 
 def _fmt_tokens(value: int) -> str:
@@ -168,6 +265,106 @@ def _fmt_tokens(value: int) -> str:
     return str(value)
 
 
+def _fmt_cost(value: float | None) -> str:
+    """Format a known cost without presenting unavailable pricing as free."""
+    return f"${value:.2f}" if value is not None else "cost n/a"
+
+
+@dataclass(frozen=True)
+class _Arm:
+    """One arm of a pass: its version, its loaded skill, and its matrix."""
+
+    version: str | None  # None => the noskill baseline
+    skill: Skill | None
+    planned: list[PlannedRun]
+    todo: list[PlannedRun]
+
+    @property
+    def name(self) -> str:
+        return arm_name(self.version)
+
+
+def _resolve_arms(cfg: Config, tasks: Sequence[Task], args: argparse.Namespace) -> list[_Arm]:
+    """Build the arms this invocation covers, loading every skill before anything is spent.
+
+    Naming an arm (``--skill vN`` / ``--no-skill``) covers that one alone. Naming none covers
+    the whole project: the baseline plus every version in ``skills/``, which is the comparison
+    the report wants anyway. A version that will not load raises here, before target prep, so a
+    broken skill costs nothing rather than surfacing part-way through a paid pass.
+    """
+    if args.skill is not None:
+        versions: list[str | None] = [args.skill]
+    elif args.no_skill:
+        versions = [None]
+    else:
+        versions = [None, *available_versions(args.skills)]
+
+    arms = []
+    for version in versions:
+        skill = None if version is None else load_skill(args.skills, version, expect_name=cfg.skill_name)
+        planned = build_matrix(cfg, tasks, skill=version, splits=args.split or SPLITS, task_ids=args.task)
+        todo = pending(planned, args.runs, resume=not args.no_resume)
+        arms.append(_Arm(version=version, skill=skill, planned=planned, todo=todo))
+    return arms
+
+
+def _print_plan(arms: Sequence[_Arm]) -> None:
+    """Print what each arm holds, and the total when a pass spans several."""
+    width = max(len(f"arm {arm.name}:") for arm in arms) if len(arms) > 1 else 0
+    indent = "    " if len(arms) > 1 else ""
+    for arm in arms:
+        label = f"arm {arm.name}:".ljust(width)
+        complete = len(arm.planned) - len(arm.todo)
+        print(f"{label} {len(arm.planned)} runs planned, {complete} already complete, {len(arm.todo)} to run")
+        if arm.skill is not None:
+            print(f"{indent}skill {arm.skill.version}: {arm.skill.name} ({arm.skill.hash[:19]}…)")
+    if len(arms) > 1:
+        planned = sum(len(arm.planned) for arm in arms)
+        todo = sum(len(arm.todo) for arm in arms)
+        print(f"total: {planned} runs planned, {todo} to run across {len(arms)} arms")
+
+
+def _print_runs(todo: Sequence[PlannedRun]) -> None:
+    for item in todo:
+        k = item.key
+        print(f"  {k.arm}/{k.split}/{k.model}/{k.task_id}/rep_{k.rep}")
+
+
+def _print_run_summary(outcomes: Sequence[RunOutcome], elapsed: float, *, label: str = "") -> None:
+    """Print the pass tally: how many passed, how long, what it cost, why runs failed."""
+    passed = sum(1 for o in outcomes if o.success)
+    counts = summarize(outcomes)
+    breakdown = ", ".join(f"{reason}={n}" for reason, n in sorted(counts.items()))
+    priced = [
+        float(o.payload["cost_usd"])
+        for o in outcomes
+        if o.payload.get("cost_available", True) and o.payload.get("cost_usd") is not None
+    ]
+    total_cost = sum(priced)
+    unpriced = len(outcomes) - len(priced)
+    cost_summary = f"${total_cost:.2f}" if priced else "cost n/a"
+    if unpriced and priced:
+        cost_summary += f" + {unpriced} unpriced run(s)"
+    elif unpriced:
+        cost_summary += f" ({unpriced} unpriced run(s))"
+    prefix = f"{label}: " if label else ""
+    print(f"\n{prefix}{passed}/{len(outcomes)} passed in {_fmt_secs(elapsed)}  ({cost_summary}, {breakdown})")
+
+
+def _print_skill_loading(outcomes: Sequence[RunOutcome], arm: _Arm, skill_name: str) -> None:
+    """Say whether the skill reached the agent — the comparison means nothing otherwise."""
+    loaded = sum(1 for o in outcomes if o.payload.get("skill_loaded"))
+    if arm.skill is not None:
+        print(f"skill loaded in {loaded}/{len(outcomes)} runs")
+        if loaded == 0:
+            print(
+                f"warning: {arm.name} never loaded the skill — that arm is not measuring the skill",
+                file=sys.stderr,
+            )
+    elif loaded:
+        print(f"warning: {skill_name} loaded in {loaded} baseline runs", file=sys.stderr)
+
+
 def _cmd_bench(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     tasks = load_tasks(args.tasks)
@@ -176,69 +373,90 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     if args.replicates:
         cfg = replace(cfg, n_replicates=args.replicates)
 
-    version = args.skill  # None => the noskill baseline
-    skill = None
-    if version is not None:
-        skill = load_skill(args.skills, version, expect_name=cfg.skill_name)
-
-    planned = build_matrix(cfg, tasks, skill=version, splits=args.split or SPLITS, task_ids=args.task)
-    todo = pending(planned, args.runs, resume=not args.no_resume)
-
-    arm = "noskill" if version is None else f"skill_{version}"
-    print(f"arm {arm}: {len(planned)} runs planned, {len(planned) - len(todo)} already complete, {len(todo)} to run")
-    if skill is not None:
-        print(f"skill {skill.version}: {skill.name} ({skill.hash[:19]}…)")
+    arms = _resolve_arms(cfg, tasks, args)
+    _print_plan(arms)
     if args.dry_run:
-        for item in todo:
-            k = item.key
-            print(f"  {k.arm}/{k.split}/{k.model}/{k.task_id}/rep_{k.rep}")
+        for arm in arms:
+            _print_runs(arm.todo)
         return 0
+
+    todo = [item for arm in arms for item in arm.todo]
     if not todo:
         return 0
 
-    # bench records real per-run cost, so it must bill the API — never the subscription.
-    auth_mode = resolve_auth_mode("api", allow_session=False)
+    # One resolved mode per provider in the matrix, so a mixed pass bills each side correctly.
+    providers = {provider_for_model(item.model) for item in todo}
+    auth_modes = {provider: resolve_auth_mode(args.auth, provider=provider) for provider in providers}
+    for provider in sorted(providers):
+        check_agent_cli(provider)
+        _print_auth(auth_modes[provider], provider)
+        _warn_codex_accounting(provider)
+    if "session" in auth_modes.values():
+        print(
+            "note: cost_usd for session-billed runs is what they would have cost at API "
+            "rates, not metered spend; each run records its auth_mode",
+            file=sys.stderr,
+        )
+    # Before the target is built and before any agent runs: an unreachable pricing page
+    # must cost nothing, and a pass must never be priced by a table it cannot date.
+    try:
+        prices = _bench_prices(cfg)
+    except PriceFeedError as err:
+        print(f"error: {err}", file=sys.stderr)
+        print(
+            "Each run's cost is frozen into its result, so a pass that cannot establish "
+            "rates would store figures nothing backs. Retry when the pages are reachable, "
+            "or pin rates with a 'prices:' block in config.yaml.",
+            file=sys.stderr,
+        )
+        return 2
+    _warn_unpriced({item.model for item in todo}, prices)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]} (venv {target.venv_dir})", flush=True)
 
+    # Arms run one after another: every run in a matrix shares one skill, and a sequential
+    # pass keeps each arm's tally readable while the progress counter spans the whole thing.
+    running = [arm for arm in arms if arm.todo]
     print(f"running {len(todo)} runs, up to {cfg.max_concurrency} at a time:", flush=True)
     progress = _Progress(len(todo))
-    outcomes = asyncio.run(
-        run_matrix(
-            todo,
-            target=target,
-            runs_root=args.runs,
-            max_concurrency=cfg.max_concurrency,
-            auth_mode=auth_mode,
-            skill=skill,
-            skill_name=cfg.skill_name,
-            keep_sandbox=args.keep_sandboxes,
-            stderr=StderrFilter(),
-            on_start=progress.on_start,
-            on_done=progress.on_done,
-            env_passthrough=cfg.env_passthrough,
-        )
-    )
-
-    passed = sum(1 for o in outcomes if o.success)
-    counts = summarize(outcomes)
-    breakdown = ", ".join(f"{reason}={n}" for reason, n in sorted(counts.items()))
-    total_cost = sum(float(o.payload.get("cost_usd", 0.0)) for o in outcomes)
-    print(f"\n{passed}/{len(outcomes)} passed in {_fmt_secs(progress.elapsed)}  (${total_cost:.2f}, {breakdown})")
-
-    # The comparison is only meaningful if the skill actually reached the agent, so say
-    # so rather than leaving it to be discovered later in the transcripts.
-    loaded = sum(1 for o in outcomes if o.payload.get("skill_loaded"))
-    if skill is not None:
-        print(f"skill loaded in {loaded}/{len(outcomes)} runs")
-        if loaded == 0:
-            print(
-                "warning: the skill never loaded — this arm is not measuring the skill",
-                file=sys.stderr,
+    collected: list[RunOutcome] = []
+    try:
+        for arm in running:
+            if len(running) > 1:
+                print(f"\n=== arm {arm.name}: {len(arm.todo)} runs ===", flush=True)
+            started = time.monotonic()
+            outcomes = asyncio.run(
+                run_matrix(
+                    arm.todo,
+                    target=target,
+                    runs_root=args.runs,
+                    max_concurrency=cfg.max_concurrency,
+                    auth_modes=auth_modes,
+                    skill=arm.skill,
+                    skill_name=cfg.skill_name,
+                    keep_sandbox=args.keep_sandboxes,
+                    stderr=StderrFilter(),
+                    on_start=progress.on_start,
+                    on_done=progress.on_done,
+                    env_passthrough=cfg.env_passthrough,
+                    prices=prices,
+                )
             )
-    elif loaded:
-        print(f"warning: {cfg.skill_name} loaded in {loaded} baseline runs", file=sys.stderr)
+            collected.extend(outcomes)
+            _print_run_summary(outcomes, time.monotonic() - started, label=arm.name if len(running) > 1 else "")
+            _print_skill_loading(outcomes, arm, cfg.skill_name)
+    except BenchmarkInvalidError as err:
+        print(f"\nerror: {err}", file=sys.stderr)
+        print(
+            "Fix or replenish that credential, then rerun the same command; invalid and "
+            "cancelled cells remain pending.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if len(running) > 1:
+        _print_run_summary(collected, progress.elapsed, label=f"all {len(running)} arms")
     print(f"runs written to {args.runs.resolve()}")
     return 0
 
@@ -258,8 +476,11 @@ def _cmd_draft(args: argparse.Namespace) -> int:
         )
         return 2
 
-    auth_mode = resolve_auth_mode(args.auth, allow_session=True)
-    _print_auth(auth_mode)
+    provider = provider_for_model(cfg.draft_model)
+    check_agent_cli(provider)
+    auth_mode = resolve_auth_mode(args.auth, provider=provider)
+    _print_auth(auth_mode, provider)
+    _warn_codex_accounting(provider)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
@@ -271,6 +492,7 @@ def _cmd_draft(args: argparse.Namespace) -> int:
         result = asyncio.run(
             draft_skill(
                 cfg=cfg,
+                prices=_agent_prices(cfg, model=cfg.draft_model),
                 target=target,
                 skills_root=args.skills,
                 auth_mode=auth_mode,
@@ -287,7 +509,7 @@ def _cmd_draft(args: argparse.Namespace) -> int:
     print(f"  description: {skill.description}")
     print(f"  hash:        {skill.hash}")
     print(f"  files:       {', '.join(files)}")
-    print(f"  cost:        ${result.cost_usd:.2f} over {result.turns} turns")
+    print(f"  cost:        {_fmt_cost(result.cost_usd)} over {result.turns} turns")
     _print_log_result(log)
     print(f"\nnext: acumen bench --skill {skill.version}")
     return 0
@@ -312,8 +534,11 @@ def _cmd_improve(args: argparse.Namespace) -> int:
     skill = load_skill(args.skills, parent, expect_name=cfg.skill_name)
     print(f"improving {skill.version} ({skill.name}, {skill.hash[:19]}…) with {cfg.improve_model}")
 
-    auth_mode = resolve_auth_mode(args.auth, allow_session=True)
-    _print_auth(auth_mode)
+    provider = provider_for_model(cfg.improve_model)
+    check_agent_cli(provider)
+    auth_mode = resolve_auth_mode(args.auth, provider=provider)
+    _print_auth(auth_mode, provider)
+    _warn_codex_accounting(provider)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
@@ -324,6 +549,7 @@ def _cmd_improve(args: argparse.Namespace) -> int:
         result = asyncio.run(
             improve_skill(
                 cfg=cfg,
+                prices=_agent_prices(cfg, model=cfg.improve_model),
                 target=target,
                 skills_root=args.skills,
                 runs_root=args.runs,
@@ -344,7 +570,7 @@ def _cmd_improve(args: argparse.Namespace) -> int:
     print(f"  hash:        {new.hash}")
     print(f"  files:       {', '.join(files)}")
     print(f"  evidence:    {result.n_train_runs} train runs ({result.n_train_failures} failing)")
-    print(f"  cost:        ${result.cost_usd:.2f} over {result.turns} turns")
+    print(f"  cost:        {_fmt_cost(result.cost_usd)} over {result.turns} turns")
     if new.hash == skill.hash:
         print(
             "warning: the new version is byte-identical to its parent — the improver changed nothing",
@@ -361,16 +587,24 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
         cfg = replace(cfg, tasks_model=args.model)
 
     out = args.out
-    # Fail before the (costly) target prep and agent run if we'd have to clobber.
-    if out.exists() and not args.force:
+    # `acumen init` writes a placeholder here, and generating over it is the documented next
+    # step — so the untouched placeholder is not something to protect. Anything the user has
+    # actually edited still needs --force, and that is checked before the costly target prep.
+    overwrite = args.force or is_scaffold_tasks(out)
+    if out.exists() and not overwrite:
         print(
-            f"{out} already exists — pass --force to overwrite it (e.g. the placeholder from `acumen init`)",
+            f"{out} already exists — pass --force to overwrite it",
             file=sys.stderr,
         )
         return 2
+    if out.exists() and not args.force:
+        print(f"replacing the untouched placeholder at {out}")
 
-    auth_mode = resolve_auth_mode(args.auth, allow_session=True)
-    _print_auth(auth_mode)
+    provider = provider_for_model(cfg.tasks_model)
+    check_agent_cli(provider)
+    auth_mode = resolve_auth_mode(args.auth, provider=provider)
+    _print_auth(auth_mode, provider)
+    _warn_codex_accounting(provider)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
@@ -385,19 +619,20 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
         result = asyncio.run(
             generate_tasks(
                 cfg=cfg,
+                prices=_agent_prices(cfg, model=cfg.tasks_model),
                 target=target,
                 out_path=out,
                 auth_mode=auth_mode,
                 max_turns=args.max_turns,
                 max_usd=args.max_usd,
-                force=args.force,
+                force=overwrite,
                 feedback=args.feedback,
                 log=log,
             )
         )
     print(f"\nwrote {result.out_path.resolve()}")
     print(f"  tasks: {len(result.tasks)} ({', '.join(t.id for t in result.tasks)})")
-    print(f"  cost:  ${result.cost_usd:.2f} over {result.turns} turns")
+    print(f"  cost:  {_fmt_cost(result.cost_usd)} over {result.turns} turns")
     _print_log_result(log)
     print("\nnext: review the tasks, then `acumen draft` and `acumen bench`")
     return 0
@@ -417,8 +652,11 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         else ("a GitHub URL — the change is delivered as a pull request")
     )
     print(f"shipping {args.version} of {cfg.skill_name} into {cfg.repo} ({where})")
-    auth_mode = resolve_auth_mode(args.auth, allow_session=True)
-    _print_auth(auth_mode)
+    provider = provider_for_model(cfg.ship_model)
+    check_agent_cli(provider)
+    auth_mode = resolve_auth_mode(args.auth, provider=provider)
+    _print_auth(auth_mode, provider)
+    _warn_codex_accounting(provider)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
@@ -434,6 +672,7 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         result = asyncio.run(
             ship_skill(
                 cfg=cfg,
+                prices=_agent_prices(cfg, model=cfg.ship_model),
                 target=target,
                 skills_root=args.skills,
                 version=args.version,
@@ -446,7 +685,7 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         )
     print(f"\nshipped {result.skill.version} of {result.skill.name}")
     print(f"  mode:  {'pull request' if result.mode == 'github' else 'working tree (local)'}")
-    print(f"  cost:  ${result.cost_usd:.2f} over {result.turns} turns")
+    print(f"  cost:  {_fmt_cost(result.cost_usd)} over {result.turns} turns")
     _print_log_result(log)
     if result.summary:
         print("\nagent summary:")
@@ -499,13 +738,84 @@ def _cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_prices(args: argparse.Namespace) -> int:
+    """Show the rates cost is computed from, or check pinned rates against the pages.
+
+    Both modes read the providers' pages, since that is the only place rates come from.
+    ``--refresh`` differs in what it prints: the models whose published price disagrees
+    with a ``prices:`` pin in ``config.yaml``, which are the only rates that can drift
+    unnoticed once everything else is read live.
+    """
+    overrides: dict[str, Rates] = {}
+    models: set[str] = set()
+    if args.config.is_file():
+        cfg = load_config(args.config)
+        overrides, models = cfg.prices, {m.strip().lower() for m in cfg.models}
+
+    for name, url in PRICE_SOURCES.items():
+        print(f"fetching {name}: {url}", flush=True)
+    try:
+        fetched = refresh(today=date.today())
+    except PriceFeedError as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+
+    if not args.refresh:
+        table = PriceTable(overrides=overrides, fetched=fetched, fetched_as_of=date.today().isoformat())
+        shown = sorted(set(fetched) | set(overrides)) if args.all else sorted(models | set(overrides))
+        print(f"\nrates (USD per million tokens) as of {table.fetched_as_of} — {PRICE_TIER}")
+        for model in shown:
+            found = table.lookup(model)
+            if found is None:
+                print(f"  {model:28} unpriced (not published; add it under 'prices:' to price it)")
+                continue
+            print(
+                f"  {model:28} in ${found.rates.input:<7} cached ${found.rates.cached_input:<7} "
+                f"write ${found.rates.cache_write:<7} out ${found.rates.output:<7} ({found.source})"
+            )
+        if not args.all:
+            print(f"\n{len(fetched)} model(s) published in total; show them all with --all")
+        return 0
+
+    # Only pinned rates can disagree with a page: everything else is read live each run.
+    if not overrides:
+        print("\nno 'prices:' pins in config.yaml, so nothing can drift — rates are read live each run")
+        return 0
+    changes = diff_rates(overrides, {m: r for m, r in fetched.items() if m in overrides})
+
+    if not changes:
+        print(f"\nup to date — all {len(overrides)} pinned rate(s) match what the providers publish")
+        return 0
+
+    print(f"\n{len(changes)} pinned rate(s) differ from the published price ({PRICE_TIER}):")
+    for change in changes:
+        print(change.describe())
+
+    block = to_yaml_block({change.model: change.after for change in changes})
+    if args.out is not None:
+        args.out.write_text(block)
+        print(f"\nwrote {args.out} — merge its 'prices:' block into config.yaml to adopt these")
+    else:
+        print("\nadopt by updating config.yaml (or re-run with --out PATH):\n")
+        print(block, end="")
+    # Never applied automatically: a pin is a deliberate statement, and a mis-parsed tier
+    # or context band would otherwise overwrite it with a plausible wrong number.
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the ``acumen`` argument parser."""
     parser = argparse.ArgumentParser(
-        prog="acumen", description="Build, benchmark, and optimize Claude skills for Python packages."
+        prog="acumen", description="Build, benchmark, and optimize agentic skills for Python packages."
     )
     sub = parser.add_subparsers(dest="command", required=True)
-    bench = sub.add_parser("bench", help="run a benchmark pass")
+    bench = sub.add_parser(
+        "bench",
+        help="run a benchmark pass over every arm, or one named arm",
+        description="Bench every arm the project has (the baseline plus each version in skills/), "
+        "or a single arm with --no-skill / --skill vN. Completed runs are skipped, so rerunning "
+        "only costs the cells that are missing.",
+    )
     _add_bench_args(bench)
     bench.set_defaults(func=_cmd_bench)
 
@@ -585,6 +895,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report.set_defaults(func=_cmd_report)
 
+    prices = sub.add_parser("prices", help="show the token rates cost is computed from, or re-check them")
+    prices.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml (for overrides)")
+    prices.add_argument("--refresh", action="store_true", help="fetch the providers' pricing pages and diff them")
+    prices.add_argument("--all", action="store_true", help="with --refresh, report every model, not just yours")
+    prices.add_argument("--out", type=Path, default=None, help="with --refresh, write the 'prices:' block here")
+    prices.set_defaults(func=_cmd_prices)
+
     init = sub.add_parser("init", help="scaffold a starter config.yaml and tasks.yaml")
     init.add_argument("--dir", type=Path, default=Path("."), dest="directory", help="directory to scaffold into")
     init.add_argument("--force", action="store_true", help="overwrite existing config.yaml / tasks.yaml")
@@ -607,6 +924,8 @@ def main(argv: list[str] | None = None) -> int:
         ConfigError,
         TaskError,
         EnvError,
+        AgentError,
+        PriceFeedError,
         SkillError,
         DraftError,
         ImproveError,

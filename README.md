@@ -48,6 +48,7 @@ acumen draft                     # generate skills/v1 from the package source, o
 acumen bench --skill v1          # benchmark the skill against the baseline
 acumen improve                   # generate skills/v2 from v1's train results, or write by hand
 acumen bench --skill v2
+acumen bench                     # or: every arm at once (baseline + each skills/vN)
 acumen report                    # aggregate every run into report.html
 
 # 4. Once a version proves out, ship it into the package itself:
@@ -67,6 +68,95 @@ train/test isolation, and for `draft`/`improve` it is recorded in the version's 
 shown in the report. (Don't paste held-out test answers into `improve` feedback — that would
 defeat the split.)
 
+Claude and Codex can run side by side. Put both model families in `models` to compare them
+in one matrix; model IDs beginning with `claude` use Claude Code, while `gpt-*`, `o1`,
+`o3`, `o4`, and `codex-*` use Codex:
+
+```yaml
+models:
+  - claude-opus-5
+  - claude-sonnet-5
+  - claude-haiku-4-5-20251001
+  - gpt-5.6-sol
+  - gpt-5.6-terra
+  - gpt-5.6-luna
+```
+
+This spans each provider's quality/cost range; it is not a claim that the tiers are
+one-to-one equivalents.
+
+Neither backend is required. Claude is an optional dependency and Codex is an external CLI,
+so install only the one you run — `pip install acumen[claude]`, or plain `acumen` plus the
+`codex` CLI on `PATH`. Selecting a model whose backend is missing fails immediately, with the
+install command, before acumen prepares a target or spends anything.
+
+Claude API runs use `ANTHROPIC_API_KEY`; Codex API runs use `CODEX_API_KEY` (or
+`OPENAI_API_KEY`). The meta-agent commands also accept a Codex model through their
+`*_model` config keys or `--model`.
+
+Every agentic command — `bench` included — takes `--auth {auto,session,api}` and defaults to
+the provider's logged-in subscription, falling back to its API key. Both billing modes report
+tokens, so Acumen can calculate the same API-rate estimate for either. Under `session`, that
+estimate is what the run *would* have cost at API rates, not money billed — so each run records
+its `auth_mode` alongside the figure.
+
+If the selected subscription runs out of usage or the API account runs out of credit, Acumen
+invalidates the pass instead of scoring that as an agent failure: it prints the provider error,
+cancels remaining cells for that provider, lets other providers finish all running and queued
+cells, and exits non-zero. Replenish the credential and rerun the same command; automatic resume
+retries the invalid and cancelled cells. Reports and `improve` refuse invalid quota/credit
+evidence.
+
+`max_turns` and `max_usd` apply to both providers, but they are not equally strict for Codex,
+which has no cap of its own — acumen enforces both against its event stream:
+
+- **`max_turns` bounds the run.** One `codex exec` is a single Codex turn however much work
+  happens inside it, so turns are counted in completed model actions (a message, a command, a
+  file change, a tool or search call) and the agent is stopped at the cap.
+- **`max_usd` cannot.** Codex reports usage once, when the turn ends, so a breach is only
+  visible after the money is spent. The run is recorded as a budget failure — the same outcome
+  Claude gives it — but bound Codex spend with `max_turns`. acumen prints this before the pass.
+
+**Reports compare inferred cost per run.** Every run records its token breakdown — fresh
+input, cache reads, cache writes, and output — and Acumen prices it with the rate table
+stored in `result.json`. That gives Claude and Codex one comparable basis and prevents an old
+benchmark from being silently re-priced. The result itself retains both
+`provider_cost_usd` (when the backend supplies one) and `inferred_cost_usd`; its compatibility
+field `cost_usd` remains provider-first. The report's sidecar CSV calls the former
+`recorded_cost_usd` and keeps it separate from `inferred_cost_usd`, while every displayed cost
+and comparison uses the inferred value.
+
+**Rates are read from the providers' pricing pages, never shipped with the package.** Prices
+move, and each run's cost is frozen into its `result.json` and never recomputed, so a table
+compiled into a release would store numbers that were already wrong. `bench` resolves rates
+before it spends anything and **fails the pass** if the pages cannot be read: cost is a headline
+metric, and a benchmark that cannot establish rates has not earned the numbers it would print.
+`draft`, `improve`, `tasks`, and `ship` fetch too but degrade to unpriced instead — their cost
+line is progress reporting, not stored evidence.
+
+Alongside the rates themselves each run records `price_source` (`config` or `fetched`) and
+`price_rates_as_of`, so a pass run in August and another in October stay individually
+attributable and one report can cover both without restating either. When arms in a report were
+priced on different dates, the report says so: the cost gap between them includes the price
+change, not only the skill's effect.
+
+```bash
+acumen prices              # the rates in use today, and where each came from
+acumen prices --refresh    # check pinned rates against what the providers publish
+```
+
+Pin rates with a `prices:` block in `config.yaml` to price a model the providers don't publish,
+to price a gateway, or to record negotiated rates — pins outrank a live fetch, since only you
+know what you are billed. They are also the only rates that can drift unnoticed, which is what
+`--refresh` checks; it prints a diff for you to accept and never rewrites anything, because
+picking the wrong tier or context band would silently misprice future runs. A model no layer
+prices records its tokens and leaves report cost unavailable — never zero, which would read as
+free.
+
+> One consequence worth knowing: Codex's `max_usd` cap is enforced from these same rates, so an
+> unpriced model under Codex has no enforceable budget cap. Bound those runs with `max_turns`,
+> or pin the rates.
+
 `draft`, `improve`, `tasks`, and `ship` each drive a long autonomous agent. Every run writes a
 live `logs/acumen-<command>-<datetime>.jsonl` (one event per step, flushed as it goes — so you
 can watch progress by reading the file) and a rendered `.html` transcript. Add `--stream` to
@@ -81,6 +171,15 @@ in particular, the [API documentation][].
 
 You need to have Python 3.12 or newer installed on your system.
 If you don't have Python installed, we recommend installing [uv][].
+
+Install the backend you actually run — both are optional, and either alone is a complete
+install:
+
+| you run | install | also needs |
+|---|---|---|
+| Claude only | `pip install acumen[claude]` | an Anthropic key or a `claude` login |
+| Codex only | `pip install acumen` | the `codex` CLI on `PATH`, plus a Codex login or key |
+| both | `pip install acumen[all]` | both of the above |
 
 <!--
 1) Install the latest release of `acumen` from [PyPI][]:

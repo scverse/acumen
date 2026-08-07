@@ -17,11 +17,11 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
-
+from acumen.agents import AgentOptions, AgentResult, provider_for_model, run_agent
 from acumen.config import Config
 from acumen.env import AuthMode, Target, build_agent_env
 from acumen.logs import LiveLog
+from acumen.prices import PriceTable, price_usage, pricer, resolve_cost
 from acumen.procs import label_env, reap
 from acumen.prompts import draft_prompt
 from acumen.skills import (
@@ -44,7 +44,7 @@ class DraftResult:
     """A drafted skill version and what it cost to produce."""
 
     skill: Skill
-    cost_usd: float
+    cost_usd: float | None
     turns: int
     #: Live log paths for this run, when a :class:`LiveLog` was attached.
     log_jsonl: Path | None = None
@@ -70,6 +70,7 @@ async def draft_skill(
     target: Target,
     skills_root: Path,
     auth_mode: AuthMode = "session",
+    prices: PriceTable | None = None,
     model: str | None = None,
     max_turns: int | None = None,
     max_usd: float | None = None,
@@ -119,7 +120,10 @@ async def draft_skill(
         work = holder / "work"
         staging = work / version
         home = holder / "home"
-        config_dir = home / ".claude"
+        selected_model = model or cfg.draft_model
+        table = prices if prices is not None else PriceTable(overrides=cfg.prices)
+        provider = provider_for_model(selected_model)
+        config_dir = home / (".claude" if provider == "claude" else ".codex")
         for path in (staging, home, config_dir, home / "tmp"):
             path.mkdir(parents=True, exist_ok=True)
 
@@ -131,6 +135,7 @@ async def draft_skill(
                 extra_path=[target.bin_dir],
                 auth_mode=auth_mode,
                 extra_allow=cfg.env_passthrough,
+                provider=provider,
             ),
             holder,
         )
@@ -144,29 +149,30 @@ async def draft_skill(
             skill_name=cfg.skill_name,
             feedback=feedback,
         )
-        options = ClaudeAgentOptions(
-            cwd=str(work),
+        options = AgentOptions(
+            cwd=work,
             env=env,
-            model=model or cfg.draft_model,
+            model=selected_model,
             # No default turn or budget cap: only bound the agent if the caller asked. The
             # config's ``max_turns``/``max_usd`` cap benchmark agents only.
             max_turns=max_turns,
-            max_budget_usd=max_usd,
+            max_usd=max_usd,
+            # Codex reports no billed figure, so a budget cap needs the run's own rate table.
+            price_usd=pricer(selected_model, table),
             # The drafter reads the target source; benchmark agents never do.
-            add_dirs=[str(target.src_dir)],
-            setting_sources=["project"],
-            permission_mode="bypassPermissions",
-            system_prompt={"type": "preset", "preset": "claude_code"},
+            read_dirs=(target.src_dir, target.venv_dir),
+            write_dirs=(work,),
+            discover_skills=True,
         )
 
-        result: ResultMessage | None = None
+        result: AgentResult | None = None
         agent_error: Exception | None = None
         try:
-            async for message in query(prompt=prompt, options=options):
-                if log is not None:
-                    log.append(message)
-                if isinstance(message, ResultMessage):
-                    result = message
+            result = await run_agent(
+                prompt,
+                options=options,
+                on_event=log.append if log is not None else None,
+            )
         except Exception as err:  # noqa: BLE001 - a failed draft is an error to report, re-raised below
             agent_error = err
         finally:
@@ -191,7 +197,15 @@ async def draft_skill(
         skill = load_skill(skills_root, version, expect_name=cfg.skill_name)
         return DraftResult(
             skill=skill,
-            cost_usd=result.total_cost_usd or 0.0,
+            cost_usd=resolve_cost(
+                result.total_cost_usd,
+                price_usage(
+                    result.usage,
+                    model=selected_model,
+                    provider=result.provider,
+                    prices=table,
+                ),
+            ).cost_usd,
             turns=result.num_turns,
             log_jsonl=log.jsonl_path if log is not None else None,
             log_html=log.html_path if log is not None and log.html_rendered else None,

@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from acumen.agents import AgentProvider, provider_for_model
 from acumen.config import Config
 from acumen.env import AuthMode, Target
 from acumen.paths import SPLITS, RunKey, Split, arm_name, is_complete, run_dir
+from acumen.prices import PriceTable
 from acumen.runner import RunOutcome, run_once
 from acumen.skills import Skill
 from acumen.tasks import Task
@@ -24,6 +26,45 @@ class PlannedRun:
     model: str
     max_turns: int
     max_usd: float
+
+
+class BenchmarkInvalidError(RuntimeError):
+    """Raised when a harness failure, not a model, decided the outcome of a pass.
+
+    Two conditions qualify, both infrastructure rather than evidence: the provider
+    credential ran out of usage or credit, and the sandbox refused a host the target needed.
+    """
+
+    def __init__(self, outcomes: RunOutcome | Sequence[RunOutcome]):
+        values = (outcomes,) if isinstance(outcomes, RunOutcome) else tuple(outcomes)
+        if not values:
+            raise ValueError("BenchmarkInvalidError needs at least one invalid outcome")
+        self.outcome = values[0]
+        self.outcomes = values
+        details: list[str] = []
+        for outcome in values:
+            payload = outcome.payload
+            cell = (
+                f"{outcome.key.arm}/{outcome.key.split}/{outcome.key.model}/{outcome.key.task_id}/rep_{outcome.key.rep}"
+            )
+            if outcome.reason == "sandbox_blocked":
+                detail = payload.get("error") or "the sandbox proxy refused a host"
+                details.append(
+                    f"the agent sandbox refused an outbound host during {cell}. Every remaining "
+                    "cell would be refused the same host, so the pass was cancelled. Egress is "
+                    "meant to be unrestricted, so this is a harness bug rather than something to "
+                    f"configure: please report it with the transcript. Sandbox error: {detail}"
+                )
+                continue
+            provider = "Claude" if payload.get("agent") == "claude" else "Codex"
+            mode = payload.get("auth_mode", "selected")
+            detail = payload.get("error") or "the provider reported exhausted usage or credit"
+            details.append(
+                f"{provider} {mode} authentication ran out of usage or credit during {cell}. "
+                f"Remaining {provider} cells were cancelled; other providers continued. "
+                f"Provider error: {detail}"
+            )
+        super().__init__("benchmark invalid: " + " | ".join(details))
 
 
 def models_for(cfg: Config, task: Task) -> list[str]:
@@ -106,6 +147,8 @@ async def run_matrix(
     runs_root: Path,
     max_concurrency: int,
     auth_mode: AuthMode = "api",
+    auth_modes: Mapping[AgentProvider, AuthMode] | None = None,
+    prices: PriceTable | None = None,
     skill: Skill | None = None,
     skill_name: str | None = None,
     sandbox_base: Path | None = None,
@@ -117,8 +160,17 @@ async def run_matrix(
 ) -> list[RunOutcome]:
     """Run planned runs concurrently, bounded by ``max_concurrency``.
 
-    One failing run never takes down the pass — :func:`acumen.runner.run_once` records
-    agent errors as failed runs rather than raising.
+    Ordinary failing runs do not take down the pass. Two harness failures do, at different
+    scopes, both preserving the diagnostic result before raising
+    :class:`BenchmarkInvalidError`.
+
+    Provider quota/credit exhaustion is provider-scoped: it cancels only that provider's
+    remaining work and lets the other finish its queued cells, since the empty credential is
+    the one thing they do not share.
+
+    A host the sandbox refuses is pass-scoped. Every remaining cell would be refused the same
+    host whatever model it runs, so continuing only fills ``runs/`` with results that measure
+    the allowlist rather than the models.
 
     Parameters
     ----------
@@ -131,8 +183,13 @@ async def run_matrix(
     max_concurrency
         Ceiling on simultaneous agents.
     auth_mode
-        Which credential every run authenticates with; benchmark passes always use ``"api"``
-        so the recorded ``cost_usd`` reflects real metered spend.
+        Which credential every run authenticates with. Under ``"session"``, the recorded
+        Claude's SDK value is API-equivalent rather than necessarily metered spend;
+        Codex uses token inference against ``prices``.
+    prices
+        The rates every run in this pass is priced by, and which each records alongside its
+        cost. One table for the whole matrix, resolved once before any spend, so a pass is
+        never priced by two different sets of numbers. Defaults to the built-in table.
     skill
         The skill every run in this matrix installs, or ``None`` for the baseline. One
         matrix is one arm, so this is a property of the pass rather than of a run.
@@ -164,9 +221,18 @@ async def run_matrix(
     """
     semaphore = asyncio.Semaphore(max_concurrency)
     outcomes: list[RunOutcome] = []
+    exhausted: dict[AgentProvider, RunOutcome] = {}
+    blocked: list[RunOutcome] = []
+    tasks: list[asyncio.Task[RunOutcome | None]] = []
+    task_providers: dict[asyncio.Task[RunOutcome | None], AgentProvider] = {}
 
-    async def one(item: PlannedRun) -> RunOutcome:
+    async def one(item: PlannedRun) -> RunOutcome | None:
+        provider = provider_for_model(item.model)
         async with semaphore:
+            # A sibling cell may have exhausted this provider while this one waited for a
+            # concurrency slot. Do not submit fresh work to a credential known to be empty.
+            if provider in exhausted:
+                return None
             if on_start is not None:
                 on_start(item)
             outcome = await run_once(
@@ -177,20 +243,61 @@ async def run_matrix(
                 model=item.model,
                 max_turns=item.max_turns,
                 max_usd=item.max_usd,
-                auth_mode=auth_mode,
+                auth_mode=(auth_modes or {}).get(provider, auth_mode),
                 skill=skill,
                 skill_name=skill_name,
                 sandbox_base=sandbox_base,
                 keep_sandbox=keep_sandbox,
                 stderr=stderr,
                 env_passthrough=env_passthrough,
+                prices=prices,
             )
             if on_done is not None:
                 on_done(outcome)
+            if outcome.reason == "sandbox_blocked":
+                # Not provider-scoped: the sandbox refuses the same host for every cell, so
+                # letting the pass continue only fills runs/ with invalid results.
+                blocked.append(outcome)
+                for peer in tasks:
+                    if peer is not asyncio.current_task() and not peer.done():
+                        peer.cancel()
+                return outcome
+            if outcome.reason == "provider_exhausted" and provider not in exhausted:
+                exhausted[provider] = outcome
+                current = asyncio.current_task()
+                # Stop both queued and in-flight siblings for this provider. Tasks for the
+                # other provider retain their places in the shared concurrency pool.
+                for peer in tasks:
+                    if peer is not current and task_providers.get(peer) == provider and not peer.done():
+                        peer.cancel()
             return outcome
 
-    for coro in asyncio.as_completed([one(item) for item in planned]):
-        outcomes.append(await coro)
+    for item in planned:
+        task = asyncio.create_task(one(item))
+        tasks.append(task)
+        task_providers[task] = provider_for_model(item.model)
+    try:
+        remaining = set(tasks)
+        while remaining:
+            done, remaining = await asyncio.wait(remaining, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                if task.cancelled():
+                    continue
+                outcome = task.result()  # propagate unexpected per-cell harness exceptions
+                if outcome is not None:
+                    outcomes.append(outcome)
+    except BaseException:
+        # External cancellation or an unexpected harness exception still stops everything;
+        # provider exhaustion itself is handled above at provider scope.
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    if blocked:
+        raise BenchmarkInvalidError(tuple(blocked))
+    if exhausted:
+        raise BenchmarkInvalidError(tuple(exhausted.values()))
     return outcomes
 
 

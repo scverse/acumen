@@ -84,8 +84,8 @@ report. What makes a version score well:
 ## Watching a long agent run
 
 `tasks`/`draft`/`improve`/`ship` each write `logs/acumen-<command>-<YYYYMMDD-HHMMSS>.jsonl`,
-one compact event per SDK message, **flushed as it goes** — read that file to follow
+one compact event per agent message, **flushed as it goes** — read that file to follow
 progress instead of streaming into your context. Tool results are recorded by status and
 size, not inlined. `--stream` mirrors the conversation to the terminal; `--log-dir` moves
-the logs. A rendered `.html` transcript lands beside the jsonl at the end (skipped, with a
-note, if `claude-code-log` is missing).
+the logs. A rendered `.html` transcript lands beside the jsonl at the end, for either
+provider (a Claude one is skipped, with a note, if `claude-code-log` is missing).

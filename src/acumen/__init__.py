@@ -1,8 +1,18 @@
-"""Build, benchmark, and optimize Claude skills for Python packages."""
+"""Build, benchmark, and optimize agentic skills for Python packages."""
 
 from importlib.metadata import version
 
-from acumen.bench import PlannedRun, build_matrix, pending, run_matrix, summarize
+from acumen.agents import (
+    AgentError,
+    AgentOptions,
+    AgentProvider,
+    AgentResult,
+    check_agent_cli,
+    claude_sdk_available,
+    provider_for_model,
+    run_agent,
+)
+from acumen.bench import BenchmarkInvalidError, PlannedRun, build_matrix, pending, run_matrix, summarize
 from acumen.config import Config, ConfigError, load_config, parse_config
 from acumen.draft import DraftError, DraftResult, draft_skill
 from acumen.env import (
@@ -10,9 +20,7 @@ from acumen.env import (
     EnvError,
     Target,
     api_auth_available,
-    auth_available,
     build_agent_env,
-    check_auth,
     prepare_target,
     resolve_auth_mode,
     scrubbed_env,
@@ -66,10 +74,20 @@ from acumen.taskgen import (
     make_skill_guard,
 )
 from acumen.tasks import Task, TaskError, TaskSplit, load_tasks, parse_tasks
-from acumen.transcript import locate_transcript, render_transcript
+from acumen.transcript import (
+    locate_transcript,
+    render_agent_transcript,
+    render_codex_transcript,
+    render_transcript,
+)
 
 __all__ = [
     "AuthMode",
+    "AgentError",
+    "AgentOptions",
+    "AgentProvider",
+    "AgentResult",
+    "BenchmarkInvalidError",
     "Config",
     "ConfigError",
     "DraftError",
@@ -104,9 +122,9 @@ __all__ = [
     "api_auth_available",
     "arm_metrics",
     "arm_name",
-    "auth_available",
     "available_versions",
-    "check_auth",
+    "check_agent_cli",
+    "claude_sdk_available",
     "build_agent_env",
     "build_filtered_source",
     "build_matrix",
@@ -137,10 +155,14 @@ __all__ = [
     "parse_tasks",
     "pending",
     "prepare_target",
+    "provider_for_model",
+    "render_agent_transcript",
+    "render_codex_transcript",
     "render_transcript",
     "resolve_auth_mode",
     "resolve_palette",
     "run_dir",
+    "run_agent",
     "run_matrix",
     "run_once",
     "sandbox",

@@ -11,7 +11,8 @@ to leak. Isolation is otherwise the same as the other meta-agents: scrubbed env,
 ``HOME`` and ``CLAUDE_CONFIG_DIR``.
 
 **Existing skills must not bias task generation.** A target repo may already ship skills or
-agent-instruction files (``SKILL.md``, ``.claude/skills/``, ``CLAUDE.md``, ``AGENTS.md``,
+agent-instruction files (``SKILL.md``, ``.agents/skills/``, ``.claude/skills/``,
+``CLAUDE.md``, ``AGENTS.md``,
 ``.cursor/``, Copilot instructions). If the generator read them, it would mine the tasks the
 author already anticipated and phrase them the way the skill does — defeating the point of an
 independent benchmark. So, as with the test-split guard, this is enforced two ways: the agent
@@ -34,14 +35,18 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
-from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, ResultMessage, query
 
+if TYPE_CHECKING:
+    from claude_agent_sdk import HookMatcher
+
+from acumen.agents import AgentOptions, AgentResult, provider_for_model, run_agent
 from acumen.config import Config
 from acumen.env import AuthMode, Target, build_agent_env
 from acumen.logs import LiveLog
+from acumen.prices import PriceTable, price_usage, pricer, resolve_cost
 from acumen.procs import label_env, reap
 from acumen.prompts import taskgen_prompt
 from acumen.tasks import Task, TaskError, load_tasks
@@ -55,8 +60,8 @@ TASKS_FILE = "tasks.yaml"
 _ARTIFACT_BASENAMES = frozenset({"SKILL.md", "CLAUDE.md", "AGENTS.md", "copilot-instructions.md"})
 
 #: Directory names that hold agent guidance; dropped from the copy and denied wherever they
-#: appear on a resolved path (``.claude/skills``, ``.cursor/rules``, …).
-_ARTIFACT_DIRS = frozenset({".claude", ".cursor"})
+#: appear on a resolved path (``.agents/skills``, ``.claude/skills``, ``.cursor/rules``, …).
+_ARTIFACT_DIRS = frozenset({".agents", ".claude", ".codex", ".cursor"})
 
 #: tool_input keys carrying a filesystem path — the coarse set the improver's guard also uses.
 _PATH_KEYS = ("file_path", "path", "notebook_path", "filename")
@@ -75,7 +80,7 @@ class TaskGenResult:
 
     tasks: list[Task]
     out_path: Path
-    cost_usd: float
+    cost_usd: float | None
     turns: int
     #: Live log paths for this run, when a :class:`LiveLog` was attached.
     log_jsonl: Path | None = None
@@ -111,7 +116,7 @@ def _copy_ignore(root: Path):
 def build_filtered_source(src: Path, dest: Path) -> Path:
     """Copy ``src`` to ``dest`` with skills and agent-guidance stripped out.
 
-    This is the structural half of the skill-bias isolation: the generator's ``add_dirs`` points
+    This is the structural half of the skill-bias isolation: the generator's read policy points
     at the returned copy, not the real checkout, so existing skills are simply absent from what
     it can read.
 
@@ -194,6 +199,10 @@ def make_skill_guard(original_src: Path) -> HookMatcher:
     ``matcher=None`` fires the hook for every tool. Paths are resolved against the real source
     checkout, so the guard holds regardless of the agent's ``cwd``.
     """
+    # Imported here, not at module scope: the Claude SDK is an optional dependency and a
+    # Codex-only install never builds an SDK hook.
+    from claude_agent_sdk import HookMatcher
+
     root = original_src.resolve()
 
     async def guard(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
@@ -281,6 +290,7 @@ async def generate_tasks(
     target: Target,
     out_path: Path,
     auth_mode: AuthMode = "session",
+    prices: PriceTable | None = None,
     model: str | None = None,
     max_turns: int | None = None,
     max_usd: float | None = None,
@@ -333,7 +343,10 @@ async def generate_tasks(
     try:
         work = holder / "work"
         home = holder / "home"
-        config_dir = home / ".claude"
+        selected_model = model or cfg.tasks_model
+        table = prices if prices is not None else PriceTable(overrides=cfg.prices)
+        provider = provider_for_model(selected_model)
+        config_dir = home / (".claude" if provider == "claude" else ".codex")
         for path in (work, home, config_dir, home / "tmp"):
             path.mkdir(parents=True, exist_ok=True)
         staged = work / TASKS_FILE
@@ -350,6 +363,7 @@ async def generate_tasks(
                 extra_path=[target.bin_dir],
                 auth_mode=auth_mode,
                 extra_allow=cfg.env_passthrough,
+                provider=provider,
             ),
             holder,
         )
@@ -361,33 +375,37 @@ async def generate_tasks(
             out=staged,
             feedback=feedback,
         )
-        options = ClaudeAgentOptions(
-            cwd=str(work),
+        options = AgentOptions(
+            cwd=work,
             env=env,
-            model=model or cfg.tasks_model,
+            model=selected_model,
             # No default budget cap: only bound the agent if the caller asked.
             max_turns=max_turns,
-            max_budget_usd=max_usd,
+            max_usd=max_usd,
+            # Codex reports no billed figure, so a budget cap needs the run's own rate table.
+            price_usd=pricer(selected_model, table),
             # The generator reads the target source, like the drafter; benchmark agents
             # never do. It points at the *filtered* copy, not the real checkout.
-            add_dirs=[str(source_copy)],
+            read_dirs=(source_copy, target.venv_dir),
+            write_dirs=(work,),
             # No skill discovery at all — the generator must not load a skill that would bias it.
-            setting_sources=[],
-            permission_mode="bypassPermissions",
-            system_prompt={"type": "preset", "preset": "claude_code"},
+            discover_skills=False,
             # Belt-and-braces over the filtered copy: deny any call that reaches an existing
-            # skill/guidance artifact or the original unfiltered source, wherever pointed.
-            hooks={"PreToolUse": [make_skill_guard(target.src_dir)]},
+            # skill/guidance artifact or the original unfiltered source, wherever pointed. Built
+            # only for Claude — the hook is an SDK object, and Codex gets ``deny_paths`` below.
+            claude_hooks={"PreToolUse": [make_skill_guard(target.src_dir)]} if provider == "claude" else None,
+            # Codex reads the filtered copy and is denied the original checkout.
+            deny_paths=(target.src_dir.resolve(),),
         )
 
-        result: ResultMessage | None = None
+        result: AgentResult | None = None
         agent_error: Exception | None = None
         try:
-            async for message in query(prompt=prompt, options=options):
-                if log is not None:
-                    log.append(message)
-                if isinstance(message, ResultMessage):
-                    result = message
+            result = await run_agent(
+                prompt,
+                options=options,
+                on_event=log.append if log is not None else None,
+            )
         except Exception as err:  # noqa: BLE001 - a failed generation is an error to report, re-raised below
             agent_error = err
         finally:
@@ -413,7 +431,15 @@ async def generate_tasks(
         return TaskGenResult(
             tasks=generated,
             out_path=out_path,
-            cost_usd=result.total_cost_usd or 0.0,
+            cost_usd=resolve_cost(
+                result.total_cost_usd,
+                price_usage(
+                    result.usage,
+                    model=selected_model,
+                    provider=result.provider,
+                    prices=table,
+                ),
+            ).cost_usd,
             turns=result.num_turns,
             log_jsonl=log.jsonl_path if log is not None else None,
             log_html=log.html_path if log is not None and log.html_rendered else None,

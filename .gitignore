@@ -11,6 +11,10 @@ __pycache__/
 # Distribution / packaging
 /dist/
 
+# uv's resolved dependency set. acumen is a library — consumers resolve their own tree, and
+# CI resolves fresh through hatch — so a committed lock would pin nothing that is checked.
+/uv.lock
+
 # Tests and coverage
 /data/
 /node_modules/

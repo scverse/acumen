@@ -9,6 +9,7 @@ from typing import Any
 import yaml
 
 from .paths import PathError, slugify
+from .prices import Rates
 
 
 class ConfigError(ValueError):
@@ -22,7 +23,17 @@ class Config:
     repo: str
     skill_name: str
     ref: str = "main"
+    #: Extras from the target's ``[project.optional-dependencies]``. These are published in
+    #: package metadata, so they are what ``pip install pkg[name]`` resolves against.
     extras: list[str] = field(default_factory=list)
+    #: PEP 735 groups from the target's ``[dependency-groups]``. Unlike extras these never
+    #: reach package metadata — they exist only in the source tree — so they need uv's
+    #: ``--group`` rather than the ``pkg[name]`` syntax.
+    dependency_groups: list[str] = field(default_factory=list)
+    #: Packages the target's own ``pyproject.toml`` declares nowhere, installed into the
+    #: target venv alongside it. Passed to ``uv pip install`` verbatim, so PEP 508
+    #: specifiers (``numpy<2``) work.
+    pip_packages: list[str] = field(default_factory=list)
     python: str = "3.12"
     #: Names of environment variables to carry from the operator's shell into isolated
     #: agents (bench sandboxes and the draft/improve/tasks meta-agents), on top of the
@@ -42,6 +53,11 @@ class Config:
     improve_model: str = "claude-opus-5"
     tasks_model: str = "claude-opus-5"
     ship_model: str = "claude-opus-5"
+    #: Per-model token rates (USD per million), overriding or extending the built-in table
+    #: in :mod:`acumen.prices`. Name a model here when you are on negotiated rates, run
+    #: through a gateway, or use a model acumen does not ship a price for — an unpriced
+    #: model still records its tokens, but its ``cost_usd`` is left unset rather than zero.
+    prices: dict[str, Rates] = field(default_factory=dict)
 
     @property
     def is_local(self) -> bool:
@@ -55,6 +71,8 @@ _KNOWN = {
     "repo",
     "ref",
     "extras",
+    "dependency_groups",
+    "pip_packages",
     "python",
     "env_passthrough",
     "models",
@@ -67,6 +85,7 @@ _KNOWN = {
     "tasks_model",
     "ship_model",
     "skill_name",
+    "prices",
 }
 
 
@@ -129,6 +148,24 @@ def _str_list(raw: dict[str, Any], key: str, default: list[str]) -> list[str]:
     return list(value)
 
 
+def _prices(raw: dict[str, Any]) -> dict[str, Rates]:
+    """Validate the optional ``prices:`` block into rates keyed by model ID."""
+    if "prices" not in raw:
+        return {}
+    value = raw["prices"]
+    if not isinstance(value, dict):
+        raise ConfigError(f"'prices' must be a mapping of model to rates, got {value!r}")
+    table: dict[str, Rates] = {}
+    for model, rates in value.items():
+        if not isinstance(model, str) or not model.strip():
+            raise ConfigError(f"'prices' keys must be non-empty model IDs, got {model!r}")
+        try:
+            table[model.strip().lower()] = Rates.from_mapping(rates, model=model)
+        except ValueError as err:
+            raise ConfigError(f"'prices': {err}") from err
+    return table
+
+
 def parse_config(raw: Any) -> Config:
     """Validate an already-parsed ``config.yaml`` document.
 
@@ -164,6 +201,8 @@ def parse_config(raw: Any) -> Config:
         skill_name=skill_name,
         ref=_optional_str(raw, "ref", "main"),
         extras=_str_list(raw, "extras", []),
+        dependency_groups=_str_list(raw, "dependency_groups", []),
+        pip_packages=_str_list(raw, "pip_packages", []),
         python=_optional_str(raw, "python", "3.12"),
         env_passthrough=_str_list(raw, "env_passthrough", []),
         models=models,
@@ -175,6 +214,7 @@ def parse_config(raw: Any) -> Config:
         improve_model=_optional_str(raw, "improve_model", default_model),
         tasks_model=_optional_str(raw, "tasks_model", default_model),
         ship_model=_optional_str(raw, "ship_model", default_model),
+        prices=_prices(raw),
     )
 
 

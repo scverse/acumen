@@ -103,7 +103,7 @@ prose, no formatting, no code fences. If you ran code or tools to get there,
 
 
 DRAFT_PROMPT = """\
-You are writing a Claude Skill for the Python package `{package}` (version {version}).
+You are writing an agent skill for the Python package `{package}` (version {version}).
 
 A skill is documentation written for an agent, not for a human. Its only purpose is to
 make an agent that has never used `{package}` succeed at real tasks with it on the first
@@ -179,7 +179,7 @@ When you are done, `{out}/SKILL.md` must exist and start with the frontmatter ab
 
 
 IMPROVE_PROMPT = """\
-You are improving a Claude Skill for the Python package `{package}` (version {version}).
+You are improving an agent skill for the Python package `{package}` (version {version}).
 
 A skill is documentation written for an agent, not a human. Its only purpose is to make an
 agent that has never used `{package}` succeed at real tasks with it on the first try.
@@ -294,7 +294,8 @@ its own — so a task gives the objective and almost nothing else.
 # Ignore any existing skills or agent instructions — deliberately hidden
 
 The package may ship skills or agent-instruction files written for it (`SKILL.md`,
-`.claude/skills/`, `CLAUDE.md`, `AGENTS.md`, `.cursor/`, Copilot instructions). These have
+`.agents/skills/`, `.claude/skills/`, `.codex/`, `CLAUDE.md`, `AGENTS.md`, `.cursor/`,
+Copilot instructions). These have
 been stripped from the source above, and any attempt to reach them — or the original
 unfiltered checkout — is BLOCKED. This is on purpose: reading pre-written guidance would bias
 which analyses you pick and how you phrase them, and this benchmark must be independent of it.

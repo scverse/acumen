@@ -16,7 +16,22 @@ from typing import Literal
 
 from acumen.paths import ANSWER_FILE
 
-Reason = Literal["ok", "wrong_answer", "format_error", "no_answer_file", "budget", "max_turns", "error"]
+Reason = Literal[
+    "ok",
+    "wrong_answer",
+    "format_error",
+    "no_answer_file",
+    "budget",
+    "max_turns",
+    "error",
+    "provider_exhausted",
+    "sandbox_blocked",
+]
+
+#: Reasons that mark a run as a harness failure rather than evidence about a model. A run
+#: with one of these is recorded for diagnosis but must never reach a report, an improve
+#: pass, or a resume as though it measured something.
+INVALID_REASONS: frozenset[Reason] = frozenset({"provider_exhausted", "sandbox_blocked"})
 
 _FENCE_RE = re.compile(r"^\s*```[^\n]*\n(?P<body>.*?)\n?\s*```\s*$", re.DOTALL)
 _HEADER_LINE_RE = re.compile(r"^\s*#+\s")

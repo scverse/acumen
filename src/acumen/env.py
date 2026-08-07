@@ -4,7 +4,8 @@ Two jobs:
 
 * :func:`prepare_target` — clone (or adopt a local path), build one venv with the target
   package installed, and record the resolved commit and package version. Cached by
-  (repo, ref) so a pass doesn't re-clone.
+  (repo, ref, dependency selection) so a pass doesn't re-clone, but changing what gets
+  installed does rebuild.
 * :func:`scrubbed_env` — the filtered environment benchmark agents run under: auth and
   PATH only, a throwaway ``HOME`` and ``CLAUDE_CONFIG_DIR``, and nothing that could leak
   the user's own settings or memories into a run.
@@ -24,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from acumen.agents import AgentProvider
 from acumen.config import Config
 from acumen.paths import slugify
 
@@ -49,6 +51,9 @@ ENV_ALLOWLIST = (
     "ANTHROPIC_VERTEX_PROJECT_ID",
     "CLOUD_ML_REGION",
     "GOOGLE_APPLICATION_CREDENTIALS",
+    "CODEX_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "NO_PROXY",
@@ -102,9 +107,23 @@ def _run(cmd: list[str], *, cwd: Path | None = None) -> str:
     return proc.stdout.strip()
 
 
-def cache_key(repo: str, ref: str) -> str:
-    """Return the cache directory name for a (repo, ref) pair."""
-    digest = hashlib.sha256(f"{repo}\n{ref}".encode()).hexdigest()[:12]
+def cache_key(
+    repo: str,
+    ref: str,
+    *,
+    extras: Sequence[str] = (),
+    dependency_groups: Sequence[str] = (),
+    pip_packages: Sequence[str] = (),
+) -> str:
+    """Return the cache directory name for a target and its dependency selection.
+
+    The selection is part of the key because it changes what lands in the venv: editing
+    ``extras`` or ``dependency_groups`` has to rebuild rather than silently reuse a venv
+    built from the previous selection. Each list is sorted first, so reordering a config
+    list is not a rebuild.
+    """
+    selection = "\n".join(",".join(sorted(names)) for names in (extras, dependency_groups, pip_packages))
+    digest = hashlib.sha256(f"{repo}\n{ref}\n{selection}".encode()).hexdigest()[:12]
     stem = slugify(Path(repo.rstrip("/")).name.removesuffix(".git") or "target")
     return f"{stem}-{digest}"
 
@@ -124,18 +143,56 @@ def _resolve_commit(src_dir: Path) -> str:
         return "local"  # a local path that isn't a git checkout is still a valid target
 
 
-def _package_name(src_dir: Path) -> str:
+def _load_pyproject(src_dir: Path) -> dict:
     pyproject = src_dir / "pyproject.toml"
     if not pyproject.is_file():
         raise EnvError(f"{src_dir} has no pyproject.toml — acumen needs an installable package")
     try:
-        data = tomllib.loads(pyproject.read_text())
+        return tomllib.loads(pyproject.read_text())
     except (OSError, tomllib.TOMLDecodeError) as err:
         raise EnvError(f"cannot parse {pyproject}: {err}") from err
+
+
+def _package_name(src_dir: Path) -> str:
+    data = _load_pyproject(src_dir)
     name = data.get("project", {}).get("name")
     if not name:
-        raise EnvError(f"{pyproject} does not declare [project].name")
+        raise EnvError(f"{src_dir / 'pyproject.toml'} does not declare [project].name")
     return str(name)
+
+
+def _validate_deps(src_dir: Path, cfg: Config) -> None:
+    """Reject extras and dependency groups the target does not declare.
+
+    Both mechanisms fail quietly otherwise: uv only *warns* about an extra that a package
+    does not provide and still exits 0, so a typo — or an extra that is really a PEP 735
+    group — silently yields a venv missing everything that was asked for. The two are easy
+    to confuse, so when a name is declared as the other kind the error says which key to use.
+    """
+    data = _load_pyproject(src_dir)
+    extras = set(data.get("project", {}).get("optional-dependencies", {}))
+    groups = set(data.get("dependency-groups", {}))
+
+    def _available(declared: set[str], label: str) -> str:
+        return f"available {label}: {', '.join(sorted(declared))}" if declared else f"the target declares no {label}"
+
+    for name in cfg.extras:
+        if name in extras:
+            continue
+        if name in groups:
+            raise EnvError(
+                f"{name!r} is a dependency group, not an extra — use dependency_groups: [{name}]. "
+                "Extras live in [project.optional-dependencies] and are published in package "
+                "metadata; PEP 735 groups live in [dependency-groups] and never leave the source tree."
+            )
+        raise EnvError(f"{name!r} is not an extra of the target; {_available(extras, 'extras')}")
+
+    for name in cfg.dependency_groups:
+        if name in groups:
+            continue
+        if name in extras:
+            raise EnvError(f"{name!r} is an extra, not a dependency group — use extras: [{name}].")
+        raise EnvError(f"{name!r} is not a dependency group of the target; {_available(groups, 'dependency groups')}")
 
 
 def _installed_version(python: Path, pkg_name: str) -> str:
@@ -152,9 +209,10 @@ def prepare_target(cfg: Config, cache_root: Path, *, refresh: bool = False) -> T
     Parameters
     ----------
     cfg
-        The pass config; supplies ``repo``, ``ref``, ``extras`` and ``python``.
+        The pass config; supplies ``repo``, ``ref``, ``python`` and the dependency
+        selection (``extras``, ``dependency_groups``, ``pip_packages``).
     cache_root
-        Directory to hold checkouts and venvs, keyed by (repo, ref).
+        Directory to hold checkouts and venvs, keyed by (repo, ref, dependency selection).
     refresh
         Rebuild even if a ready-marked cache entry exists.
 
@@ -164,7 +222,13 @@ def prepare_target(cfg: Config, cache_root: Path, *, refresh: bool = False) -> T
     """
     if shutil.which("uv") is None:
         raise EnvError("uv is not on PATH — acumen uses it to build the target venv")
-    entry = cache_root / cache_key(cfg.repo, cfg.ref)
+    entry = cache_root / cache_key(
+        cfg.repo,
+        cfg.ref,
+        extras=cfg.extras,
+        dependency_groups=cfg.dependency_groups,
+        pip_packages=cfg.pip_packages,
+    )
     venv_dir = entry / "venv"
     marker = entry / READY_MARKER
 
@@ -197,6 +261,9 @@ def prepare_target(cfg: Config, cache_root: Path, *, refresh: bool = False) -> T
     if not cfg.is_local:
         _clone(cfg.repo, cfg.ref, src_dir)
 
+    # Before the venv, so an unsatisfiable selection costs nothing but the checkout.
+    _validate_deps(src_dir, cfg)
+
     entry.mkdir(parents=True, exist_ok=True)
     if venv_dir.exists():
         shutil.rmtree(venv_dir)
@@ -207,7 +274,12 @@ def prepare_target(cfg: Config, cache_root: Path, *, refresh: bool = False) -> T
     if cfg.extras:
         spec = f"{src_dir}[{','.join(cfg.extras)}]"
     python = venv_dir / ("Scripts" if os.name == "nt" else "bin") / ("python.exe" if os.name == "nt" else "python")
-    _run(["uv", "pip", "install", "--python", str(python), spec])
+    install = ["uv", "pip", "install", "--python", str(python), spec, *cfg.pip_packages]
+    # Groups must be path-qualified: a bare --group resolves against the *cwd's* pyproject,
+    # and _run does not set one.
+    for group in cfg.dependency_groups:
+        install += ["--group", f"{src_dir / 'pyproject.toml'}:{group}"]
+    _run(install)
 
     target = Target(
         source=cfg.repo,
@@ -238,6 +310,17 @@ def claude_cli_dir() -> Path | None:
     return Path(found).parent if found else None
 
 
+def codex_cli_dir() -> Path | None:
+    """Return the directory holding the ``codex`` CLI."""
+    found = shutil.which("codex")
+    return Path(found).parent if found else None
+
+
+def agent_cli_dir(provider: AgentProvider) -> Path | None:
+    """Return the directory holding the selected provider's CLI."""
+    return claude_cli_dir() if provider == "claude" else codex_cli_dir()
+
+
 #: Allowlisted variables that, present and non-empty, let a run authenticate on their own:
 #: a direct Anthropic key/token, or a flag routing to a cloud provider whose own (AWS/GCP)
 #: credentials then apply. A subset of :data:`ENV_ALLOWLIST` — the entries that carry or
@@ -250,9 +333,9 @@ AUTH_ENV_VARS = (
     "CLAUDE_CODE_USE_VERTEX",
 )
 
-#: A resolved authentication mode for an agent run. ``"session"`` bills the user's Claude
-#: subscription via an OAuth login; ``"api"`` bills the Anthropic API (or a cloud provider)
-#: per token — the only mode that yields the real ``cost_usd`` the benchmark records.
+#: A resolved authentication mode for an agent run. ``"session"`` uses the provider's stored
+#: account/subscription login; ``"api"`` uses a metered API credential. Acumen derives
+#: ``cost_usd`` from tokens in either mode, and records the mode so its meaning stays explicit.
 AuthMode = Literal["session", "api"]
 
 #: Allowlisted variables that carry *metered* (API/cloud) authentication, as distinct from a
@@ -270,6 +353,8 @@ API_AUTH_ENV_VARS = (
 #: Kept in ``"session"`` mode and dropped in ``"api"`` mode so exactly one auth path is live.
 SESSION_AUTH_ENV_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
 
+CODEX_API_AUTH_ENV_VARS = ("CODEX_API_KEY", "OPENAI_API_KEY")
+
 
 def _credentials_path() -> Path:
     """The user's Claude OAuth credentials file — what :func:`seed_credentials` copies."""
@@ -277,36 +362,36 @@ def _credentials_path() -> Path:
     return Path(base) / ".credentials.json"
 
 
-def auth_available() -> bool:
-    """Whether an agent run could authenticate to the Claude API.
+def _codex_home() -> Path:
+    """The user's real Codex home, which contains ``auth.json``."""
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 
-    A run gets its credential one of two ways: an allowlisted auth variable in the
-    environment (a direct Anthropic key/token, or a Bedrock/Vertex routing flag whose own
-    cloud credentials then apply), or a Claude credentials file that
-    :func:`seed_credentials` copies into the throwaway config dir (an OAuth login). An
-    empty variable does not count.
+
+def _codex_credentials_path() -> Path:
+    return _codex_home() / "auth.json"
+
+
+def _codex_persisted_auth_mode() -> AuthMode | None:
+    """Classify the credential stored by ``codex login``, without exposing its value.
+
+    Both account and API-key logins write ``auth.json``. The file's existence therefore
+    cannot distinguish subscription usage from metered API usage: recent Codex versions
+    identify API-key login with ``auth_mode: apikey`` and account login with
+    ``auth_mode: chatgpt``. The payload shapes are retained as compatibility fallbacks.
+    Unknown or unreadable files are not guessed at.
     """
-    if any(os.environ.get(var) for var in AUTH_ENV_VARS):
-        return True
-    return _credentials_path().is_file()
-
-
-def check_auth() -> None:
-    """Raise :class:`EnvError` if no credential is reachable for an agent run.
-
-    A preflight guard for the agentic commands. Without it an unauthenticated ``bench``
-    would run the whole matrix, record every run as an ``error``, and still exit 0, while
-    the meta-agents (``draft``/``improve``/``tasks``/``ship``) would fail deep in the SDK
-    with a raw message — so fail early, before the costly target prep, with a clear fix.
-    """
-    if auth_available():
-        return
-    raise EnvError(
-        "no Claude credentials found — an agent run cannot authenticate. Set "
-        "ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_OAUTH_TOKEN), enable a "
-        "provider with CLAUDE_CODE_USE_BEDROCK / CLAUDE_CODE_USE_VERTEX, or log in with "
-        "`claude` so ~/.claude/.credentials.json exists."
-    )
+    try:
+        data = json.loads(_codex_credentials_path().read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    mode = data.get("auth_mode")
+    if mode == "apikey" or data.get("OPENAI_API_KEY"):
+        return "api"
+    if mode == "chatgpt" or isinstance(data.get("tokens"), dict):
+        return "session"
+    return None
 
 
 def _has_oauth_credentials() -> bool:
@@ -324,66 +409,68 @@ def _has_oauth_credentials() -> bool:
     return isinstance(data.get("claudeAiOauth"), dict)
 
 
-def session_auth_available() -> bool:
+def session_auth_available(provider: AgentProvider = "claude") -> bool:
     """Whether an agent run could bill the Claude subscription ("session usage").
 
-    True when a portable ``CLAUDE_CODE_OAUTH_TOKEN`` is set, or the user has a subscription
-    OAuth login on disk (:func:`_has_oauth_credentials`). An empty variable does not count.
+    For Claude, true when a portable ``CLAUDE_CODE_OAUTH_TOKEN`` is set or a subscription
+    OAuth login is on disk. For Codex, true only for an account login in ``auth.json``; a
+    persisted API-key login is deliberately not a session. An empty variable does not count.
     """
+    if provider == "codex":
+        return _codex_persisted_auth_mode() == "session"
     if os.environ.get(SESSION_AUTH_ENV_VAR):
         return True
     return _has_oauth_credentials()
 
 
-def api_auth_available() -> bool:
+def api_auth_available(provider: AgentProvider = "claude") -> bool:
     """Whether an agent run could bill the Anthropic API (or a cloud provider) per token.
 
     True when any metered auth variable is set (:data:`API_AUTH_ENV_VARS`): a direct
     Anthropic key/token, or a Bedrock/Vertex routing flag whose own cloud credentials then
-    apply. The subscription OAuth token is deliberately excluded — it bills the plan, not
-    the API. An empty variable does not count.
+    apply. A Codex API key persisted by ``codex login --with-api-key`` also counts. The
+    subscription OAuth token is deliberately excluded — it bills the plan, not the API.
     """
-    return any(os.environ.get(var) for var in API_AUTH_ENV_VARS)
+    variables = API_AUTH_ENV_VARS if provider == "claude" else CODEX_API_AUTH_ENV_VARS
+    available = any(os.environ.get(var) for var in variables)
+    return available or (provider == "codex" and _codex_persisted_auth_mode() == "api")
 
 
-def resolve_auth_mode(requested: str, *, allow_session: bool) -> AuthMode:
+def resolve_auth_mode(
+    requested: str,
+    *,
+    provider: AgentProvider = "claude",
+) -> AuthMode:
     """Resolve a requested auth choice to the concrete mode a run will use, or fail loudly.
 
-    A preflight guard that replaces :func:`check_auth` on the agentic commands: it both
-    validates that the chosen credential is actually reachable and reports which mode the
-    run will bill, so the choice is never silent.
+    A preflight guard for every agentic command: it both validates that the chosen credential
+    is actually reachable and reports which mode the run will bill, so the choice is never
+    silent.
+
+    ``bench`` used to be barred from ``"session"`` on the grounds that only metered API billing
+    yields a real per-run ``cost_usd``. That stopped being true when cost became a function of
+    the token counts both billing modes report (:mod:`acumen.prices`): a subscription run prices
+    exactly as accurately as a metered one. What the figure *means* does change — under
+    ``"session"`` it is what the run would have cost at API rates, not money billed — so the
+    mode is recorded in each ``result.json`` rather than the choice being taken away.
 
     Parameters
     ----------
     requested
         The user's choice: ``"auto"`` (prefer the subscription, else the API), ``"session"``
         (force the subscription), or ``"api"`` (force the API).
-    allow_session
-        Whether the subscription is a permitted mode. ``bench`` passes ``False`` because it
-        records real per-run ``cost_usd``, which only means anything under metered API
-        billing — so bench always resolves to ``"api"`` and rejects ``"session"``.
 
     Returns
     -------
     ``"session"`` or ``"api"``.
     """
-    if not allow_session:
-        if requested == "session":
-            raise EnvError(
-                "bench records real per-run cost and must bill the API, so --auth session is "
-                "not available for it — the Claude subscription does not meter per-run spend. "
-                "Run the single-agent commands (draft/improve/tasks/ship) on the session instead."
-            )
-        if not api_auth_available():
-            raise EnvError(
-                "no API credential found — bench must bill the API. Set ANTHROPIC_API_KEY (or "
-                "ANTHROPIC_AUTH_TOKEN), or enable a provider with CLAUDE_CODE_USE_BEDROCK / "
-                "CLAUDE_CODE_USE_VERTEX."
-            )
-        return "api"
-
     if requested == "session":
-        if not session_auth_available():
+        if not session_auth_available(provider):
+            if provider == "codex":
+                raise EnvError(
+                    "no Codex account login found for --auth session. Log in with `codex login` "
+                    "so ~/.codex/auth.json exists."
+                )
             raise EnvError(
                 "no Claude subscription login found for --auth session. Log in with `claude` so "
                 "~/.claude/.credentials.json exists, or set CLAUDE_CODE_OAUTH_TOKEN (from "
@@ -391,7 +478,9 @@ def resolve_auth_mode(requested: str, *, allow_session: bool) -> AuthMode:
             )
         return "session"
     if requested == "api":
-        if not api_auth_available():
+        if not api_auth_available(provider):
+            if provider == "codex":
+                raise EnvError("no API credential found for --auth api. Set CODEX_API_KEY (or OPENAI_API_KEY).")
             raise EnvError(
                 "no API credential found for --auth api. Set ANTHROPIC_API_KEY (or "
                 "ANTHROPIC_AUTH_TOKEN), or enable a provider with CLAUDE_CODE_USE_BEDROCK / "
@@ -401,10 +490,15 @@ def resolve_auth_mode(requested: str, *, allow_session: bool) -> AuthMode:
 
     # "auto": prefer the subscription (it's what the user is paying a flat rate for), fall
     # back to the metered API, and only then give up.
-    if session_auth_available():
+    if session_auth_available(provider):
         return "session"
-    if api_auth_available():
+    if api_auth_available(provider):
         return "api"
+    if provider == "codex":
+        raise EnvError(
+            "no Codex credentials found — log in with `codex login` (subscription), "
+            "or set CODEX_API_KEY / OPENAI_API_KEY (API)."
+        )
     raise EnvError(
         "no Claude credentials found — an agent run cannot authenticate. Log in with `claude` "
         "so ~/.claude/.credentials.json exists (subscription), or set ANTHROPIC_API_KEY (or "
@@ -435,13 +529,36 @@ def seed_credentials(config_dir: Path) -> bool:
     return True
 
 
-def _apply_auth_mode(env: dict[str, str], auth_mode: AuthMode | None) -> None:
-    """Neutralize the credential variables the chosen mode must not authenticate with.
+def seed_codex_credentials(config_dir: Path) -> bool:
+    """Copy only Codex's login token into an isolated ``CODEX_HOME``."""
+    real = _codex_credentials_path()
+    if not real.is_file():
+        return False
+    config_dir.mkdir(parents=True, exist_ok=True)
+    dest = config_dir / "auth.json"
+    shutil.copyfile(real, dest)
+    dest.chmod(0o600)
+    return True
 
-    So exactly one auth path is live: ``"session"`` neutralizes the metered API/cloud variables
-    and keeps the subscription OAuth token; ``"api"`` neutralizes the OAuth token and keeps the
-    metered ones. ``None`` leaves the allowlisted credentials untouched (the historical
-    behavior, for callers that don't select a mode).
+
+def _apply_auth_mode(
+    env: dict[str, str],
+    auth_mode: AuthMode | None,
+    provider: AgentProvider = "claude",
+) -> None:
+    """Neutralize the credential variables the chosen provider and mode must not authenticate with.
+
+    Two rules, in order. First, the *other* provider's credentials are blanked whatever the
+    mode: they can never authenticate this run, so allowlisting them would only carry the
+    operator's second API key into a web-enabled agent. Second, within the selected provider
+    exactly one auth path is left live: ``"session"`` neutralizes the metered API/cloud
+    variables and keeps the subscription login; ``"api"`` neutralizes the OAuth token and keeps
+    the metered ones. ``None`` leaves the selected provider's own credentials untouched (the
+    historical behavior, for callers that don't select a mode).
+
+    Codex has no session *variable* — its subscription login is the ``auth.json`` that
+    :func:`seed_codex_credentials` copies into the throwaway ``CODEX_HOME`` — so ``"session"``
+    there just blanks the API keys.
 
     The variables are set to ``""``, not deleted. The SDK builds the agent subprocess env as
     ``{**os.environ, **options.env}`` — it merges our mapping *over* the inherited environment —
@@ -449,14 +566,22 @@ def _apply_auth_mode(env: dict[str, str], auth_mode: AuthMode | None) -> None:
     silently authenticates with the wrong one. An explicit empty value overrides the inherited
     one, which the CLI reads as unset.
     """
-    if auth_mode == "session":
-        drop = API_AUTH_ENV_VARS
-    elif auth_mode == "api":
-        drop = (SESSION_AUTH_ENV_VAR,)
+    if provider == "claude":
+        drop = [*CODEX_API_AUTH_ENV_VARS]
+        if auth_mode == "session":
+            drop += API_AUTH_ENV_VARS
+        elif auth_mode == "api":
+            drop.append(SESSION_AUTH_ENV_VAR)
     else:
-        return
+        drop = [*API_AUTH_ENV_VARS, SESSION_AUTH_ENV_VAR]
+        if auth_mode == "session":
+            drop += CODEX_API_AUTH_ENV_VARS
     for var in drop:
         env[var] = ""
+    if provider == "codex" and auth_mode == "api":
+        # ``codex exec`` consumes CODEX_API_KEY. Accept the conventional OpenAI variable too
+        # and translate it here, without mutating the operator's shell.
+        env["CODEX_API_KEY"] = os.environ.get("CODEX_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
 
 
 def scrubbed_env(
@@ -466,6 +591,7 @@ def scrubbed_env(
     extra_path: list[Path] | None = None,
     auth_mode: AuthMode | None = None,
     extra_allow: Sequence[str] | None = None,
+    provider: AgentProvider = "claude",
 ) -> dict[str, str]:
     """Build the environment an isolated agent runs under.
 
@@ -508,10 +634,10 @@ def scrubbed_env(
     """
     allow = (*ENV_ALLOWLIST, *(extra_allow or ()))
     env = {key: os.environ[key] for key in allow if key in os.environ}
-    _apply_auth_mode(env, auth_mode)
+    _apply_auth_mode(env, auth_mode, provider)
 
     path_parts = [str(p) for p in (extra_path or [])]
-    cli_dir = claude_cli_dir()
+    cli_dir = agent_cli_dir(provider)
     if cli_dir is not None:
         path_parts.append(str(cli_dir))
     node_dir = shutil.which("node")
@@ -526,6 +652,7 @@ def scrubbed_env(
     env["PATH"] = os.pathsep.join(seen)
     env["HOME"] = str(home)
     env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    env["CODEX_HOME"] = str(config_dir)
     # Skill discovery needs setting_sources=["project"], but project discovery
     # also walks UP from cwd and auto-loads every CLAUDE.md it passes. Verified: an agent
     # recited a canary planted in its sandbox's parent directory having made zero tool
@@ -557,24 +684,33 @@ def build_agent_env(
     extra_path: list[Path] | None = None,
     auth_mode: AuthMode,
     extra_allow: Sequence[str] | None = None,
+    provider: AgentProvider = "claude",
 ) -> dict[str, str]:
     """Prepare an isolated agent's environment for a resolved auth mode.
 
-    Pairs the two steps that must agree: in ``"session"`` mode the subscription OAuth login is
-    seeded into ``config_dir`` (only ``.credentials.json`` is copied — never settings, memories,
-    or skills, so isolation is unchanged), and the API/cloud variables are stripped from the
-    env; in ``"api"`` mode nothing is seeded and the OAuth token is stripped instead. Either
-    way exactly one credential reaches the run, so billing is deterministic.
+    Pairs the two steps that must agree. Claude seeds its subscription OAuth login only in
+    ``"session"`` mode. Codex stores both account and API-key logins in ``auth.json``, so the
+    file is seeded only when its classified mode matches ``auth_mode``. Environment credentials
+    for the other mode are stripped either way, keeping billing deterministic.
 
     Every isolated agent (bench sandboxes and the draft/improve/tasks meta-agents) builds its
     env through here, so the seed-and-scrub pairing lives in one place. ``extra_allow`` (the
     operator's ``env_passthrough``) names variables to carry through on top of the built-in
     allowlist, for a target that needs one at runtime.
     """
-    if auth_mode == "session":
+    if provider == "claude" and auth_mode == "session":
         seed_credentials(config_dir)
+    elif provider == "codex" and _codex_persisted_auth_mode() == auth_mode:
+        # Codex stores either account tokens or an API key in auth.json. Copy only the
+        # credential matching the resolved mode into the isolated CODEX_HOME.
+        seed_codex_credentials(config_dir)
     return scrubbed_env(
-        config_dir=config_dir, home=home, extra_path=extra_path, auth_mode=auth_mode, extra_allow=extra_allow
+        config_dir=config_dir,
+        home=home,
+        extra_path=extra_path,
+        auth_mode=auth_mode,
+        extra_allow=extra_allow,
+        provider=provider,
     )
 
 
@@ -588,13 +724,28 @@ DEFAULT_CACHE_ROOT = _default_cache_root()
 
 
 def sdk_version() -> str:
-    """Return the installed ``claude-agent-sdk`` version, for the run fingerprint."""
+    """Return the installed ``claude-agent-sdk`` version, for the run fingerprint.
+
+    ``"unknown"`` on a Codex-only install, where the SDK is deliberately absent — the
+    fingerprint records what drove the run, and nothing Claude drove can be recorded here.
+    """
     from importlib.metadata import PackageNotFoundError, version
 
     try:
         return version("claude-agent-sdk")
-    except PackageNotFoundError:  # pragma: no cover - the SDK is a hard dependency
+    except PackageNotFoundError:
         return "unknown"
+
+
+def agent_version(provider: AgentProvider) -> str:
+    """Return the installed provider runtime version for run fingerprints."""
+    if provider == "claude":
+        return sdk_version()
+    try:
+        output = _run(["codex", "--version"])
+    except EnvError:
+        return "unknown"
+    return output.removeprefix("codex-cli ").strip()
 
 
 def python_version() -> str:
