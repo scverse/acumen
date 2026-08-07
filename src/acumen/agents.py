@@ -121,6 +121,10 @@ class AgentOptions:
     discover_skills: bool = True
     claude_hooks: dict[str, Any] | None = None
     deny_paths: tuple[Path, ...] = ()
+    #: Hosts this agent may reach (``config.allowed_domains``). Empty leaves egress
+    #: unrestricted; a non-empty list closes the sandbox to everything else. Private-network
+    #: addresses are denied in both cases — see :data:`_PRIVATE_NETWORK_HOSTS`.
+    allowed_domains: tuple[str, ...] = ()
     stderr: Callable[[str], None] | None = None
     #: Prices one provider usage block in USD. Claude enforces ``max_usd`` itself against the
     #: figure it bills; Codex reports tokens and no dollar amount, so enforcing a budget there
@@ -168,6 +172,44 @@ def _access_roots(options: AgentOptions) -> tuple[list[Path], list[Path]]:
     return reads, writes
 
 
+def _codex_runtime_roots(cli: Path) -> list[Path]:
+    """Return the directories the Codex CLI must read to re-execute itself.
+
+    Codex's command sandbox re-runs the Codex binary inside a bubblewrap namespace, so
+    whatever ``codex`` resolves to on ``PATH`` has to stay readable. For a standalone
+    install (Homebrew, cargo, a downloaded release) that is a real binary and its own
+    directory is enough.
+
+    The npm package is not: ``codex`` there is a Node shim at ``<pkg>/bin/codex.js`` that
+    execs a native binary shipped in a *separate* optional dependency,
+    ``@openai/codex-<platform>-<arch>/vendor/<triple>/bin/codex``. That package lives
+    outside ``<pkg>/bin``, so allowing only the shim's directory leaves the real binary
+    outside the namespace and every command dies with ``bwrap: execvp …: No such file or
+    directory`` — the agent keeps its tools but can no longer run a single one.
+
+    The shim finds the platform package by ordinary Node resolution, walking up from its
+    own directory through each ancestor's ``node_modules``. Mirroring that walk locates
+    the package wherever the install layout put it (npm, yarn, or pnpm's symlinked store)
+    without hard-coding a target triple: npm installs only the optional dependency that
+    matches the host, so a glob finds the one that is actually present.
+    """
+    roots = [cli.parent]
+    for ancestor in cli.parents:
+        scope = ancestor / "node_modules" / "@openai"
+        if not scope.is_dir():
+            continue
+        # ``codex-*`` cannot match the shim package itself, only its platform siblings.
+        roots.extend(package for package in scope.glob("codex-*") if (package / "vendor").is_dir())
+    # The shim falls back to a vendor directory inside its own package when the optional
+    # dependency was flattened away by the installer.
+    bundled = cli.parent.parent / "vendor"
+    if bundled.is_dir():
+        roots.append(bundled)
+    # pnpm reaches the platform package through a symlink into its content-addressed
+    # store. Landlock and bubblewrap both evaluate the real path, so allow both.
+    return _dedupe_paths([*roots, *(path.resolve() for path in roots)])
+
+
 def _claude_path_rule(tool: str, path: Path) -> str:
     return f"{tool}(//{str(path).lstrip('/')}/**)"
 
@@ -199,10 +241,16 @@ def _claude_settings(options: AgentOptions) -> dict[str, Any]:
                 "denyWrite": ["/"],
                 "allowWrite": [str(path) for path in writes],
             },
+            # ``strictAllowlist`` makes the sandbox runtime deny any host not matched by
+            # ``allowedDomains``, so it is only meaningful once an operator has named the
+            # hosts. Turning it on against a catch-all pattern denies everything instead of
+            # allowing everything, and a denied host surfaces to the agent as an ordinary
+            # network error it will work around rather than report — which is how a whole
+            # benchmark can come back looking like the models got worse.
             "network": {
-                "allowedDomains": ["*"],
+                "allowedDomains": list(options.allowed_domains) or ["*"],
                 "deniedDomains": list(_PRIVATE_NETWORK_HOSTS),
-                "strictAllowlist": True,
+                "strictAllowlist": bool(options.allowed_domains),
                 "allowLocalBinding": False,
                 "allowAllUnixSockets": False,
             },
@@ -280,6 +328,16 @@ async def _run_claude(
             if isinstance(message, ResultMessage):
                 result = message
     except Exception as err:
+        # The CLI exits non-zero on purpose after reporting an ``is_error`` result — a turn
+        # or budget cap, say — and the SDK surfaces that trailing ProcessError as an
+        # exception carrying the result text. The structured ResultMessage has already
+        # arrived by then, so raising would throw away the turns, cost, session id and
+        # transcript of a run that really happened, and file a cap breach as an
+        # unexplained crash. Return the result the CLI gave us and let the caller classify
+        # it. A result that is *not* an error means the stream broke after a clean finish,
+        # which is a genuine failure and still raises.
+        if result is not None and result.is_error:
+            return _from_claude(result)
         # SDK connection/process exceptions can be generic while the actionable quota or
         # billing message was emitted only on stderr. Preserve it so the benchmark runner can
         # classify infrastructure exhaustion instead of blaming the agent.
@@ -342,8 +400,8 @@ def _codex_command(options: AgentOptions, prompt: str) -> list[str]:
     reads, writes = _access_roots(options)
     # The Linux command sandbox re-executes the Codex binary through bubblewrap.
     # Its resolved standalone install is outside the usual /usr runtime roots,
-    # so make the containing directory visible without exposing user config.
-    reads = [*reads, Path(cli).resolve().parent]
+    # so make the containing directories visible without exposing user config.
+    reads = [*reads, *_codex_runtime_roots(Path(cli).resolve())]
     # Keep lexical system aliases as well as their resolved targets.  Landlock
     # evaluates the command path it is given, so allowing /usr/bin does not make
     # an invocation through the /bin -> /usr/bin symlink readable.
@@ -362,15 +420,22 @@ def _codex_command(options: AgentOptions, prompt: str) -> list[str]:
     command.extend(("-c", f"permissions.acumen.filesystem={{{filesystem_toml}}}"))
     command.extend(("-c", "permissions.acumen.network.enabled=true"))
     command.extend(("-c", 'permissions.acumen.network.mode="limited"'))
-    domains = {
-        "*": "allow",
-        "localhost": "deny",
-        "*.localhost": "deny",
-        "127.0.0.1": "deny",
-        "0.0.0.0": "deny",
-        "::1": "deny",
-        "metadata.google.internal": "deny",
-    }
+    # Catch-all allow unless the operator named hosts, matching the Claude policy: an
+    # unnamed host is reachable, a named list closes everything else. The deny entries are
+    # listed after the catch-all so private-network addresses stay blocked either way.
+    domains = {"*": "allow"} if not options.allowed_domains else dict.fromkeys(options.allowed_domains, "allow")
+    if options.allowed_domains:
+        domains["*"] = "deny"
+    domains.update(
+        {
+            "localhost": "deny",
+            "*.localhost": "deny",
+            "127.0.0.1": "deny",
+            "0.0.0.0": "deny",
+            "::1": "deny",
+            "metadata.google.internal": "deny",
+        }
+    )
     domains_toml = ",".join(f"{json.dumps(host)}={json.dumps(access)}" for host, access in domains.items())
     command.extend(("-c", f"permissions.acumen.network.domains={{{domains_toml}}}"))
     command.extend(("-c", "permissions.acumen.network.allow_local_binding=false"))

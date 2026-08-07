@@ -16,6 +16,7 @@ from acumen.bench import BenchmarkInvalidError, PlannedRun, build_matrix, pendin
 from acumen.config import Config, ConfigError, load_config
 from acumen.draft import DraftError, draft_skill
 from acumen.env import DEFAULT_CACHE_ROOT, AuthMode, EnvError, prepare_target, resolve_auth_mode
+from acumen.grade import INVALID_REASONS
 from acumen.improve import ImproveError, improve_skill
 from acumen.logs import LiveLog
 from acumen.paths import SPLITS, arm_name
@@ -231,8 +232,9 @@ class _Progress:
         self.running -= 1
         if outcome.success:
             self.passed += 1
-        mark = "⚠ INVALID" if outcome.reason == "provider_exhausted" else ("✓ pass" if outcome.success else "✗ FAIL")
         p = outcome.payload
+        invalid = outcome.reason in INVALID_REASONS
+        mark = "⚠ INVALID" if invalid else ("✓ pass" if outcome.success else "✗ FAIL")
         toks = int(p.get("input_tokens", 0)) + int(p.get("output_tokens", 0))
         dur = _fmt_secs(float(p.get("duration_s", 0.0)))
         cost_available = p.get("cost_available", True) and p.get("cost_usd") is not None
@@ -246,6 +248,12 @@ class _Progress:
         )
         if outcome.reason == "provider_exhausted":
             print(f"error: provider usage/credit exhausted: {p.get('error') or 'no provider detail'}", file=sys.stderr)
+        elif outcome.reason == "sandbox_blocked":
+            print(
+                "error: the agent sandbox refused an outbound host; set config "
+                f"'allowed_domains' or leave it empty: {p.get('error') or 'no sandbox detail'}",
+                file=sys.stderr,
+            )
 
 
 def _fmt_tokens(value: int) -> str:
@@ -432,6 +440,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
                     on_start=progress.on_start,
                     on_done=progress.on_done,
                     env_passthrough=cfg.env_passthrough,
+                    allowed_domains=cfg.allowed_domains,
                     prices=prices,
                 )
             )

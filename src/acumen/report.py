@@ -252,8 +252,9 @@ def load_results(runs_root: Path) -> pd.DataFrame:
         sample = ", ".join(str(path) for path in invalid[:3])
         more = f" (+{len(invalid) - 3} more)" if len(invalid) > 3 else ""
         raise ReportError(
-            "benchmark contains infrastructure-invalid provider quota/credit result(s); "
-            f"replenish the credential and resume the benchmark before reporting: {sample}{more}"
+            "benchmark contains infrastructure-invalid result(s) — exhausted provider credit, "
+            "or a host the agent sandbox refused. Fix the harness and resume the benchmark "
+            f"before reporting: {sample}{more}"
         )
     if not rows:
         raise ReportError(f"no {RESULT_FILE} files under {runs_root} — run `acumen bench` first")

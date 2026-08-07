@@ -163,6 +163,7 @@ async def draft_skill(
             read_dirs=(target.src_dir, target.venv_dir),
             write_dirs=(work,),
             discover_skills=True,
+            allowed_domains=tuple(cfg.allowed_domains),
         )
 
         result: AgentResult | None = None

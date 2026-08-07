@@ -42,6 +42,24 @@ class Config:
     #: (``OMP_NUM_THREADS``, ``R_HOME``, a service key) must name it here. Values are passed
     #: through verbatim; only list what the package genuinely needs.
     env_passthrough: list[str] = field(default_factory=list)
+    #: Hosts an isolated agent may reach, as sandbox wildcard patterns (``zenodo.org``,
+    #: ``*.ebi.ac.uk``). Empty — the default — leaves egress unrestricted.
+    #:
+    #: A target decides its own network needs at runtime: which mirror a dataset loader
+    #: falls back to, which server a prior is fetched from. Those hosts cannot be enumerated
+    #: before a pass, and a refused host does not fail a run loudly — the agent improvises
+    #: around it and returns a confidently wrong answer, which then scores as evidence about
+    #: the model. So the default is open, and closing it is a deliberate act by an operator
+    #: who knows the target's hosts. Private-network addresses are denied either way; that
+    #: protection is not part of this setting.
+    #:
+    #: Nothing announces this list to an agent, but it is not hidden from one either: it
+    #: reaches Claude through a settings file inside the run's own config directory and
+    #: Codex through its argv, both of which a determined agent can read. It is identical in
+    #: every arm, so it cannot bias a skill against its baseline — but naming task-relevant
+    #: hosts (a dataset mirror, a resource server) does put a hint about the task within
+    #: reach. Prefer the empty default unless egress control is worth that.
+    allowed_domains: list[str] = field(default_factory=list)
     models: list[str] = field(default_factory=lambda: ["claude-opus-5"])
     n_replicates: int = 3
     max_concurrency: int = 4
@@ -75,6 +93,7 @@ _KNOWN = {
     "pip_packages",
     "python",
     "env_passthrough",
+    "allowed_domains",
     "models",
     "n_replicates",
     "max_concurrency",
@@ -205,6 +224,7 @@ def parse_config(raw: Any) -> Config:
         pip_packages=_str_list(raw, "pip_packages", []),
         python=_optional_str(raw, "python", "3.12"),
         env_passthrough=_str_list(raw, "env_passthrough", []),
+        allowed_domains=_str_list(raw, "allowed_domains", []),
         models=models,
         n_replicates=_positive_int(raw, "n_replicates", 3),
         max_concurrency=_positive_int(raw, "max_concurrency", 4),

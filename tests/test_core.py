@@ -53,7 +53,7 @@ from acumen.env import (
     scrubbed_env,
     session_auth_available,
 )
-from acumen.grade import grade_answer, grade_run
+from acumen.grade import INVALID_REASONS, grade_answer, grade_run
 from acumen.improve import ImproveError, _write_material, collect_train_runs, load_rates
 from acumen.logs import LiveLog
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
@@ -95,7 +95,15 @@ from acumen.report import (
     skill_tests,
     tradeoff_figure,
 )
-from acumen.runner import RunOutcome, StderrFilter, _provider_exhaustion_error, _skill_fired, _terminal_reason, run_once
+from acumen.runner import (
+    RunOutcome,
+    StderrFilter,
+    _provider_exhaustion_error,
+    _sandbox_denial,
+    _skill_fired,
+    _terminal_reason,
+    run_once,
+)
 from acumen.sandbox import Sandbox
 from acumen.ship import _ship_env
 from acumen.skills import SkillError, load_skill, read_meta, skill_hash, write_meta
@@ -315,22 +323,44 @@ def test_skill_fired_matches_the_skill_under_test_only(tmp_path: Path) -> None:
     assert _skill_fired(tmp_path / "absent.jsonl", "target") is None
 
 
-def test_codex_skill_fired_matches_project_skill_read(tmp_path: Path) -> None:
-    path = tmp_path / "codex.jsonl"
-    path.write_text(
+def _codex_read(name: str, status: str, exit_code: int | None) -> str:
+    return (
         json.dumps(
             {
                 "type": "item.completed",
                 "item": {
+                    "id": "item_1",
                     "type": "command_execution",
-                    "command": "sed -n '1,200p' .agents/skills/target/SKILL.md",
+                    "command": f"sed -n '1,200p' .agents/skills/{name}/SKILL.md",
+                    "exit_code": exit_code,
+                    "status": status,
                 },
             }
         )
         + "\n"
     )
+
+
+def test_codex_skill_fired_matches_project_skill_read(tmp_path: Path) -> None:
+    path = tmp_path / "codex.jsonl"
+    path.write_text(_codex_read("target", "completed", 0))
     assert _skill_fired(path, "target", provider="codex") is True
     assert _skill_fired(path, "another", provider="codex") is False
+
+
+def test_codex_skill_fired_ignores_a_read_that_never_ran(tmp_path: Path) -> None:
+    """A command the sandbox refused is an attempt to load the skill, not a load.
+
+    Counting the attempt reports the skill as loaded-and-ineffective when its body was
+    never seen, sending the improver to rewrite prose the agent never read.
+    """
+    path = tmp_path / "codex.jsonl"
+    path.write_text(_codex_read("target", "failed", 1))
+    assert _skill_fired(path, "target", provider="codex") is False
+
+    started = tmp_path / "started.jsonl"
+    started.write_text(_codex_read("target", "in_progress", None))
+    assert _skill_fired(started, "target", provider="codex") is False
 
 
 @pytest.mark.parametrize(
@@ -466,6 +496,161 @@ def test_agent_sandbox_policies_are_fail_closed_and_workspace_scoped(tmp_path: P
     assert str(Path.home() / ".codex" / "rules") not in "\n".join(command)
 
 
+def test_egress_is_open_until_an_operator_names_hosts(tmp_path: Path) -> None:
+    """A target's hosts cannot be enumerated before a pass, so the default must not deny.
+
+    A strict allowlist over a catch-all pattern denies every host instead of allowing every
+    host, and the agent sees an ordinary connection error rather than a policy decision — so
+    it improvises and the run scores as a wrong answer.
+    """
+    work, home = tmp_path / "work", tmp_path / "home"
+    for path in (work, home / ".codex"):
+        path.mkdir(parents=True)
+    env = {"PATH": os.environ["PATH"], "HOME": str(home), "CODEX_HOME": str(home / ".codex")}
+
+    default = AgentOptions(cwd=work, env=env, model="claude-opus-5")
+    network = _claude_settings(default)["sandbox"]["network"]
+    assert network["strictAllowlist"] is False
+    assert network["allowedDomains"] == ["*"]
+    # Opening egress must not open the private-network protection with it.
+    assert "169.254.*" in network["deniedDomains"]
+
+    codex_default = _codex_command(replace(default, model="gpt-5.6-sol"), "probe")
+    domains = next(
+        value
+        for index, value in enumerate(codex_default)
+        if index and codex_default[index - 1] == "-c" and value.startswith("permissions.acumen.network.domains=")
+    )
+    assert '"*"="allow"' in domains
+    assert '"metadata.google.internal"="deny"' in domains
+
+    named = replace(default, allowed_domains=("zenodo.org", "*.ebi.ac.uk"))
+    closed = _claude_settings(named)["sandbox"]["network"]
+    assert closed["strictAllowlist"] is True
+    assert closed["allowedDomains"] == ["zenodo.org", "*.ebi.ac.uk"]
+
+    codex_named = _codex_command(replace(named, model="gpt-5.6-sol"), "probe")
+    domains = next(
+        value
+        for index, value in enumerate(codex_named)
+        if index and codex_named[index - 1] == "-c" and value.startswith("permissions.acumen.network.domains=")
+    )
+    assert '"zenodo.org"="allow"' in domains
+    assert '"*"="deny"' in domains
+
+
+def test_sandbox_denial_is_infrastructure_not_evidence(tmp_path: Path) -> None:
+    """A host the sandbox refused says nothing about the model, so it must not be scored."""
+    jsonl = tmp_path / "transcript.jsonl"
+    jsonl.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "content": "ProxyError('Unable to connect to proxy', "
+                            "OSError('Tunnel connection failed: 403 Forbidden'))",
+                        }
+                    ]
+                },
+            }
+        )
+        + "\n"
+    )
+    evidence = _sandbox_denial(jsonl)
+    assert evidence is not None and "403" in evidence
+    assert "sandbox_blocked" in INVALID_REASONS
+
+    # An origin-server 403 or a DNS failure is the target's own trouble, not the harness's.
+    for innocuous in ("HTTPError: 403 Client Error: Forbidden for url: https://example.org/x", "NameResolutionError"):
+        other = tmp_path / "other.jsonl"
+        other.write_text(json.dumps({"type": "user", "message": {"content": [{"type": "text", "text": innocuous}]}}))
+        assert _sandbox_denial(other) is None
+
+    assert _sandbox_denial(tmp_path / "absent.jsonl") is None
+
+
+def test_codex_runtime_roots_cover_the_vendored_native_binary(tmp_path: Path) -> None:
+    """The npm shim execs a binary in a sibling package, not one beside itself.
+
+    Allowing only the shim's own directory leaves the real binary outside the command
+    sandbox's namespace, and every command the agent runs fails with
+    ``bwrap: execvp …: No such file or directory``.
+    """
+    from acumen.agents import _codex_runtime_roots
+
+    package = tmp_path / "lib" / "node_modules" / "@openai" / "codex"
+    shim = package / "bin" / "codex.js"
+    shim.parent.mkdir(parents=True)
+    shim.touch()
+    platform_package = package / "node_modules" / "@openai" / "codex-linux-arm64"
+    native = platform_package / "vendor" / "aarch64-unknown-linux-musl" / "bin" / "codex"
+    native.parent.mkdir(parents=True)
+    native.touch()
+
+    roots = _codex_runtime_roots(shim)
+    assert shim.parent in roots
+    assert any(native.is_relative_to(root) for root in roots)
+
+    # A standalone install is a real binary; its own directory is the whole requirement.
+    standalone = tmp_path / "usr" / "bin" / "codex"
+    standalone.parent.mkdir(parents=True)
+    standalone.touch()
+    assert _codex_runtime_roots(standalone) == [standalone.parent]
+
+
+def test_codex_filesystem_permissions_reach_the_binary_bwrap_execs(tmp_path: Path) -> None:
+    """The emitted allowlist, not just the helper, has to name the native binary.
+
+    Reproduces the layout of a benchmark host where every Codex command failed with
+    ``bwrap: execvp …/vendor/aarch64-unknown-linux-musl/bin/codex: No such file or
+    directory``: npm puts a symlink on PATH, pointing at a Node shim, whose native
+    binary lives in a sibling package the shim's own directory does not contain.
+    """
+    npm = tmp_path / "npm"
+    package = npm / "lib" / "node_modules" / "@openai" / "codex"
+    shim = package / "bin" / "codex.js"
+    native = (
+        package
+        / "node_modules"
+        / "@openai"
+        / "codex-linux-arm64"
+        / "vendor"
+        / "aarch64-unknown-linux-musl"
+        / "bin"
+        / "codex"
+    )
+    for path in (shim, native):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+        path.chmod(0o755)
+    binroot = npm / "bin"
+    binroot.mkdir()
+    (binroot / "codex").symlink_to(os.path.relpath(shim, binroot))
+
+    work = tmp_path / "work"
+    work.mkdir()
+    options = AgentOptions(
+        cwd=work,
+        env={"PATH": str(binroot), "HOME": str(tmp_path / "home"), "CODEX_HOME": str(tmp_path / "home" / ".codex")},
+        model="gpt-5.6-sol",
+    )
+    command = _codex_command(options, "probe")
+    overrides = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "-c"]
+    filesystem = next(value for value in overrides if value.startswith("permissions.acumen.filesystem="))
+
+    allowed = [
+        json.loads(entry.rpartition("=")[0])
+        for entry in filesystem.split("=", 1)[1].strip("{}").split(",")
+        if json.loads(entry.rpartition("=")[2]) in {"read", "write"}
+    ]
+    # The sandbox resolves symlinks, so compare real paths on both sides.
+    target = native.resolve()
+    assert any(target.is_relative_to(Path(entry).resolve()) for entry in allowed)
+
+
 def test_claude_options_write_run_local_settings_file(tmp_path: Path) -> None:
     pytest.importorskip("claude_agent_sdk")
     from acumen.agents import _claude_options
@@ -489,6 +674,90 @@ def test_claude_options_write_run_local_settings_file(tmp_path: Path) -> None:
     assert settings_path == config_dir / "acumen-settings.json"
     settings = json.loads(settings_path.read_text())
     assert settings == _claude_settings(options)
+
+
+def _claude_result(**kwargs: object) -> object:
+    from claude_agent_sdk import ResultMessage
+
+    fields: dict[str, object] = {
+        "subtype": "error_max_turns",
+        "duration_ms": 91_000,
+        "duration_api_ms": 88_000,
+        "is_error": True,
+        "num_turns": 40,
+        "session_id": "session-1",
+        "total_cost_usd": 0.42,
+        "usage": {"input_tokens": 1200, "output_tokens": 340},
+        "errors": ["Reached maximum number of turns (40)"],
+    }
+    fields.update(kwargs)
+    return ResultMessage(**fields)  # type: ignore[arg-type]
+
+
+def _patch_claude_query(monkeypatch: pytest.MonkeyPatch, messages: list[object], error: Exception | None) -> None:
+    import claude_agent_sdk
+
+    async def fake_query(**_kwargs: object):
+        for message in messages:
+            yield message
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+
+
+def test_claude_cap_breach_keeps_the_result_the_cli_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CLI exits non-zero *after* reporting a cap breach, and the SDK re-raises that.
+
+    The structured result has already arrived, so treating the trailing exception as the
+    outcome throws away the turns, cost, session id and transcript of a run that really
+    happened, and files a turn cap as an unexplained crash.
+    """
+    pytest.importorskip("claude_agent_sdk")
+
+    work = tmp_path / "work"
+    work.mkdir()
+    options = AgentOptions(
+        cwd=work,
+        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path), "CLAUDE_CONFIG_DIR": str(tmp_path / "cfg")},
+        model="claude-opus-5",
+        max_turns=40,
+    )
+    _patch_claude_query(
+        monkeypatch,
+        [_claude_result()],
+        Exception("Claude Code returned an error result: Reached maximum number of turns (40)"),
+    )
+
+    result = asyncio.run(run_agent("go", options=options))
+
+    assert result.subtype == "error_max_turns"
+    assert result.num_turns == 40
+    assert result.session_id == "session-1"
+    assert result.total_cost_usd == 0.42
+    # The runner maps the subtype onto its reason taxonomy; a discarded result cannot.
+    assert _terminal_reason(result) == "max_turns"
+
+
+def test_claude_crash_after_a_clean_result_still_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only a deliberate non-zero exit after an error result is expected; a break is not."""
+    pytest.importorskip("claude_agent_sdk")
+
+    work = tmp_path / "work"
+    work.mkdir()
+    options = AgentOptions(
+        cwd=work,
+        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path), "CLAUDE_CONFIG_DIR": str(tmp_path / "cfg")},
+        model="claude-opus-5",
+    )
+    _patch_claude_query(
+        monkeypatch,
+        [_claude_result(subtype="success", is_error=False, errors=None)],
+        Exception("transport closed unexpectedly"),
+    )
+
+    with pytest.raises(Exception, match="transport closed unexpectedly"):
+        asyncio.run(run_agent("go", options=options))
 
 
 def test_codex_guard_denies_isolated_paths(tmp_path: Path) -> None:
@@ -1948,7 +2217,7 @@ def test_reports_refuse_provider_exhaustion_results(runs_root: Path, model: str,
     key = RunKey(arm="noskill", split="train", model=model, task_id="quota", rep=1)
     make_result(runs_root, key, valid=False, reason="provider_exhausted", success=False)
 
-    with pytest.raises(ReportError, match="infrastructure-invalid provider quota/credit"):
+    with pytest.raises(ReportError, match="infrastructure-invalid result"):
         load_results(runs_root)
 
 

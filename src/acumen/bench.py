@@ -29,7 +29,11 @@ class PlannedRun:
 
 
 class BenchmarkInvalidError(RuntimeError):
-    """Raised when provider quota/credit exhaustion invalidates a benchmark pass."""
+    """Raised when a harness failure, not a model, decided the outcome of a pass.
+
+    Two conditions qualify, both infrastructure rather than evidence: the provider
+    credential ran out of usage or credit, and the sandbox refused a host the target needed.
+    """
 
     def __init__(self, outcomes: RunOutcome | Sequence[RunOutcome]):
         values = (outcomes,) if isinstance(outcomes, RunOutcome) else tuple(outcomes)
@@ -40,14 +44,25 @@ class BenchmarkInvalidError(RuntimeError):
         details: list[str] = []
         for outcome in values:
             payload = outcome.payload
+            cell = (
+                f"{outcome.key.arm}/{outcome.key.split}/{outcome.key.model}/{outcome.key.task_id}/rep_{outcome.key.rep}"
+            )
+            if outcome.reason == "sandbox_blocked":
+                detail = payload.get("error") or "the sandbox proxy refused a host"
+                details.append(
+                    f"the agent sandbox refused an outbound host during {cell}. Every remaining "
+                    "cell would be refused the same host, so the pass was cancelled. Name the "
+                    "hosts the target needs in config 'allowed_domains', or leave it empty to "
+                    f"lift the restriction entirely. Sandbox error: {detail}"
+                )
+                continue
             provider = "Claude" if payload.get("agent") == "claude" else "Codex"
             mode = payload.get("auth_mode", "selected")
             detail = payload.get("error") or "the provider reported exhausted usage or credit"
             details.append(
-                f"{provider} {mode} authentication ran out of usage or credit during "
-                f"{outcome.key.arm}/{outcome.key.split}/{outcome.key.model}/"
-                f"{outcome.key.task_id}/rep_{outcome.key.rep}. Remaining {provider} cells were "
-                f"cancelled; other providers continued. Provider error: {detail}"
+                f"{provider} {mode} authentication ran out of usage or credit during {cell}. "
+                f"Remaining {provider} cells were cancelled; other providers continued. "
+                f"Provider error: {detail}"
             )
         super().__init__("benchmark invalid: " + " | ".join(details))
 
@@ -142,13 +157,21 @@ async def run_matrix(
     on_start: Callable[[PlannedRun], None] | None = None,
     on_done: Callable[[RunOutcome], None] | None = None,
     env_passthrough: Sequence[str] | None = None,
+    allowed_domains: Sequence[str] = (),
 ) -> list[RunOutcome]:
     """Run planned runs concurrently, bounded by ``max_concurrency``.
 
-    Ordinary failing runs do not take down the pass. Provider quota/credit exhaustion is
-    different: it invalidates that provider's measurement, cancels only its remaining work,
-    lets other providers finish their queued cells, then raises :class:`BenchmarkInvalidError`
-    after preserving the diagnostic result.
+    Ordinary failing runs do not take down the pass. Two harness failures do, at different
+    scopes, both preserving the diagnostic result before raising
+    :class:`BenchmarkInvalidError`.
+
+    Provider quota/credit exhaustion is provider-scoped: it cancels only that provider's
+    remaining work and lets the other finish its queued cells, since the empty credential is
+    the one thing they do not share.
+
+    A host the sandbox refuses is pass-scoped. Every remaining cell would be refused the same
+    host whatever model it runs, so continuing only fills ``runs/`` with results that measure
+    the allowlist rather than the models.
 
     Parameters
     ----------
@@ -200,6 +223,7 @@ async def run_matrix(
     semaphore = asyncio.Semaphore(max_concurrency)
     outcomes: list[RunOutcome] = []
     exhausted: dict[AgentProvider, RunOutcome] = {}
+    blocked: list[RunOutcome] = []
     tasks: list[asyncio.Task[RunOutcome | None]] = []
     task_providers: dict[asyncio.Task[RunOutcome | None], AgentProvider] = {}
 
@@ -227,10 +251,19 @@ async def run_matrix(
                 keep_sandbox=keep_sandbox,
                 stderr=stderr,
                 env_passthrough=env_passthrough,
+                allowed_domains=allowed_domains,
                 prices=prices,
             )
             if on_done is not None:
                 on_done(outcome)
+            if outcome.reason == "sandbox_blocked":
+                # Not provider-scoped: the sandbox refuses the same host for every cell, so
+                # letting the pass continue only fills runs/ with invalid results.
+                blocked.append(outcome)
+                for peer in tasks:
+                    if peer is not asyncio.current_task() and not peer.done():
+                        peer.cancel()
+                return outcome
             if outcome.reason == "provider_exhausted" and provider not in exhausted:
                 exhausted[provider] = outcome
                 current = asyncio.current_task()
@@ -263,6 +296,8 @@ async def run_matrix(
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
+    if blocked:
+        raise BenchmarkInvalidError(tuple(blocked))
     if exhausted:
         raise BenchmarkInvalidError(tuple(exhausted.values()))
     return outcomes

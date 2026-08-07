@@ -17,7 +17,7 @@ from typing import TextIO
 
 from acumen.agents import AgentOptions, AgentResult, provider_for_model, run_agent
 from acumen.env import AuthMode, Target, agent_version
-from acumen.grade import Grade, Reason, grade_run
+from acumen.grade import INVALID_REASONS, Grade, Reason, grade_run
 from acumen.paths import (
     ANSWER_FILE,
     RESULT_FILE,
@@ -60,6 +60,15 @@ _PROVIDER_EXHAUSTION_MARKERS = (
     "spending limit",
     "spend limit",
     "token quota",
+)
+
+# The sandbox runtime interposes an HTTP proxy and refuses a host it was not given by
+# answering CONNECT with 403. Only a proxy in the path can produce these, so matching them
+# cannot be confused with the target's own network trouble.
+_SANDBOX_DENIAL_MARKERS = (
+    "tunnel connection failed: 403",
+    "connect tunnel failed, response 403",
+    "proxy connect aborted: 403",
 )
 
 
@@ -110,6 +119,34 @@ def _provider_exhaustion_error(message: AgentResult | None, error: str | None = 
     return None
 
 
+def _sandbox_denial(jsonl: Path) -> str | None:
+    """Return evidence that the sandbox's own proxy refused a host, or ``None``.
+
+    A refused host is a failure of the harness, not of the model. It does not reach the
+    agent as a policy decision it could report: the sandbox runtime answers the proxy
+    ``CONNECT`` with ``403``, which surfaces inside the run as an ordinary connection
+    error. An agent that cannot fetch a dataset or a prior does not stop — it improvises
+    from memory and returns a confident, wrong answer, which then scores as a
+    ``wrong_answer`` and enters the report as evidence about the model. Recording it as
+    infrastructure-invalid is the only way that never happens silently.
+
+    Matched narrowly on the ``CONNECT``-tunnel refusal, which only the interposing proxy
+    can produce. Ordinary DNS failures, timeouts and origin-server 403s are *not* matched:
+    those can equally be a target's own flakiness, and misreading one as harness failure
+    would discard a legitimate result.
+    """
+    try:
+        text = jsonl.read_text(errors="ignore")
+    except OSError:
+        return None
+    lowered = text.lower()
+    for marker in _SANDBOX_DENIAL_MARKERS:
+        index = lowered.find(marker)
+        if index != -1:
+            return text[max(0, index - 120) : index + len(marker) + 120].strip()
+    return None
+
+
 def _find_transcript(box: Sandbox, session_id: str) -> Path | None:
     return locate_transcript(box.config_dir, box.root, session_id)
 
@@ -142,8 +179,15 @@ def _skill_fired(jsonl: Path, name: str, *, provider: str = "claude") -> bool | 
                 continue
             # Codex loads repository skills from .agents/skills. The JSONL
             # protocol exposes the command used to read the selected SKILL.md.
+            # The command only counts once it has actually run: a command that
+            # was issued and then failed means the agent tried to read the skill
+            # and could not, which is the opposite of loading it. Counting the
+            # attempt reports a skill as loaded-and-ineffective when its body was
+            # never seen, and that is precisely the distinction the improver acts
+            # on. Codex marks a non-zero exit as "failed", so an item that
+            # completed is one whose output reached the model.
             command = item.get("command")
-            if isinstance(command, str):
+            if isinstance(command, str) and item.get("status") == "completed":
                 normalized = command.replace("\\", "/")
                 if f".agents/skills/{name}/SKILL.md" in normalized:
                     return True
@@ -207,6 +251,7 @@ def _build_options(
     read_dirs: tuple[Path, ...] = (),
     prices: PriceTable | None = None,
     stderr: Callable[[str], None] | None = None,
+    allowed_domains: Sequence[str] = (),
 ) -> AgentOptions:
     """Assemble the SDK options for one run.
 
@@ -235,6 +280,7 @@ def _build_options(
         discover_skills=True,
         price_usd=pricer(model, prices),
         read_dirs=read_dirs,
+        allowed_domains=tuple(allowed_domains),
         stderr=stderr,
     )
 
@@ -255,6 +301,7 @@ async def run_once(
     keep_sandbox: bool = False,
     stderr: Callable[[str], None] | None = None,
     env_passthrough: Sequence[str] | None = None,
+    allowed_domains: Sequence[str] = (),
     prices: PriceTable | None = None,
 ) -> RunOutcome:
     """Execute one benchmark run end to end and write its ``result.json``.
@@ -335,6 +382,7 @@ async def run_once(
             read_dirs=(target.venv_dir,),
             prices=prices,
             stderr=stderr,
+            allowed_domains=allowed_domains,
         )
         try:
             result = await run_agent(prompt, options=options)
@@ -359,8 +407,14 @@ async def run_once(
 
     grade: Grade = grade_run(run_dir, split.answer)
     exhaustion = _provider_exhaustion_error(result, error)
+    # Checked only when the run did not pass. A refused host the agent routed around
+    # without it costing the answer is noise, and invalidating a passing run over it would
+    # throw away a measurement that plainly survived.
+    denial = None if grade.success else _sandbox_denial(run_dir / TRANSCRIPT_JSONL)
     if exhaustion is not None:
         success, reason = False, "provider_exhausted"
+    elif denial is not None:
+        success, reason = False, "sandbox_blocked"
     elif error is not None or result is None:
         success, reason = False, "error"
     else:
@@ -394,9 +448,10 @@ async def run_once(
         "rep": key.rep,
         "success": success,
         "reason": reason,
-        # Provider quota/credit exhaustion invalidates the measurement. Keeping a diagnostic
-        # result is useful, but reports and resume must never treat it as benchmark evidence.
-        "valid": reason != "provider_exhausted",
+        # Exhausted provider credit and a sandbox-refused host both invalidate the
+        # measurement: neither says anything about the model. Keeping a diagnostic result is
+        # useful, but reports and resume must never treat one as benchmark evidence.
+        "valid": reason not in INVALID_REASONS,
         "turns": result.num_turns if result else 0,
         "cost_usd": cost.cost_usd,
         "cost_available": cost.available,
@@ -426,7 +481,7 @@ async def run_once(
         "stop_reason": result.stop_reason if result else None,
         "subtype": result.subtype if result else None,
         "transcript_html": rendered,
-        "error": exhaustion or error or (result.errors if result else None),
+        "error": exhaustion or denial or error or (result.errors if result else None),
     }
     (run_dir / RESULT_FILE).write_text(json.dumps(payload, indent=2) + "\n")
     return RunOutcome(key=key, success=success, reason=reason, payload=payload)

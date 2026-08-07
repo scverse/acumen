@@ -150,7 +150,9 @@ def collect_train_runs(runs_root: Path, arm: str, tasks: list[Task]) -> list[Tra
         if data.get("valid", True) is False:
             raise ImproveError(
                 "cannot improve from an infrastructure-invalid benchmark result: "
-                f"{result_path}. Replenish the provider credential and resume the benchmark first."
+                f"{result_path} ({data.get('reason')}). Fix the harness — replenish the provider "
+                "credential, or widen config 'allowed_domains' if the sandbox refused a host — "
+                "and resume the benchmark first."
             )
         key = parse_run_dir(runs_root, result_path.parent)
         task = by_id.get(key.task_id)
@@ -536,6 +538,7 @@ async def improve_skill(
             read_dirs=(target.venv_dir,),
             write_dirs=(work,),
             discover_skills=True,
+            allowed_domains=tuple(cfg.allowed_domains),
             # Belt-and-braces over the structural isolation: refuse any call that reaches a
             # held-out test result, wherever the agent points it. Built only for Claude — the
             # hook is an SDK object, and Codex gets the equivalent from ``deny_paths`` below.
