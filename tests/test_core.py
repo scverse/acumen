@@ -31,6 +31,7 @@ from acumen.agents import (
     AgentError,
     AgentOptions,
     AgentResult,
+    _claude_path_rule,
     _claude_settings,
     _codex_command,
     _codex_terminal,
@@ -54,6 +55,7 @@ from acumen.env import (
     session_auth_available,
 )
 from acumen.grade import INVALID_REASONS, grade_answer, grade_run
+from acumen.guard import SYSTEM_ROOTS, find_escape
 from acumen.improve import ImproveError, _write_material, collect_train_runs, load_rates
 from acumen.logs import LiveLog
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
@@ -441,7 +443,7 @@ printf '%s\\n' \\
     assert len(seen) == 4
 
 
-def test_agent_sandbox_policies_are_fail_closed_and_workspace_scoped(tmp_path: Path) -> None:
+def test_agent_policies_are_workspace_scoped(tmp_path: Path) -> None:
     work = tmp_path / "work"
     home = tmp_path / "home"
     venv = tmp_path / "venv"
@@ -456,16 +458,13 @@ def test_agent_sandbox_policies_are_fail_closed_and_workspace_scoped(tmp_path: P
     )
 
     claude = _claude_settings(options)
-    assert claude["sandbox"]["enabled"] is True
-    assert claude["sandbox"]["failIfUnavailable"] is True
-    assert claude["sandbox"]["allowUnsandboxedCommands"] is False
-    assert claude["sandbox"]["filesystem"]["denyRead"] == ["/"]
-    assert str(venv.resolve()) in claude["sandbox"]["filesystem"]["allowRead"]
-    assert str(work.resolve()) in claude["sandbox"]["filesystem"]["allowWrite"]
-    assert str(source.resolve()) not in claude["sandbox"]["filesystem"]["allowWrite"]
-    assert "localhost" in claude["sandbox"]["network"]["deniedDomains"]
-    assert "127.*" in claude["sandbox"]["network"]["deniedDomains"]
-    assert claude["sandbox"]["network"]["allowLocalBinding"] is False
+    # No OS sandbox for Claude: enabling it also interposes an egress proxy whose allowlist
+    # cannot be set from --settings, which is what killed every download in a whole pass.
+    # Filesystem containment is the guard hook instead; see test_guard_* below.
+    assert "sandbox" not in claude
+    assert _claude_path_rule("Read", venv.resolve()) in claude["permissions"]["allow"]
+    assert _claude_path_rule("Edit", work.resolve()) in claude["permissions"]["allow"]
+    assert _claude_path_rule("Edit", source.resolve()) not in claude["permissions"]["allow"]
 
     command = _codex_command(options, "do it")
     overrides = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "-c"]
@@ -484,59 +483,41 @@ def test_agent_sandbox_policies_are_fail_closed_and_workspace_scoped(tmp_path: P
     assert f'{json.dumps(str(codex_dir))}="read"' in filesystem
     assert '"/bin"="read"' in filesystem
     assert "permissions.acumen.network.enabled=true" in overrides
-    assert 'permissions.acumen.network.mode="limited"' in overrides
-    domains = next(value for value in overrides if value.startswith("permissions.acumen.network.domains="))
-    assert '"*"="allow"' in domains
-    assert '"localhost"="deny"' in domains
-    assert '"127.0.0.1"="deny"' in domains
-    assert '"metadata.google.internal"="deny"' in domains
     assert "permissions.acumen.network.allow_local_binding=false" in overrides
     assert "--ignore-user-config" in command and "--ignore-rules" in command
     assert str(Path.home() / ".codex" / "config.toml") not in "\n".join(command)
     assert str(Path.home() / ".codex" / "rules") not in "\n".join(command)
 
 
-def test_egress_is_open_until_an_operator_names_hosts(tmp_path: Path) -> None:
-    """A target's hosts cannot be enumerated before a pass, so the default must not deny.
+def test_egress_is_unrestricted_for_both_providers(tmp_path: Path) -> None:
+    """Nothing in a sandbox may refuse an outbound host.
 
-    A strict allowlist over a catch-all pattern denies every host instead of allowing every
-    host, and the agent sees an ordinary connection error rather than a policy decision — so
-    it improvises and the run scores as a wrong answer.
+    A target decides its own hosts at runtime — which mirror a loader falls back to, which
+    server a prior comes from — so no list written before a pass can be complete. A refused
+    host does not surface to the agent as a policy decision either: it arrives as an ordinary
+    connection error, the agent improvises from memory, and the run scores as a wrong answer.
     """
     work, home = tmp_path / "work", tmp_path / "home"
     for path in (work, home / ".codex"):
         path.mkdir(parents=True)
     env = {"PATH": os.environ["PATH"], "HOME": str(home), "CODEX_HOME": str(home / ".codex")}
+    options = AgentOptions(cwd=work, env=env, model="claude-opus-5")
 
-    default = AgentOptions(cwd=work, env=env, model="claude-opus-5")
-    network = _claude_settings(default)["sandbox"]["network"]
-    assert network["strictAllowlist"] is False
-    assert network["allowedDomains"] == ["*"]
-    # Opening egress must not open the private-network protection with it.
-    assert "169.254.*" in network["deniedDomains"]
+    # Claude gets no sandbox at all: its proxy cannot be opened from --settings, so the only
+    # configuration that reaches the network is the one that does not configure it.
+    settings = _claude_settings(options)
+    assert "sandbox" not in settings
+    assert not any(rule.startswith("WebFetch(domain:") for rule in settings["permissions"]["allow"])
+    assert "deny" not in settings["permissions"]
 
-    codex_default = _codex_command(replace(default, model="gpt-5.6-sol"), "probe")
-    domains = next(
-        value
-        for index, value in enumerate(codex_default)
-        if index and codex_default[index - 1] == "-c" and value.startswith("permissions.acumen.network.domains=")
-    )
-    assert '"*"="allow"' in domains
-    assert '"metadata.google.internal"="deny"' in domains
-
-    named = replace(default, allowed_domains=("zenodo.org", "*.ebi.ac.uk"))
-    closed = _claude_settings(named)["sandbox"]["network"]
-    assert closed["strictAllowlist"] is True
-    assert closed["allowedDomains"] == ["zenodo.org", "*.ebi.ac.uk"]
-
-    codex_named = _codex_command(replace(named, model="gpt-5.6-sol"), "probe")
-    domains = next(
-        value
-        for index, value in enumerate(codex_named)
-        if index and codex_named[index - 1] == "-c" and value.startswith("permissions.acumen.network.domains=")
-    )
-    assert '"zenodo.org"="allow"' in domains
-    assert '"*"="deny"' in domains
+    command = _codex_command(replace(options, model="gpt-5.6-sol"), "probe")
+    overrides = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "-c"]
+    # ``limited`` is not merely a narrower domain table: its proxy also answers anything
+    # outside GET/HEAD/OPTIONS with 403, which breaks every POST a target's loaders make.
+    assert 'permissions.acumen.network.mode="full"' in overrides
+    assert 'permissions.acumen.network.mode="limited"' not in overrides
+    domains = next(value for value in overrides if value.startswith("permissions.acumen.network.domains="))
+    assert domains == 'permissions.acumen.network.domains={"*"="allow"}'
 
 
 def test_sandbox_denial_is_infrastructure_not_evidence(tmp_path: Path) -> None:
@@ -833,6 +814,77 @@ def test_codex_turns_count_model_actions_not_exec_invocations() -> None:
     )
     # Two commands and the message; reasoning and bookkeeping are not actions.
     assert result.num_turns == 3
+
+
+def test_guard_blocks_exploration_outside_the_run_roots(tmp_path: Path) -> None:
+    """The agent may work in its sandbox and use system paths, and go nowhere else."""
+    work = tmp_path / "work"
+    venv = tmp_path / "venv"
+    elsewhere = tmp_path / "elsewhere"
+    for path in (work, venv, elsewhere):
+        path.mkdir()
+    roots = [work, venv, *SYSTEM_ROOTS]
+
+    # Allowed: the workspace, the target venv, and the system paths every command touches.
+    assert find_escape({"command": "python analysis.py"}, roots, cwd=work) is None
+    assert find_escape({"command": "curl -sS -o /dev/null https://zenodo.org/"}, roots, cwd=work) is None
+    assert find_escape({"file_path": str(work / "answer.md")}, roots, cwd=work) is None
+    assert find_escape({"command": f"ls {venv}/lib"}, roots, cwd=work) is None
+    assert find_escape({"command": "cat /etc/hosts"}, roots, cwd=work) is None
+
+    # Blocked: anywhere else on the host, however the path is spelled.
+    assert find_escape({"command": f"ls {elsewhere}"}, roots, cwd=work) is not None
+    assert find_escape({"file_path": str(elsewhere / "secret.txt")}, roots, cwd=work) is not None
+    assert find_escape({"command": "ls ../.."}, roots, cwd=work) is not None
+
+    # ``~`` means the agent's throwaway home, not the operator's. Judging it against the
+    # harness process's own HOME would deny the agent its own scratch directory and permit
+    # nothing useful in exchange.
+    agent_home = work / "home"
+    (agent_home / "tmp").mkdir(parents=True)
+    assert find_escape({"command": "ls ~/tmp"}, [*roots, agent_home], cwd=work, home=agent_home) is None
+    assert find_escape({"command": "cat ~/.ssh/id_rsa"}, roots, cwd=work, home=Path("/home/someone")) is not None
+    # Nested inputs are walked, so a path cannot hide inside a structured tool argument.
+    assert find_escape({"edits": [{"path": str(elsewhere / "x")}]}, roots, cwd=work) is not None
+
+
+def test_guard_denies_paths_win_over_allowed_roots(tmp_path: Path) -> None:
+    """A meta-agent's hidden evidence stays hidden even when it sits inside the workspace."""
+    work = tmp_path / "work"
+    runs = work / "runs"
+    runs.mkdir(parents=True)
+    assert find_escape({"command": f"ls {runs}"}, [work], deny_roots=[runs], cwd=work) is not None
+    assert find_escape({"command": f"ls {work}"}, [work], deny_roots=[runs], cwd=work) is None
+
+
+def test_codex_sandbox_failure_is_caught_in_command_output_not_only_stderr() -> None:
+    """A sandbox that cannot start reports itself where the command was meant to write.
+
+    bubblewrap's ``execvp`` failure arrives as the command's ``aggregated_output``, not on
+    codex's own stderr. Scanning stderr alone leaves a run whose every command died before it
+    began looking like a model that answered badly, and it enters the report as evidence.
+    """
+    result = _codex_terminal(
+        [
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "/usr/bin/bash -lc 'python script.py'",
+                    "aggregated_output": "bwrap: execvp /opt/codex/vendor/bin/codex: No such file or directory\n",
+                    "exit_code": 1,
+                    "status": "failed",
+                },
+            },
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "here is my answer"}},
+        ],
+        0,
+        10,
+    )
+    assert result.is_error is True
+    assert result.subtype == "error_sandbox"
+    assert result.errors is not None
+    assert "bwrap" in "\n".join(result.errors)
 
 
 def test_codex_stops_at_the_turn_cap(tmp_path: Path) -> None:

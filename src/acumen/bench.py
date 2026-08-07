@@ -51,9 +51,9 @@ class BenchmarkInvalidError(RuntimeError):
                 detail = payload.get("error") or "the sandbox proxy refused a host"
                 details.append(
                     f"the agent sandbox refused an outbound host during {cell}. Every remaining "
-                    "cell would be refused the same host, so the pass was cancelled. Name the "
-                    "hosts the target needs in config 'allowed_domains', or leave it empty to "
-                    f"lift the restriction entirely. Sandbox error: {detail}"
+                    "cell would be refused the same host, so the pass was cancelled. Egress is "
+                    "meant to be unrestricted, so this is a harness bug rather than something to "
+                    f"configure: please report it with the transcript. Sandbox error: {detail}"
                 )
                 continue
             provider = "Claude" if payload.get("agent") == "claude" else "Codex"
@@ -157,7 +157,6 @@ async def run_matrix(
     on_start: Callable[[PlannedRun], None] | None = None,
     on_done: Callable[[RunOutcome], None] | None = None,
     env_passthrough: Sequence[str] | None = None,
-    allowed_domains: Sequence[str] = (),
 ) -> list[RunOutcome]:
     """Run planned runs concurrently, bounded by ``max_concurrency``.
 
@@ -251,7 +250,6 @@ async def run_matrix(
                 keep_sandbox=keep_sandbox,
                 stderr=stderr,
                 env_passthrough=env_passthrough,
-                allowed_domains=allowed_domains,
                 prices=prices,
             )
             if on_done is not None:

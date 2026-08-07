@@ -4,6 +4,11 @@ The agent sees an installed package and nothing else — no repo source, no user
 settings, no memories. Each run gets its own sandbox, throwaway ``HOME`` and throwaway
 provider config directory, so runs cannot see each other either.
 
+The directory is where the agent works, not a jail on its own. What keeps a run inside it
+is the provider's own confinement: Codex's permission profile, enforced by the kernel, and
+for Claude the tool-layer guard in :mod:`acumen.guard`. Egress is deliberately open in both,
+because a target downloads its own datasets and priors.
+
 A skill arm differs from the baseline in exactly one way: ``skills/v{n}/`` is
 copied into the selected provider's project skill directory, where the agent's own
 discovery finds it. Same prompt, same tools, same caps, same env otherwise.

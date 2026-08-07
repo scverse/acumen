@@ -251,7 +251,6 @@ def _build_options(
     read_dirs: tuple[Path, ...] = (),
     prices: PriceTable | None = None,
     stderr: Callable[[str], None] | None = None,
-    allowed_domains: Sequence[str] = (),
 ) -> AgentOptions:
     """Assemble the SDK options for one run.
 
@@ -280,7 +279,6 @@ def _build_options(
         discover_skills=True,
         price_usd=pricer(model, prices),
         read_dirs=read_dirs,
-        allowed_domains=tuple(allowed_domains),
         stderr=stderr,
     )
 
@@ -301,7 +299,6 @@ async def run_once(
     keep_sandbox: bool = False,
     stderr: Callable[[str], None] | None = None,
     env_passthrough: Sequence[str] | None = None,
-    allowed_domains: Sequence[str] = (),
     prices: PriceTable | None = None,
 ) -> RunOutcome:
     """Execute one benchmark run end to end and write its ``result.json``.
@@ -382,7 +379,6 @@ async def run_once(
             read_dirs=(target.venv_dir,),
             prices=prices,
             stderr=stderr,
-            allowed_domains=allowed_domains,
         )
         try:
             result = await run_agent(prompt, options=options)

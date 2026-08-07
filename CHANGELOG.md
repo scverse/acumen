@@ -65,6 +65,20 @@ and this project adheres to [Semantic Versioning][].
 
 ### Fixed
 
+- Give isolated agents unrestricted internet again. Sandboxing every run also put an egress
+  policy in front of it, and the policy denied the hosts a target actually needs: EBI, Zenodo,
+  figshare, OmniPath, NCBI and cellxgene were all unreachable while GitHub and PyPI were not.
+  A refused host does not stop an agent — it improvises from memory and returns a confident
+  wrong answer — so the runs scored as evidence that the models had got worse. Codex now runs
+  its proxy in `full` rather than `limited` mode, which had also been rejecting every request
+  that was not GET, HEAD or OPTIONS. Claude runs without an OS sandbox, whose proxy cannot be
+  opened from the settings file the SDK passes, and is confined to its sandbox directory by a
+  tool-layer guard instead: it can use system paths and the target venv, and cannot list or
+  read anywhere else on the host.
+- Record a run whose sandbox could not execute anything as an infrastructure failure rather
+  than a wrong answer. bubblewrap reports its own startup failure as the command's output, not
+  on the agent CLI's stderr, so the existing check never saw it and a run where every single
+  command died still entered the report as a graded result.
 - Let `acumen tasks` generate over the untouched `tasks.yaml` placeholder that `acumen init`
   writes, instead of demanding `--force` — the two documented first steps of the loop
   contradicted each other. A file the user has edited is still protected.

@@ -31,19 +31,6 @@ if TYPE_CHECKING:
 
 AgentProvider = Literal["claude", "codex"]
 
-_PRIVATE_NETWORK_HOSTS = (
-    "localhost",
-    "*.localhost",
-    "127.*",
-    "0.0.0.0",
-    "10.*",
-    "169.254.*",
-    "192.168.*",
-    *(f"172.{second}.*" for second in range(16, 32)),
-    "::1",
-    "metadata.google.internal",
-)
-
 
 class AgentError(RuntimeError):
     """Raised when an agent model or provider cannot be resolved."""
@@ -121,10 +108,11 @@ class AgentOptions:
     discover_skills: bool = True
     claude_hooks: dict[str, Any] | None = None
     deny_paths: tuple[Path, ...] = ()
-    #: Hosts this agent may reach (``config.allowed_domains``). Empty leaves egress
-    #: unrestricted; a non-empty list closes the sandbox to everything else. Private-network
-    #: addresses are denied in both cases — see :data:`_PRIVATE_NETWORK_HOSTS`.
-    allowed_domains: tuple[str, ...] = ()
+    #: Whether to install the :mod:`acumen.guard` containment hook, which refuses a Claude tool
+    #: call naming a path outside ``read_dirs``/``write_dirs``/``cwd``. True for every isolated
+    #: agent. The shipper sets it False: it is the one agent that runs in the operator's real
+    #: environment on purpose, and it needs the git and ``gh`` credentials that live there.
+    confine: bool = True
     stderr: Callable[[str], None] | None = None
     #: Prices one provider usage block in USD. Claude enforces ``max_usd`` itself against the
     #: figure it bills; Codex reports tokens and no dollar amount, so enforcing a budget there
@@ -215,7 +203,21 @@ def _claude_path_rule(tool: str, path: Path) -> str:
 
 
 def _claude_settings(options: AgentOptions) -> dict[str, Any]:
-    """Build strict run-local Claude settings for unattended execution."""
+    """Build run-local Claude settings for unattended execution.
+
+    Deliberately carries no ``sandbox`` block. Claude Code's OS sandbox confines the
+    filesystem but also puts a proxy in front of every outbound connection, and that proxy's
+    allowlist cannot be set from the ``--settings`` file the SDK passes: it ignores
+    ``sandbox.network.allowedDomains`` whether the entry is ``"*"`` or an explicit host, and
+    ignores ``WebFetch(domain:...)`` allow rules too. Measured on CLI 2.1.224: with the
+    sandbox on, zenodo.org, ftp.ebi.ac.uk and omnipathdb.org are all unreachable; with it off,
+    all three answer. A benchmark target downloads its own datasets and priors, so egress has
+    to win, and the filesystem boundary moves to :mod:`acumen.guard`.
+
+    The file is still written even now that it carries only permissions, because passing
+    ``--settings`` is also what stops the operator's own ``~/.claude/settings.json`` from
+    being inherited by a run.
+    """
     reads, writes = _access_roots(options)
     return {
         "permissions": {
@@ -227,35 +229,34 @@ def _claude_settings(options: AgentOptions) -> dict[str, Any]:
                 *(_claude_path_rule("Read", path) for path in reads),
                 *(_claude_path_rule("Edit", path) for path in writes),
             ],
-            "deny": [f"WebFetch(domain:{host})" for host in _PRIVATE_NETWORK_HOSTS],
-        },
-        "sandbox": {
-            "enabled": True,
-            "failIfUnavailable": True,
-            "autoAllowBashIfSandboxed": True,
-            "allowUnsandboxedCommands": False,
-            "excludedCommands": [],
-            "filesystem": {
-                "denyRead": ["/"],
-                "allowRead": [str(path) for path in reads],
-                "denyWrite": ["/"],
-                "allowWrite": [str(path) for path in writes],
-            },
-            # ``strictAllowlist`` makes the sandbox runtime deny any host not matched by
-            # ``allowedDomains``, so it is only meaningful once an operator has named the
-            # hosts. Turning it on against a catch-all pattern denies everything instead of
-            # allowing everything, and a denied host surfaces to the agent as an ordinary
-            # network error it will work around rather than report — which is how a whole
-            # benchmark can come back looking like the models got worse.
-            "network": {
-                "allowedDomains": list(options.allowed_domains) or ["*"],
-                "deniedDomains": list(_PRIVATE_NETWORK_HOSTS),
-                "strictAllowlist": bool(options.allowed_domains),
-                "allowLocalBinding": False,
-                "allowAllUnixSockets": False,
-            },
         },
     }
+
+
+def _claude_hooks(options: AgentOptions) -> dict[str, Any]:
+    """Combine the caller's own hooks with the filesystem containment guard.
+
+    Composed rather than replaced: ``improve`` and ``taskgen`` each install a ``PreToolUse``
+    hook of their own to hide evidence a meta-agent must not see, and those still have to fire
+    alongside containment.
+    """
+    hooks: dict[str, Any] = {key: list(value) for key, value in (options.claude_hooks or {}).items()}
+    if not options.confine:
+        return hooks
+
+    from acumen.guard import containment_hook
+
+    reads, _ = _access_roots(options)
+    agent_home = options.env.get("HOME")
+    guard = containment_hook(
+        reads,
+        options.deny_paths,
+        cwd=options.cwd,
+        home=Path(agent_home) if agent_home else None,
+    )
+    hooks.setdefault("PreToolUse", [])
+    hooks["PreToolUse"] = [guard, *hooks["PreToolUse"]]
+    return hooks
 
 
 def _claude_options(options: AgentOptions) -> ClaudeAgentOptions:
@@ -263,7 +264,7 @@ def _claude_options(options: AgentOptions) -> ClaudeAgentOptions:
 
     config_dir_value = options.env.get("CLAUDE_CONFIG_DIR")
     if not config_dir_value:
-        raise AgentError("Claude sandboxing requires a run-local CLAUDE_CONFIG_DIR")
+        raise AgentError("an isolated Claude run requires a run-local CLAUDE_CONFIG_DIR")
     settings_path = Path(config_dir_value) / "acumen-settings.json"
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(_claude_settings(options)), encoding="utf-8")
@@ -283,7 +284,7 @@ def _claude_options(options: AgentOptions) -> ClaudeAgentOptions:
         # from being inherited by the run.
         settings=str(settings_path),
         system_prompt={"type": "preset", "preset": "claude_code"},
-        hooks=options.claude_hooks,
+        hooks=_claude_hooks(options),
         stderr=options.stderr,
     )
 
@@ -419,25 +420,13 @@ def _codex_command(options: AgentOptions, prompt: str) -> list[str]:
     filesystem_toml = ",".join(f"{json.dumps(path)}={json.dumps(access)}" for path, access in filesystem.items())
     command.extend(("-c", f"permissions.acumen.filesystem={{{filesystem_toml}}}"))
     command.extend(("-c", "permissions.acumen.network.enabled=true"))
-    command.extend(("-c", 'permissions.acumen.network.mode="limited"'))
-    # Catch-all allow unless the operator named hosts, matching the Claude policy: an
-    # unnamed host is reachable, a named list closes everything else. The deny entries are
-    # listed after the catch-all so private-network addresses stay blocked either way.
-    domains = {"*": "allow"} if not options.allowed_domains else dict.fromkeys(options.allowed_domains, "allow")
-    if options.allowed_domains:
-        domains["*"] = "deny"
-    domains.update(
-        {
-            "localhost": "deny",
-            "*.localhost": "deny",
-            "127.0.0.1": "deny",
-            "0.0.0.0": "deny",
-            "::1": "deny",
-            "metadata.google.internal": "deny",
-        }
-    )
-    domains_toml = ",".join(f"{json.dumps(host)}={json.dumps(access)}" for host, access in domains.items())
-    command.extend(("-c", f"permissions.acumen.network.domains={{{domains_toml}}}"))
+    # ``full``, not ``limited``: the two accepted modes differ in more than their domain
+    # table. Under ``limited`` the proxy enforces a method policy as well, answering anything
+    # outside GET/HEAD/OPTIONS with 403 (verified against ``codex sandbox`` with
+    # ``features.network_proxy=true``), which silently breaks every POST a target's loaders
+    # make. Egress here is meant to be unrestricted, so the mode has to say so.
+    command.extend(("-c", 'permissions.acumen.network.mode="full"'))
+    command.extend(("-c", 'permissions.acumen.network.domains={"*"="allow"}'))
     command.extend(("-c", "permissions.acumen.network.allow_local_binding=false"))
     command.append(prompt)
     return command
@@ -605,6 +594,7 @@ def _codex_terminal(
     errors: list[str] = []
     subtype = "success"
     turns = 0
+    command_output: list[str] = []
     for event in events:
         kind = event.get("type")
         if _is_turn_item(event):
@@ -618,6 +608,10 @@ def _codex_terminal(
                 text = item.get("text")
                 if isinstance(text, str):
                     final = text
+            elif isinstance(item, dict) and item.get("type") == "command_execution":
+                output = item.get("aggregated_output")
+                if isinstance(output, str):
+                    command_output.extend(output.splitlines())
         elif kind == "turn.completed":
             raw = event.get("usage")
             if isinstance(raw, dict):
@@ -626,6 +620,14 @@ def _codex_terminal(
             subtype = str(event.get("type"))
             detail = event.get("message") or event.get("error")
             errors.append(str(detail or event))
+
+    # A sandbox that cannot start reports itself where the *command* was supposed to write,
+    # not on codex's own stderr: bubblewrap's ``execvp`` failure arrives as the command's
+    # ``aggregated_output``. Scanning stderr alone therefore misses the case where every
+    # command in the run died before it began, which grades as the model answering badly
+    # rather than as the harness failing.
+    if sandbox_failure is None:
+        sandbox_failure = _sandbox_failure(command_output)
 
     if sandbox_failure is not None:
         # Checked before the cap and before the exit status: when the sandbox cannot carry out

@@ -250,8 +250,8 @@ class _Progress:
             print(f"error: provider usage/credit exhausted: {p.get('error') or 'no provider detail'}", file=sys.stderr)
         elif outcome.reason == "sandbox_blocked":
             print(
-                "error: the agent sandbox refused an outbound host; set config "
-                f"'allowed_domains' or leave it empty: {p.get('error') or 'no sandbox detail'}",
+                "error: the agent sandbox refused an outbound host; egress is meant to be "
+                f"unrestricted, so this is a harness bug: {p.get('error') or 'no sandbox detail'}",
                 file=sys.stderr,
             )
 
@@ -440,7 +440,6 @@ def _cmd_bench(args: argparse.Namespace) -> int:
                     on_start=progress.on_start,
                     on_done=progress.on_done,
                     env_passthrough=cfg.env_passthrough,
-                    allowed_domains=cfg.allowed_domains,
                     prices=prices,
                 )
             )

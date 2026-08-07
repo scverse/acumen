@@ -388,7 +388,6 @@ async def generate_tasks(
             # never do. It points at the *filtered* copy, not the real checkout.
             read_dirs=(source_copy, target.venv_dir),
             write_dirs=(work,),
-            allowed_domains=tuple(cfg.allowed_domains),
             # No skill discovery at all — the generator must not load a skill that would bias it.
             discover_skills=False,
             # Belt-and-braces over the filtered copy: deny any call that reaches an existing

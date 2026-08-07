@@ -293,6 +293,10 @@ async def ship_skill(
             write_dirs=(target.src_dir, holder),
             # No skill discovery: the shipper packages a skill, it does not consume one.
             discover_skills=False,
+            # The one agent that runs in the operator's real environment on purpose. Confining
+            # it to the checkout would cut it off from the git and ``gh`` credentials that
+            # opening a pull request needs.
+            confine=False,
         )
 
         result: AgentResult | None = None
