@@ -369,10 +369,12 @@ async def preflight_models(
     any real benchmark work is attempted. An empty return value means every model is reachable.
     """
     resolved = {m: (auth_modes or {}).get(provider_for_model(m), auth_mode) for m in models}
-    errors = await asyncio.gather(*(
-        _preflight_model(m, target=target, auth_mode=am, sandbox_base=sandbox_base, env_passthrough=env_passthrough)
-        for m, am in resolved.items()
-    ))
+    errors = await asyncio.gather(
+        *(
+            _preflight_model(m, target=target, auth_mode=am, sandbox_base=sandbox_base, env_passthrough=env_passthrough)
+            for m, am in resolved.items()
+        )
+    )
     return {m: err for m, err in zip(resolved, errors) if err is not None}
 
 
