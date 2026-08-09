@@ -16,10 +16,11 @@ discovery finds it. Same prompt, same tools, same caps, same env otherwise.
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import tempfile
-from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -88,8 +89,8 @@ def install_skill(root: Path, skill: Skill, *, provider: AgentProvider = "claude
     return dest
 
 
-@contextmanager
-def sandbox(
+@asynccontextmanager
+async def sandbox(
     target: Target,
     *,
     auth_mode: AuthMode,
@@ -98,7 +99,7 @@ def sandbox(
     skill: Skill | None = None,
     env_passthrough: Sequence[str] | None = None,
     provider: AgentProvider = "claude",
-) -> Iterator[Sandbox]:
+) -> AsyncIterator[Sandbox]:
     """Create a fresh sandbox for one run and clean it up afterwards.
 
     Parameters
@@ -162,6 +163,6 @@ def sandbox(
         # running when the CLI was terminated on a cap breach or a Ctrl-C. Kill them before
         # the directory goes, so nothing is left writing into a path that no longer exists.
         # ``keep`` preserves the files for inspection, never the processes.
-        reap(holder)
+        await asyncio.to_thread(reap, holder)
         if not keep:
-            shutil.rmtree(holder, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, holder, True)

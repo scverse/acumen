@@ -60,6 +60,11 @@ _PROVIDER_EXHAUSTION_MARKERS = (
     "spending limit",
     "spend limit",
     "token quota",
+    # Authentication failures: the session or API key is invalid/expired.
+    # Treated as infrastructure failure — every remaining cell would fail the same way.
+    "failed to authenticate",
+    "oauth session expired",
+    "authentication_failed",
 )
 
 # The sandbox runtime interposes an HTTP proxy and refuses a host it was not given by
@@ -111,7 +116,7 @@ def _provider_exhaustion_error(message: AgentResult | None, error: str | None = 
         return None
     parts = [error or ""]
     if message is not None:
-        parts.extend([message.subtype or "", *(message.errors or [])])
+        parts.extend([message.subtype or "", message.result, *(message.errors or [])])
     detail = "\n".join(str(part) for part in parts if part).strip()
     lowered = detail.lower()
     if any(marker in lowered for marker in _PROVIDER_EXHAUSTION_MARKERS):
@@ -356,7 +361,7 @@ async def run_once(
     result: AgentResult | None = None
     error: str | None = None
 
-    with sandbox(
+    async with sandbox(
         target,
         auth_mode=auth_mode,
         base=sandbox_base,

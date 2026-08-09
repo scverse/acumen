@@ -219,6 +219,19 @@ async def run_matrix(
     -------
     The outcomes, in completion order.
     """
+    unique_models = list(dict.fromkeys(p.model for p in planned))
+    failures = await preflight_models(
+        unique_models,
+        target=target,
+        auth_mode=auth_mode,
+        auth_modes=auth_modes,
+        sandbox_base=sandbox_base,
+        env_passthrough=env_passthrough,
+    )
+    if failures:
+        lines = "\n".join(f"  {m}: {e}" for m, e in failures.items())
+        raise RuntimeError(f"preflight failed — stop the run before any benchmark work:\n{lines}")
+
     semaphore = asyncio.Semaphore(max_concurrency)
     outcomes: list[RunOutcome] = []
     exhausted: dict[AgentProvider, RunOutcome] = {}
@@ -299,6 +312,68 @@ async def run_matrix(
     if exhausted:
         raise BenchmarkInvalidError(tuple(exhausted.values()))
     return outcomes
+
+
+async def _preflight_model(
+    model: str,
+    *,
+    target: Target,
+    auth_mode: AuthMode,
+    sandbox_base: Path | None,
+    env_passthrough: Sequence[str] | None,
+) -> str | None:
+    """Return None if the model can authenticate, else a short error string."""
+    from acumen.agents import AgentOptions, run_agent
+    from acumen.sandbox import sandbox
+
+    provider = provider_for_model(model)
+    try:
+        async with sandbox(
+            target,
+            auth_mode=auth_mode,
+            base=sandbox_base,
+            provider=provider,
+            env_passthrough=env_passthrough,
+        ) as box:
+            result = await run_agent(
+                "Reply with only the word: ok",
+                options=AgentOptions(
+                    cwd=box.root,
+                    env=box.env,
+                    model=model,
+                    max_turns=5,
+                    max_usd=0.10,
+                    discover_skills=False,
+                    confine=False,
+                ),
+            )
+        if result.is_error:
+            return "; ".join(result.errors or []) or result.subtype or "agent error"
+        return None
+    except Exception as err:
+        return str(err)
+
+
+async def preflight_models(
+    models: Sequence[str],
+    *,
+    target: Target,
+    auth_mode: AuthMode = "api",
+    auth_modes: Mapping[AgentProvider, AuthMode] | None = None,
+    sandbox_base: Path | None = None,
+    env_passthrough: Sequence[str] | None = None,
+) -> dict[str, str]:
+    """Probe each model with a trivial prompt; return a mapping of model → error for failures.
+
+    Run before the benchmark matrix to catch expired credentials or missing CLIs before
+    any real benchmark work is attempted. An empty return value means every model is reachable.
+    """
+    resolved = {m: (auth_modes or {}).get(provider_for_model(m), auth_mode) for m in models}
+    errors = await asyncio.gather(*(
+        _preflight_model(m, target=target, auth_mode=am, sandbox_base=sandbox_base, env_passthrough=env_passthrough)
+        for m, am in resolved.items()
+    ))
+    return {m: err for m, err in zip(resolved, errors) if err is not None}
 
 
 def summarize(outcomes: Sequence[RunOutcome]) -> dict[str, int]:

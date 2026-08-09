@@ -726,6 +726,7 @@ async def _run_codex(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=options.env,
+        limit=10 * 1024 * 1024,  # 10 MB; default 64 KB is too small for large Codex events
     )
     assert process.stdout is not None
     assert process.stderr is not None
