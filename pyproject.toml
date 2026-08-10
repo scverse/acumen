@@ -4,7 +4,7 @@ requires = [ "hatchling" ]
 
 [project]
 name = "acumen"
-version = "0.0.1dev"
+version = "0.0.1.dev0"
 description = "Build, Benchmark, and Optimize Agentic Skills for Python Packages."
 readme = "README.md"
 license = { file = "LICENSE" }
