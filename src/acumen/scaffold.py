@@ -39,6 +39,7 @@ draft_model: claude-opus-5            # model that writes the first skill (reads
 improve_model: claude-opus-5          # model that improves a skill from its train results
 tasks_model: claude-opus-5            # model for `acumen tasks` (generates this file); runs code
 ship_model: claude-opus-5             # model for `acumen ship` (wires a multi-framework install-skills script)
+check_model: claude-opus-5            # model for `acumen check`'s review of prompt/answer/script coherence
 
 # skill_name: your_skill              # name for the built skill; defaults to the repo's name
 """
@@ -62,6 +63,11 @@ TASKS_TEMPLATE = """\
 # A good task is one your target package solves and the baseline gets wrong — that is where
 # a skill has room to help. Replace the placeholders below with your own, or run
 # `acumen tasks` to generate this file automatically from the target package.
+#
+# Every answer should be reproducible: put a script at `tasks/<id>-<split>.py` that redoes the
+# analysis and writes the answer to `answer.md` in its working directory, then run
+# `acumen check` to confirm each one still produces the recorded answer. `acumen tasks` writes
+# those scripts for you. A task that needs no code to answer sets `needs_script: false`.
 #
 # Optional per-task overrides: `max_turns`, `max_usd`, `model`.
 

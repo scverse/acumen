@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
+import tempfile
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -13,6 +15,19 @@ from pathlib import Path
 
 from acumen.agents import AgentError, AgentProvider, check_agent_cli, provider_for_model
 from acumen.bench import BenchmarkInvalidError, PlannedRun, build_matrix, pending, run_matrix, summarize
+from acumen.check import (
+    DEFAULT_JOBS,
+    DEFAULT_TIMEOUT,
+    SCRIPTS_DIRNAME,
+    CheckError,
+    CheckResult,
+    CheckSummary,
+    check_tasks,
+    import_probe,
+    orphan_scripts,
+    select_tasks,
+    summarize_checks,
+)
 from acumen.config import Config, ConfigError, load_config
 from acumen.draft import DraftError, draft_skill
 from acumen.env import DEFAULT_CACHE_ROOT, AuthMode, EnvError, prepare_target, resolve_auth_mode
@@ -32,6 +47,7 @@ from acumen.pricefeed import (
 )
 from acumen.prices import PriceTable, Rates
 from acumen.report import ReportError, build_report
+from acumen.review import ReviewError, ReviewResult, ReviewStatus, ReviewVerdict, review_tasks
 from acumen.runner import RunOutcome, StderrFilter
 from acumen.scaffold import InitError, is_scaffold_tasks, scaffold
 from acumen.ship import ShipError, ship_skill
@@ -622,6 +638,7 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
                 prices=_agent_prices(cfg, model=cfg.tasks_model),
                 target=target,
                 out_path=out,
+                scripts_root=args.scripts,
                 auth_mode=auth_mode,
                 max_turns=args.max_turns,
                 max_usd=args.max_usd,
@@ -631,11 +648,343 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
             )
         )
     print(f"\nwrote {result.out_path.resolve()}")
-    print(f"  tasks: {len(result.tasks)} ({', '.join(t.id for t in result.tasks)})")
-    print(f"  cost:  {_fmt_cost(result.cost_usd)} over {result.turns} turns")
+    print(f"  tasks:   {len(result.tasks)} ({', '.join(t.id for t in result.tasks)})")
+    no_script = [task.id for task in result.tasks if not task.needs_script]
+    scripts = f"{len(result.scripts)} in {args.scripts}"
+    if no_script:
+        scripts += f" ({len(no_script)} task(s) need none: {', '.join(no_script)})"
+    print(f"  scripts: {scripts}")
+    print(f"  cost:    {_fmt_cost(result.cost_usd)} over {result.turns} turns")
     _print_log_result(log)
-    print("\nnext: review the tasks, then `acumen draft` and `acumen bench`")
+    if result.missing_scripts:
+        gaps = ", ".join(f"{task_id}/{split}" for task_id, split in result.missing_scripts)
+        print(
+            f"warning: the agent wrote no reproducer for {gaps}. `acumen check` reports these "
+            "as missing, so their answers cannot be confirmed.",
+            file=sys.stderr,
+        )
+    for name in result.unexpected_scripts:
+        print(
+            f"warning: the agent left {name} in its scripts directory, which matches no task "
+            "and split, so it was not kept",
+            file=sys.stderr,
+        )
+    print("\nnext: review the tasks, then `acumen check`, `acumen draft` and `acumen bench`")
     return 0
+
+
+#: How each status prints in the check table. Only ``skipped`` is renamed: "n/a" reads as
+#: "nothing to check here", where "skipped" would read as "we did not get to it".
+_CHECK_LABELS = {"skipped": "n/a"}
+
+#: Width of the widest status label, so streamed rows line up before all of them are known.
+_STATUS_WIDTH = 12
+
+
+def _clip(text: str, width: int) -> str:
+    """Shorten ``text`` to ``width`` characters, marking that it was cut."""
+    flat = " ".join(text.split())
+    return flat if len(flat) <= width else flat[: width - 1] + "…"
+
+
+def _check_detail(result: CheckResult, timeout: float) -> str:
+    """The rightmost column: what this status means for this split, in one line."""
+    if result.status == "ok":
+        return _clip(result.answer or "", 60)
+    if result.status == "wrong_answer":
+        return f"got {_clip(result.answer or '', 28)} / want {_clip(result.expected, 28)}"
+    if result.status == "format_error":
+        return f"right content, formatting differs: {_clip(result.answer or '', 40)}"
+    if result.status == "no_answer":
+        return "ran clean but wrote no answer.md"
+    if result.status == "error":
+        code = f"exit {result.returncode}" if result.returncode is not None else "failed to start"
+        return f"{code}: {_clip(result.error_tail or '', 60)}"
+    if result.status == "timeout":
+        return f"killed after {_fmt_secs(timeout)}"
+    if result.status == "missing":
+        return f"no reproducer at {result.script}"
+    return "needs_script: false"
+
+
+#: How a review verdict prints. An unreviewed split shows a dash rather than a word: it is the
+#: absence of a judgement, not a judgement.
+_REVIEW_LABELS: dict[str, str] = {"unreviewed": "-"}
+
+#: Width of the widest review label, so the column lines up before every verdict is in.
+_REVIEW_WIDTH = 8
+
+
+def _check_header(*, task_width: int, review: bool) -> str:
+    """The table's header row, with the review column only when there is one."""
+    head = f"  {'task':<{task_width}}  {'split':<5}  {'status':<{_STATUS_WIDTH}}  {'time':>6}  "
+    if review:
+        head += f"{'review':<{_REVIEW_WIDTH}}  "
+    return head + "detail"
+
+
+def _check_row(result: CheckResult, *, task_width: int, timeout: float, review: ReviewStatus | None = None) -> str:
+    """Format one result as a table row, optionally carrying its review verdict."""
+    status = _CHECK_LABELS.get(result.status, result.status)
+    elapsed = _fmt_secs(result.seconds) if result.script is not None and result.status != "missing" else "-"
+    row = f"  {result.task_id:<{task_width}}  {result.split:<5}  {status:<{_STATUS_WIDTH}}  {elapsed:>6}  "
+    if review is not None:
+        row += f"{_REVIEW_LABELS.get(review, review):<{_REVIEW_WIDTH}}  "
+    return row + _check_detail(result, timeout)
+
+
+def _print_flagged(flagged: Sequence[ReviewVerdict], *, task_width: int) -> None:
+    """Print what the review flagged: one line naming the contradiction, one naming the fix."""
+    noun = "split" if len(flagged) == 1 else "splits"
+    print(f"\n{len(flagged)} {noun} the review flagged")
+    label_width = max(task_width + 6, 12)
+    for verdict in flagged:
+        label = f"{verdict.task_id}/{verdict.split}"
+        print(f"  {label:<{label_width}}  {verdict.issue or 'flagged with no reason given'}")
+        if verdict.fix:
+            print(f"  {'':<{label_width}}  fix: {verdict.fix}")
+
+
+def _print_check_summary(summary: CheckSummary, review: ReviewResult | None = None) -> None:
+    """Print the statistics: how much of the task set has reproducible, coherent ground truth."""
+
+    def line(label: str, part: int, whole: int, pct: float | None) -> str:
+        share = "" if pct is None else f"  ({pct:g}%)"
+        return f"  {label:<22} {part:>3}/{whole:<3}{share}"
+
+    print("\nsummary")
+    print(f"  {'splits checked':<22} {summary.n_splits:>3}")
+    if summary.n_non_code_splits:
+        print(
+            f"  {'needing a reproducer':<22} {summary.n_code_splits:>3}      ({summary.n_non_code_splits} marked needs_script: false)"
+        )
+    print(line("with a reproducer", summary.n_with_script, summary.n_code_splits, summary.pct_with_script))
+    print(line("reproduced", summary.n_ok, summary.n_code_splits, summary.pct_reproduced))
+    for status in ("wrong_answer", "format_error", "no_answer", "error", "timeout", "missing"):
+        count = summary.by_status.get(status, 0)
+        if count:
+            print(f"    {status:<20} {count:>3}")
+    print(
+        line(
+            "tasks fully reproduced",
+            summary.n_tasks_reproduced,
+            summary.n_code_tasks,
+            summary.pct_tasks_reproduced,
+        )
+        + "  (both splits)"
+    )
+    if review is not None:
+        judged = sum(1 for verdict in review.verdicts.values() if verdict.status != "unreviewed")
+        n_flagged = len(review.flagged)
+        pct = None if summary.n_splits == 0 else round(100.0 * judged / summary.n_splits, 1)
+        print(line("reviewed", judged, summary.n_splits, pct))
+        if n_flagged:
+            print(f"    {'mismatch':<20} {n_flagged:>3}")
+
+
+def _cmd_check(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    if args.model:
+        cfg = replace(cfg, check_model=args.model)
+    tasks = select_tasks(load_tasks(args.tasks), args.task)
+    splits = args.split or list(SPLITS)
+    review_on = not args.no_review
+
+    # Everything the review needs is resolved before the target is built and before a single
+    # script runs: a missing agent CLI or an unusable credential must not surface after half an
+    # hour of analyses, when it was knowable up front.
+    auth_mode: AuthMode = "api"
+    prices: PriceTable | None = None
+    if review_on:
+        provider = provider_for_model(cfg.check_model)
+        check_agent_cli(provider)
+        auth_mode = resolve_auth_mode(args.auth, provider=provider)
+        _print_auth(auth_mode, provider)
+        _warn_codex_accounting(provider)
+        prices = _agent_prices(cfg, model=cfg.check_model)
+
+    orphans = orphan_scripts(tasks, args.scripts) if not args.task else []
+    print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
+    target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
+    ok, detail = import_probe(target.python, target.pkg_name)
+    if not ok:
+        print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", file=sys.stderr)
+        print(f"error: {target.pkg_name} does not import in the target venv:\n{detail}", file=sys.stderr)
+        print(
+            "Every task would fail the same way, so nothing was run. Fix the target's "
+            "dependency selection in config.yaml (extras, dependency_groups, pip_packages) "
+            "and rerun, or rebuild the venv with --refresh-target.",
+            file=sys.stderr,
+        )
+        return 2
+    print(f"target ready: {target.fingerprint} @ {target.commit[:8]} (imports as {detail})")
+    print(f"reproducers:  {args.scripts}")
+
+    n_rows = len(tasks) * len(splits)
+    task_width = max((len(task.id) for task in tasks), default=4)
+    print(f"\nchecking {n_rows} task splits, up to {args.jobs} at a time:")
+    print(_check_header(task_width=task_width, review=False))
+
+    # Rows print as each reproducer finishes, since a real analysis takes minutes and a silent
+    # terminal for half an hour is not progress.
+    def on_done(result: CheckResult) -> None:
+        print(_check_row(result, task_width=task_width, timeout=args.timeout), flush=True)
+
+    work_root = Path(tempfile.mkdtemp(prefix="acumen-check-")) if args.keep else None
+    results = check_tasks(
+        tasks,
+        scripts_root=args.scripts,
+        python=target.python,
+        splits=splits,
+        timeout=args.timeout,
+        jobs=args.jobs,
+        work_root=work_root,
+        on_done=on_done,
+    )
+    if work_root is not None:
+        print(f"\nworking directories kept at {work_root}")
+
+    summary = summarize_checks(results, tasks)
+    review: ReviewResult | None = None
+    review_failed: str | None = None
+    if review_on:
+        # The second phase. Reproducing the answer says the code and the answer agree; it says
+        # nothing about whether the PROMPT asks for what they produce, which is the other way a
+        # task silently costs a whole pass.
+        print(f"\nreviewing {len(results)} task splits with {cfg.check_model} ...", flush=True)
+        log = LiveLog.open(args.log_dir, "check", stream=args.stream)
+        print(f"log → {log.jsonl_path}", flush=True)
+        try:
+            with log:
+                review = asyncio.run(
+                    review_tasks(
+                        cfg=cfg,
+                        target=target,
+                        tasks=tasks,
+                        results=results,
+                        auth_mode=auth_mode,
+                        prices=prices,
+                        max_turns=args.max_turns,
+                        max_usd=args.max_usd,
+                        log=log,
+                    )
+                )
+        except ReviewError as err:
+            # The deterministic results still stand on their own, so they are reported below
+            # rather than thrown away. The exit code says the check did not complete.
+            review_failed = str(err)
+        else:
+            print(f"review: {_fmt_cost(review.cost_usd)} over {review.turns} turns")
+            _print_log_result(log)
+
+    # The full table in task order, now that every verdict is in. It replaces restating the
+    # failures: with several reproducers running at once the streamed rows are in completion
+    # order, and the review column did not exist yet when they were printed.
+    if review is not None:
+        print()
+        print(_check_header(task_width=task_width, review=True))
+        for result in results:
+            verdict = review.status_for(result.task_id, result.split)
+            print(_check_row(result, task_width=task_width, timeout=args.timeout, review=verdict))
+        if review.flagged:
+            _print_flagged(review.flagged, task_width=task_width)
+    else:
+        failed = [result for result in results if not result.ok]
+        # Restated in task order only when something actually reproduced: when nothing passed the
+        # streamed table already *is* that list, and repeating it says nothing. Rows for tasks
+        # that need no reproducer do not count as passes here.
+        if failed and summary.n_ok:
+            print(f"\n{len(failed)} of {summary.n_code_splits} splits did not reproduce:")
+            for result in failed:
+                print(_check_row(result, task_width=task_width, timeout=args.timeout))
+    _print_check_summary(summary, review)
+    for warning in review.warnings if review is not None else ():
+        sys.stdout.flush()
+        print(f"warning: {warning}", file=sys.stderr)
+    if orphans:
+        # Flushed first: piped stdout is block-buffered, and a warning that lands above the
+        # table it refers to reads as being about something else.
+        sys.stdout.flush()
+        for path in orphans:
+            print(f"warning: {path} matches no task and split, so nothing runs it", file=sys.stderr)
+
+    if args.json is not None:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(
+            json.dumps(
+                {
+                    "target": {
+                        "repo": cfg.repo,
+                        "ref": cfg.ref,
+                        "commit": target.commit,
+                        "pkg_version": target.fingerprint,
+                    },
+                    "scripts_root": str(args.scripts),
+                    "results": [
+                        {
+                            **result.to_dict(),
+                            "review": (
+                                None if review is None else review.verdicts[(result.task_id, result.split)].to_dict()
+                            ),
+                        }
+                        for result in results
+                    ],
+                    "summary": summary.to_dict(),
+                    "review": None
+                    if review is None
+                    else {
+                        "model": cfg.check_model,
+                        "cost_usd": review.cost_usd,
+                        "turns": review.turns,
+                        "flagged": len(review.flagged),
+                        "warnings": list(review.warnings),
+                    },
+                    "orphans": [str(path) for path in orphans],
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        print(f"wrote {args.json}")
+
+    if review_failed is not None:
+        sys.stdout.flush()
+        print(f"\nerror: {review_failed}", file=sys.stderr)
+        print(
+            "The deterministic results above still stand, but the coherence review did not run, "
+            "so this is not a clean check.",
+            file=sys.stderr,
+        )
+        return 2
+    if summary.ok and review is not None and review.flagged:
+        sys.stdout.flush()
+        print(
+            "\nevery answer reproduced, but the review flagged the splits above: a prompt that "
+            "asks for something other than what its script and answer produce fails every agent "
+            "that reads it correctly",
+            file=sys.stderr,
+        )
+        return 1
+    if summary.ok:
+        print("\nevery task's ground truth reproduced: the answers are safe to benchmark against")
+        return 0
+    sys.stdout.flush()
+    if summary.n_with_script == 0:
+        # A hand-written tasks.yaml has no reproducers yet, and "16 missing" is not advice.
+        print(
+            f"\nno task has a reproducer yet. Write one per split as {args.scripts}/<id>-<split>.py, "
+            "each redoing the analysis and writing its answer to answer.md in the working "
+            "directory it is started in, or run `acumen tasks` to regenerate the task set with "
+            "its reproducers. Mark a task that needs no code with `needs_script: false`.",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "\nfix the reproducers and answers above before benchmarking: a task whose ground "
+        "truth cannot be reproduced costs a full pass and measures nothing",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def _cmd_ship(args: argparse.Namespace) -> int:
@@ -855,6 +1204,12 @@ def build_parser() -> argparse.ArgumentParser:
     tasks_cmd = sub.add_parser("tasks", help="autonomously generate a tasks.yaml from the target package")
     tasks_cmd.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
     tasks_cmd.add_argument("--out", type=Path, default=Path("tasks.yaml"), help="tasks.yaml to write")
+    tasks_cmd.add_argument(
+        "--scripts",
+        type=Path,
+        default=Path(SCRIPTS_DIRNAME),
+        help="directory to keep the reproducer script for each split in, for `acumen check`",
+    )
     tasks_cmd.add_argument("--model", help="override config tasks_model")
     tasks_cmd.add_argument("--max-turns", type=int, help="cap turns for the generation agent (default: unbounded)")
     tasks_cmd.add_argument("--max-usd", type=float, help="cap spend for the generation agent (default: unbounded)")
@@ -865,6 +1220,49 @@ def build_parser() -> argparse.ArgumentParser:
     _add_feedback_arg(tasks_cmd, extra=" (e.g. which functionality to skip or focus on)")
     _add_log_args(tasks_cmd)
     tasks_cmd.set_defaults(func=_cmd_tasks)
+
+    check = sub.add_parser(
+        "check",
+        help="verify each task's answer by running its reproducer, then review prompt/answer/script agreement",
+        description=f"Two phases. First, run {SCRIPTS_DIRNAME}/<task>-<split>.py for every task in "
+        "the target venv and compare the answer.md it writes against the answer recorded in "
+        "tasks.yaml. Then an agent reads each task's prompt, recorded answer and reproducer "
+        "together and says whether they describe the same thing, since a prompt that asks for "
+        "something else than its script computes fails every agent that reads it correctly. Both "
+        "phases catch a broken task before a benchmark pass pays for it. A task that needs no code "
+        "sets 'needs_script: false'; --no-review skips the agent and costs nothing.",
+    )
+    check.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
+    check.add_argument("--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml")
+    check.add_argument(
+        "--scripts", type=Path, default=Path(SCRIPTS_DIRNAME), help="directory holding the reproducer scripts"
+    )
+    check.add_argument("--task", metavar="ID", action="append", help="restrict to a task id (repeatable)")
+    check.add_argument("--split", choices=SPLITS, action="append", help="restrict to a split (repeatable)")
+    check.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        help=f"seconds one script may run (default: {DEFAULT_TIMEOUT:g})",
+    )
+    check.add_argument(
+        "--jobs", type=int, default=DEFAULT_JOBS, help=f"scripts to run at once (default: {DEFAULT_JOBS})"
+    )
+    check.add_argument("--keep", action="store_true", help="leave each script's working directory on disk")
+    check.add_argument("--json", type=Path, default=None, help="also write the results and summary here as JSON")
+    check.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
+    check.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
+    check.add_argument(
+        "--no-review",
+        action="store_true",
+        help="skip the coherence review: run the reproducers only, spawning no agent and spending nothing",
+    )
+    check.add_argument("--model", help="override config check_model (the review agent)")
+    check.add_argument("--max-turns", type=int, help="cap turns for the review agent (default: unbounded)")
+    check.add_argument("--max-usd", type=float, help="cap spend for the review agent (default: unbounded)")
+    _add_auth_arg(check)
+    _add_log_args(check)
+    check.set_defaults(func=_cmd_check)
 
     ship = sub.add_parser("ship", help="make a benchmarked skill installable into the target package")
     ship.add_argument(
@@ -921,6 +1319,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except (
+        CheckError,
         ConfigError,
         TaskError,
         EnvError,
@@ -930,6 +1329,7 @@ def main(argv: list[str] | None = None) -> int:
         DraftError,
         ImproveError,
         TaskGenError,
+        ReviewError,
         ShipError,
         ReportError,
         InitError,

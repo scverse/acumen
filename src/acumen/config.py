@@ -53,6 +53,9 @@ class Config:
     improve_model: str = "claude-opus-5"
     tasks_model: str = "claude-opus-5"
     ship_model: str = "claude-opus-5"
+    #: Model for the coherence review in ``acumen check`` — the agent that reads each task's
+    #: prompt, recorded answer and reproducer together and says whether they agree.
+    check_model: str = "claude-opus-5"
     #: Per-model token rates (USD per million), overriding or extending the built-in table
     #: in :mod:`acumen.prices`. Name a model here when you are on negotiated rates, run
     #: through a gateway, or use a model acumen does not ship a price for — an unpriced
@@ -84,6 +87,7 @@ _KNOWN = {
     "improve_model",
     "tasks_model",
     "ship_model",
+    "check_model",
     "skill_name",
     "prices",
 }
@@ -214,6 +218,7 @@ def parse_config(raw: Any) -> Config:
         improve_model=_optional_str(raw, "improve_model", default_model),
         tasks_model=_optional_str(raw, "tasks_model", default_model),
         ship_model=_optional_str(raw, "ship_model", default_model),
+        check_model=_optional_str(raw, "check_model", default_model),
         prices=_prices(raw),
     )
 

@@ -13,6 +13,21 @@ from acumen.agents import (
     run_agent,
 )
 from acumen.bench import BenchmarkInvalidError, PlannedRun, build_matrix, pending, run_matrix, summarize
+from acumen.check import (
+    CheckError,
+    CheckResult,
+    CheckStatus,
+    CheckSummary,
+    ScriptRun,
+    check_task_split,
+    check_tasks,
+    import_probe,
+    orphan_scripts,
+    run_reproducer,
+    script_path,
+    select_tasks,
+    summarize_checks,
+)
 from acumen.config import Config, ConfigError, load_config, parse_config
 from acumen.draft import DraftError, DraftResult, draft_skill
 from acumen.env import (
@@ -49,6 +64,15 @@ from acumen.report import (
     skill_tests,
     tradeoff_figure,
 )
+from acumen.review import (
+    ReviewError,
+    ReviewResult,
+    ReviewStatus,
+    ReviewVerdict,
+    parse_reviews,
+    review_tasks,
+    write_packet,
+)
 from acumen.runner import RunOutcome, run_once
 from acumen.sandbox import Sandbox, install_skill, sandbox
 from acumen.scaffold import InitError, scaffold
@@ -65,12 +89,14 @@ from acumen.skills import (
     skill_hash,
 )
 from acumen.taskgen import (
+    Harvest,
     TaskGenError,
     TaskGenResult,
     build_filtered_source,
     dump_tasks,
     find_skill_access,
     generate_tasks,
+    harvest_scripts,
     make_skill_guard,
 )
 from acumen.tasks import Task, TaskError, TaskSplit, load_tasks, parse_tasks
@@ -88,12 +114,17 @@ __all__ = [
     "AgentProvider",
     "AgentResult",
     "BenchmarkInvalidError",
+    "CheckError",
+    "CheckResult",
+    "CheckStatus",
+    "CheckSummary",
     "Config",
     "ConfigError",
     "DraftError",
     "DraftResult",
     "EnvError",
     "Grade",
+    "Harvest",
     "ImproveError",
     "ImproveResult",
     "InitError",
@@ -102,9 +133,14 @@ __all__ = [
     "Reason",
     "Report",
     "ReportError",
+    "ReviewError",
+    "ReviewResult",
+    "ReviewStatus",
+    "ReviewVerdict",
     "RunKey",
     "RunOutcome",
     "Sandbox",
+    "ScriptRun",
     "ShipError",
     "ShipResult",
     "Skill",
@@ -129,6 +165,8 @@ __all__ = [
     "build_filtered_source",
     "build_matrix",
     "build_report",
+    "check_task_split",
+    "check_tasks",
     "collect_train_runs",
     "draft_skill",
     "dump_tasks",
@@ -137,6 +175,8 @@ __all__ = [
     "generate_tasks",
     "grade_answer",
     "grade_run",
+    "harvest_scripts",
+    "import_probe",
     "improve_skill",
     "install_skill",
     "installer_exists",
@@ -150,7 +190,9 @@ __all__ = [
     "load_skill",
     "load_tasks",
     "next_version",
+    "orphan_scripts",
     "parse_config",
+    "parse_reviews",
     "parse_run_dir",
     "parse_tasks",
     "pending",
@@ -161,13 +203,17 @@ __all__ = [
     "render_transcript",
     "resolve_auth_mode",
     "resolve_palette",
+    "review_tasks",
     "run_dir",
     "run_agent",
     "run_matrix",
     "run_once",
+    "run_reproducer",
     "sandbox",
     "scaffold",
+    "script_path",
     "scrubbed_env",
+    "select_tasks",
     "session_auth_available",
     "ship_skill",
     "SkillTests",
@@ -176,7 +222,9 @@ __all__ = [
     "skill_hash",
     "skill_tests",
     "summarize",
+    "summarize_checks",
     "tradeoff_figure",
+    "write_packet",
 ]
 
 __version__ = version("acumen")

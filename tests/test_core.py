@@ -23,8 +23,10 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+import yaml
 from matplotlib import pyplot as plt
 from matplotlib.colors import to_hex
+from matplotlib.patches import FancyArrowPatch
 
 import acumen
 from acumen.agents import (
@@ -41,6 +43,16 @@ from acumen.agents import (
     run_agent,
 )
 from acumen.bench import BenchmarkInvalidError, PlannedRun, build_matrix, pending, run_matrix
+from acumen.check import (
+    CheckError,
+    CheckResult,
+    check_tasks,
+    import_probe,
+    orphan_scripts,
+    script_path,
+    select_tasks,
+    summarize_checks,
+)
 from acumen.config import Config, ConfigError, derive_skill_name, load_config, parse_config
 from acumen.env import (
     AUTH_ENV_VARS,
@@ -97,6 +109,17 @@ from acumen.report import (
     skill_tests,
     tradeoff_figure,
 )
+from acumen.review import (
+    MAX_NOTE_CHARS,
+    PACKET_DIGEST,
+    PACKET_DIRNAME,
+    PACKET_SCRIPTS,
+    REVIEW_FILE,
+    ReviewError,
+    parse_reviews,
+    review_tasks,
+    write_packet,
+)
 from acumen.runner import (
     RunOutcome,
     StderrFilter,
@@ -109,6 +132,7 @@ from acumen.runner import (
 from acumen.sandbox import Sandbox
 from acumen.ship import _ship_env
 from acumen.skills import SkillError, load_skill, read_meta, skill_hash, write_meta
+from acumen.taskgen import dump_tasks, harvest_scripts
 from acumen.tasks import Task, TaskError, TaskSplit, load_tasks, parse_tasks
 from acumen.transcript import render_agent_transcript, render_codex_transcript
 
@@ -2523,10 +2547,15 @@ def _model_marks(figure: plt.Figure) -> list[plt.Line2D]:
     ]
 
 
-def _frontier(figure: plt.Figure) -> list[tuple[float, float]]:
-    """The vertices of the drawn Pareto staircase — the only marker-less line on the axes."""
+def _frontier_line(figure: plt.Figure) -> plt.Line2D:
+    """The drawn Pareto staircase — the only marker-less line on the axes."""
     (line,) = [ln for ln in figure.axes[0].lines if str(ln.get_marker()) == "None"]
-    return [(float(x), float(y)) for x, y in zip(*line.get_data(), strict=True)]
+    return line
+
+
+def _frontier(figure: plt.Figure) -> list[tuple[float, float]]:
+    """The vertices of the drawn Pareto staircase."""
+    return [(float(x), float(y)) for x, y in zip(*_frontier_line(figure).get_data(), strict=True)]
 
 
 def test_tradeoff_pooled_mark_averages_runs_not_per_model_means(runs_root: Path, model: str, make_result) -> None:
@@ -2553,7 +2582,7 @@ def test_tradeoff_pooled_mark_averages_runs_not_per_model_means(runs_root: Path,
 
 
 def test_tradeoff_shape_carries_the_arm_and_colour_carries_the_model(runs_root: Path, model: str, make_result) -> None:
-    """Two channels, two meanings: an ✕ then a widening polygon per version, hue left to the model."""
+    """Two channels, two meanings: an ✕ against a disc for skill, hue left to the model."""
     for arm in ("skill_v1", "skill_v2"):
         make_result(runs_root, RunKey(arm=arm, split="test", model=model, task_id="example_task", rep=1))
     df = load_results(runs_root)
@@ -2565,9 +2594,111 @@ def test_tradeoff_shape_carries_the_arm_and_colour_carries_the_model(runs_root: 
     finally:
         plt.close(figure)
 
-    # noskill is off the ladder; v1 and v2 are the 3- and 4-sided polygons.
-    assert markers == {"X", "(3, 0, 0)", "(4, 0, 0)"}
+    # Both versions are the same disc: the arrows tell them apart, not the shape.
+    assert markers == {"X", "o"}
     assert colors == {"#3b7ea1"}  # the override reaches the marks, not just the legend
+
+
+def _arrows(figure: plt.Figure) -> list[tuple[tuple[float, float], tuple[float, float], str]]:
+    """Every trajectory arrow as ``(tail, head, colour)`` in data coordinates.
+
+    The arrows are the axes' only patches; the marks and the frontier are lines. Their
+    endpoints come off the patch's private pair because the public path is the *shrunk*
+    outline, which no longer touches the marks the arrow was asked to join.
+    """
+    return [
+        (patch._posA_posB[0], patch._posA_posB[1], to_hex(patch.get_edgecolor(), keep_alpha=False))
+        for patch in figure.axes[0].patches
+        if isinstance(patch, FancyArrowPatch)
+    ]
+
+
+def test_tradeoff_arrows_walk_each_model_in_version_order_and_never_cross_models(
+    runs_root: Path, model: str, make_result
+) -> None:
+    """The chain is what says which disc is which version, so it must run within one model."""
+    other = "claude-opus-5"
+    costs = {(model, "skill_v1"): 0.40, (other, "noskill"): 0.60, (other, "skill_v1"): 0.90}
+    for (who, arm), cost in costs.items():
+        key = RunKey(arm=arm, split="test", model=who, task_id="example_task", rep=1)
+        make_result(runs_root, key, cost_usd=cost)
+    df = load_results(runs_root)  # plus the fixture's $0.12 noskill run for `model`
+
+    figure = tradeoff_figure(df, colors=resolve_palette([model, other], {model: "#3b7ea1", other: "#a1553b"}))
+    try:
+        arrows = _arrows(figure)
+    finally:
+        plt.close(figure)
+
+    # One hop per model — baseline to v1 — plus the pooled chain's own hop. Nothing joins the
+    # $0.12 and $0.60 baselines, or either baseline to the other model's version.
+    assert sorted((tail[0], head[0], color) for tail, head, color in arrows) == [
+        (pytest.approx(0.12), pytest.approx(0.40), "#3b7ea1"),
+        (pytest.approx(0.36), pytest.approx(0.65), "#9b968d"),  # pooled: mean of each arm's runs
+        (pytest.approx(0.60), pytest.approx(0.90), "#a1553b"),
+    ]
+
+
+def test_tradeoff_joins_versions_that_landed_on_the_same_result(runs_root: Path, model: str, make_result) -> None:
+    """Every hop is drawn and every hop is straight, however close the two marks are.
+
+    Marks this close overlap and hide the arrow between them, which is the honest reading: one
+    place, two versions. Bending the hop out to make it visible would draw a path through
+    results nobody measured.
+    """
+    for arm, cost in (("skill_v1", 0.1201), ("skill_v2", 0.1202)):
+        key = RunKey(arm=arm, split="test", model=model, task_id="example_task", rep=1)
+        make_result(runs_root, key, cost_usd=cost)
+    df = load_results(runs_root)  # three arms within a hundredth of a cent of the fixture's run
+
+    figure = tradeoff_figure(df)
+    try:
+        arrows = figure.axes[0].patches
+        curved = [patch for patch in arrows if patch.get_connectionstyle().rad]
+    finally:
+        plt.close(figure)
+
+    assert len(arrows) == 4  # two hops for the model's own chain, two more for the pooled one
+    assert curved == []
+
+
+def test_tradeoff_arrow_reaches_the_mark_it_points_at(runs_root: Path, model: str, make_result) -> None:
+    """The head must land on the target's rim, as squarely as the tail leaves the one behind it.
+
+    matplotlib insets a filled head from the end of its own path, so an arrow given the same
+    standoff at both ends stops visibly short of what it points at while its tail sits flush.
+    """
+    key = RunKey(arm="skill_v1", split="test", model=model, task_id="example_task", rep=1)
+    make_result(runs_root, key, cost_usd=0.60)
+    df = load_results(runs_root)  # the fixture's $0.12 baseline, then this
+
+    figure = tradeoff_figure(df)
+    try:
+        arrow = next(patch for patch in figure.axes[0].patches if isinstance(patch, FancyArrowPatch))
+        drawn = figure.axes[0].transData.transform(arrow.get_path().vertices)
+        tail, head = figure.axes[0].transData.transform(arrow._posA_posB)
+        reach = [min(float(abs(complex(*(point - centre)))) for point in drawn) for centre in (tail, head)]
+    finally:
+        plt.close(figure)
+
+    assert reach[1] == pytest.approx(reach[0], abs=0.2)  # both ends stop on their mark's rim
+
+
+def test_tradeoff_labels_no_mark_in_the_plot(runs_root: Path, model: str, make_result) -> None:
+    """Order rides the arrows, so no version has to be named on the panel itself."""
+    for arm, cost in (("skill_v1", 0.40), ("skill_v2", 0.80)):
+        key = RunKey(arm=arm, split="test", model=model, task_id="example_task", rep=1)
+        make_result(runs_root, key, cost_usd=cost)
+    df = load_results(runs_root)
+
+    figure = tradeoff_figure(df)
+    try:
+        assert _arrows(figure)  # the arms are far enough apart to be joined, so this is a real test
+        texts = {text.get_text() for text in figure.axes[0].texts}
+    finally:
+        plt.close(figure)
+
+    assert texts == {"Pareto frontier"}  # the frontier's own caption, and nothing else
 
 
 def test_tradeoff_frontier_steps_between_the_marks_nothing_beats(runs_root: Path, model: str, make_result) -> None:
@@ -2590,13 +2721,23 @@ def test_tradeoff_frontier_steps_between_the_marks_nothing_beats(runs_root: Path
     figure = tradeoff_figure(df)
     try:
         vertices = _frontier(figure)
-        y_min = figure.axes[0].get_ylim()[0]
+        dashes = _frontier_line(figure).get_linestyle()
+        y_min, _y_max = figure.axes[0].get_ylim()
+        _x_min, x_max = figure.axes[0].get_xlim()
     finally:
         plt.close(figure)
 
+    # Dashed: no run lies along the line, unlike every other path on the panel.
+    assert dashes != "-"
+
     # Both $0.12 runs pass, so the cheapest 100% mark alone survives; the $0.50 failure is
-    # dominated and the riser starts at the axis floor.
-    assert vertices == [(pytest.approx(0.12), pytest.approx(y_min)), (pytest.approx(0.12), pytest.approx(1.0))]
+    # dominated and the riser starts at the axis floor. The last leg carries that rate out to
+    # the right edge, since nothing dearer beat it either.
+    assert vertices == [
+        (pytest.approx(0.12), pytest.approx(y_min)),
+        (pytest.approx(0.12), pytest.approx(1.0)),
+        (pytest.approx(x_max), pytest.approx(1.0)),
+    ]
 
 
 def test_tradeoff_handles_an_arm_where_nothing_succeeded(runs_root: Path, model: str, make_result) -> None:
@@ -2678,13 +2819,19 @@ def test_tradeoff_skill_key_is_unfilled_and_the_model_key_is_not(runs_root: Path
     figure = tradeoff_figure(df, colors=resolve_palette([model], {model: "#3b7ea1"}))
     try:
         keys = {legend.get_title().get_text(): legend.legend_handles for legend in figure.legends}
-        skill = {handle.get_markerfacecolor() for handle in keys["skill"]}
+        labels = {
+            legend.get_title().get_text(): [text.get_text() for text in legend.get_texts()] for legend in figure.legends
+        }
+        marks = [handle for handle in keys["skill"] if isinstance(handle, plt.Line2D)]
+        skill = {handle.get_markerfacecolor() for handle in marks}
         models = {to_hex(handle.get_markerfacecolor()) for handle in keys["model"]}
     finally:
         plt.close(figure)
 
     assert skill == {"none"}  # shape is the channel, so an outline is the whole handle
     assert models == {"#3b7ea1"}  # the model key is the colour key, and keeps its fill
+    # Two shapes and the arrow that orders them, whatever the version count.
+    assert labels["skill"] == ["No skill", "Skill", "next version"]
 
 
 @pytest.mark.parametrize(
@@ -2713,9 +2860,11 @@ def test_pareto_steps_never_cuts_a_diagonal() -> None:
 
     Sloping straight from one point to the next would assert results at prices nobody ran.
     """
-    xs, ys = _pareto_steps([(0.1, 0.8), (0.2, 0.9)], y_min=0.5)
+    xs, ys = _pareto_steps([(0.1, 0.8), (0.2, 0.9)], y_min=0.5, x_max=0.4)
 
-    assert list(zip(xs, ys, strict=True)) == [(0.1, 0.5), (0.1, 0.8), (0.2, 0.8), (0.2, 0.9)]
+    # The last leg runs flat to the right edge: past the dearest frontier point, paying more
+    # cannot buy less, so that stretch is dominated ground rather than nothing at all.
+    assert list(zip(xs, ys, strict=True)) == [(0.1, 0.5), (0.1, 0.8), (0.2, 0.8), (0.2, 0.9), (0.4, 0.9)]
 
 
 # --- significance -----------------------------------------------------------------------
@@ -2910,10 +3059,10 @@ def test_skill_tests_uses_the_test_split_only(runs_root: Path, model: str, make_
     assert after.arms["cost"].tolist() == before.arms["cost"].tolist()
 
 
-def test_arm_marker_widens_with_the_version() -> None:
-    """The baseline is off the ladder; each version adds a side, so the order is legible."""
+def test_arm_marker_separates_skill_from_no_skill_only() -> None:
+    """Shape says skill or not; which version is the arrows' job, so it never runs out of shapes."""
     assert _arm_marker("noskill") == "X"
-    assert [_arm_marker(f"skill_v{n}") for n in (1, 2, 3, 9)] == [(3, 0, 0), (4, 0, 0), (5, 0, 0), (11, 0, 0)]
+    assert {_arm_marker(f"skill_v{n}") for n in (1, 2, 3, 9, 30)} == {"o"}
 
 
 # --- the runs table --------------------------------------------------------------------
@@ -3116,3 +3265,574 @@ def test_label_env_marks_a_run_without_disturbing_the_rest(tmp_path: Path) -> No
 
     assert marked.items() >= base.items()
     assert str(holder) in marked.values()
+
+
+# --- checking task ground truth --------------------------------------------------------
+
+
+def _fake_venv(tmp_path: Path) -> Path:
+    """A venv-shaped directory whose interpreter is the one running the tests."""
+    venv = tmp_path / "venv"
+    bin_dir = venv / ("Scripts" if os.name == "nt" else "bin")
+    bin_dir.mkdir(parents=True)
+    (bin_dir / ("python.exe" if os.name == "nt" else "python")).symlink_to(sys.executable)
+    return venv
+
+
+def _task(task_id: str, train: str = "TRAIN", test: str = "TEST", **kwargs) -> Task:
+    return Task(
+        id=task_id,
+        train=TaskSplit(prompt="do the thing", answer=train),
+        test=TaskSplit(prompt="do the other thing", answer=test),
+        **kwargs,
+    )
+
+
+#: One reproducer per failure mode the check has to tell apart, keyed by its filename.
+_REPRODUCERS = {
+    "good-train.py": 'from pathlib import Path\nprint("noise on stdout")\nPath("answer.md").write_text("TRAIN")\n',
+    "good-test.py": 'from pathlib import Path\nPath("answer.md").write_text("TEST")\n',
+    "shaky-train.py": 'from pathlib import Path\nPath("answer.md").write_text("SOMETHING ELSE")\n',
+    "shaky-test.py": 'from pathlib import Path\nPath("answer.md").write_text("**TEST**")\n',
+    "broken-train.py": 'import sys\nprint("no module named scanpy", file=sys.stderr)\nraise SystemExit(3)\n',
+    "broken-test.py": "pass\n",  # runs clean, writes nothing
+    "slow-train.py": "import time\n\ntime.sleep(30)\n",
+}
+
+
+def test_needs_script_defaults_to_true_and_must_be_a_bool() -> None:
+    entry = {"id": "t", "train": {"prompt": "p", "answer": "a"}, "test": {"prompt": "p", "answer": "b"}}
+
+    (task,) = parse_tasks({"tasks": [entry]})
+    assert task.needs_script is True
+
+    (opted_out,) = parse_tasks({"tasks": [{**entry, "needs_script": False}]})
+    assert opted_out.needs_script is False
+
+    # `1` and `"no"` would silently mean something the author did not write.
+    with pytest.raises(TaskError, match="needs_script must be true or false"):
+        parse_tasks({"tasks": [{**entry, "needs_script": 1}]})
+
+
+def test_dump_tasks_writes_needs_script_only_when_it_is_off() -> None:
+    text = dump_tasks([_task("code"), _task("prose", needs_script=False)])
+
+    assert text.count("needs_script") == 1
+    assert "needs_script: false" in text
+    # Round-tripping is what the generator's output is validated by, so it must survive.
+    assert [t.needs_script for t in parse_tasks(yaml.safe_load(text))] == [True, False]
+
+
+def test_check_tells_every_failure_mode_apart(tmp_path: Path) -> None:
+    """The point of the command: name *why* a task's ground truth is not trustworthy.
+
+    A wrong recorded answer, a script that crashes, one that writes nothing, one that hangs and
+    a missing script all mean different repairs, so they must not collapse into "failed".
+    """
+    scripts = tmp_path / "tasks"
+    scripts.mkdir()
+    for name, body in _REPRODUCERS.items():
+        (scripts / name).write_text(body)
+    tasks = [
+        _task("good"),
+        _task("shaky"),
+        _task("broken"),
+        _task("slow"),
+        _task("prose", needs_script=False),
+    ]
+
+    results = check_tasks(
+        tasks,
+        scripts_root=scripts,
+        python=_fake_venv(tmp_path).joinpath("bin", "python"),
+        timeout=1,
+        jobs=4,
+    )
+
+    assert {(r.task_id, r.split): r.status for r in results} == {
+        ("good", "train"): "ok",
+        ("good", "test"): "ok",
+        ("shaky", "train"): "wrong_answer",
+        ("shaky", "test"): "format_error",  # right content, formatting the exact match rejects
+        ("broken", "train"): "error",
+        ("broken", "test"): "no_answer",
+        ("slow", "train"): "timeout",
+        ("slow", "test"): "missing",
+        ("prose", "train"): "skipped",
+        ("prose", "test"): "skipped",
+    }
+    wrong = next(r for r in results if (r.task_id, r.split) == ("shaky", "train"))
+    assert (wrong.answer, wrong.expected) == ("SOMETHING ELSE", "TRAIN")
+    crashed = next(r for r in results if (r.task_id, r.split) == ("broken", "train"))
+    assert crashed.returncode == 3
+    assert "scanpy" in crashed.error_tail
+    # stdout is diagnostics, never the answer: a passing script may print whatever it likes.
+    assert next(r for r in results if (r.task_id, r.split) == ("good", "train")).answer == "TRAIN"
+
+
+def test_check_invokes_the_venv_interpreter_by_its_own_path(tmp_path: Path) -> None:
+    """The target venv's ``bin/python`` must not be resolved to the interpreter it links to.
+
+    Python finds its ``pyvenv.cfg`` — and therefore the venv's site-packages — from the path it
+    was invoked by. Following the symlink runs the base interpreter, where the target package is
+    not installed, so every single reproducer would fail with ModuleNotFoundError.
+    """
+    venv = _fake_venv(tmp_path)
+    interpreter = venv / "bin" / "python"
+    scripts = tmp_path / "tasks"
+    scripts.mkdir()
+    (scripts / "venvcheck-train.py").write_text(
+        "import sys\nfrom pathlib import Path\n\nPath('answer.md').write_text(sys.executable)\n"
+    )
+
+    results = check_tasks(
+        [_task("venvcheck", train=str(interpreter))], scripts_root=scripts, python=interpreter, splits=["train"]
+    )
+
+    assert [r.status for r in results] == ["ok"], f"ran {results[0].answer} instead of {interpreter}"
+
+
+def test_check_runs_each_reproducer_in_its_own_empty_directory(tmp_path: Path) -> None:
+    """Two scripts writing answer.md must not read each other's, and neither may litter."""
+    scripts = tmp_path / "tasks"
+    scripts.mkdir()
+    for split, answer in (("train", "TRAIN"), ("test", "TEST")):
+        (scripts / f"solo-{split}.py").write_text(
+            "from pathlib import Path\n"
+            "assert not list(Path.cwd().iterdir()), f'not an empty directory: {list(Path.cwd().iterdir())}'\n"
+            f'Path("answer.md").write_text({answer!r})\n'
+            'Path("scratch.csv").write_text("stray output")\n'
+        )
+    before = sorted(p.name for p in scripts.iterdir())
+
+    results = check_tasks(
+        [_task("solo")],
+        scripts_root=scripts,
+        python=_fake_venv(tmp_path).joinpath("bin", "python"),
+        jobs=2,
+    )
+
+    assert [r.status for r in results] == ["ok", "ok"]
+    assert sorted(p.name for p in scripts.iterdir()) == before
+    assert not (tmp_path / "scratch.csv").exists()
+
+
+def test_summarize_checks_scores_only_the_tasks_that_need_a_script(tmp_path: Path) -> None:
+    scripts = tmp_path / "tasks"
+    scripts.mkdir()
+    (scripts / "good-train.py").write_text(_REPRODUCERS["good-train.py"])
+    (scripts / "good-test.py").write_text(_REPRODUCERS["good-test.py"])
+    (scripts / "shaky-train.py").write_text(_REPRODUCERS["shaky-train.py"])
+    tasks = [_task("good"), _task("shaky"), _task("prose", needs_script=False)]
+
+    results = check_tasks(tasks, scripts_root=scripts, python=_fake_venv(tmp_path).joinpath("bin", "python"), jobs=1)
+    summary = summarize_checks(results, tasks)
+
+    assert (summary.n_splits, summary.n_code_splits, summary.n_non_code_splits) == (6, 4, 2)
+    assert (summary.n_with_script, summary.pct_with_script) == (3, 75.0)
+    assert (summary.n_ok, summary.pct_reproduced) == (2, 50.0)
+    # `good` reproduced on both splits; `shaky` on neither. `prose` is not counted either way.
+    assert (summary.n_code_tasks, summary.n_tasks_reproduced) == (2, 1)
+    assert summary.ok is False
+    assert summary.by_status["skipped"] == 2
+
+
+def test_summary_of_an_all_prose_task_set_is_not_reported_as_zero_percent() -> None:
+    """An empty denominator must read as "nothing to measure", never as "nothing worked"."""
+    tasks = [_task("prose", needs_script=False)]
+    results = check_tasks(tasks, scripts_root=Path("nowhere"), python=Path(sys.executable))
+
+    summary = summarize_checks(results, tasks)
+
+    assert summary.pct_reproduced is None
+    assert summary.pct_tasks_reproduced is None
+    assert summary.ok is True
+
+
+def test_orphan_scripts_flags_a_reproducer_no_task_claims(tmp_path: Path) -> None:
+    """A renamed task id leaves a script that looks like coverage but is never run."""
+    scripts = tmp_path / "tasks"
+    scripts.mkdir()
+    for name in ("kept-train.py", "kept-test.py", "renamed_away-train.py", "notes.txt"):
+        (scripts / name).write_text("pass\n")
+
+    assert orphan_scripts([_task("kept")], scripts) == [scripts / "renamed_away-train.py"]
+    assert orphan_scripts([_task("kept")], tmp_path / "absent") == []
+
+
+def test_script_path_builds_the_name_rather_than_splitting_it() -> None:
+    """Task ids may contain '-', so a filename can never be parsed back apart safely."""
+    assert script_path(Path("tasks"), "bulk-tf-activity", "train") == Path("tasks/bulk-tf-activity-train.py")
+
+
+def test_select_tasks_rejects_an_unknown_id() -> None:
+    tasks = [_task("a"), _task("b")]
+
+    assert [t.id for t in select_tasks(tasks, ["b"])] == ["b"]
+    assert [t.id for t in select_tasks(tasks, None)] == ["a", "b"]
+    with pytest.raises(CheckError, match="unknown task ids"):
+        select_tasks(tasks, ["c"])
+
+
+def test_import_probe_resolves_the_import_name_from_the_distribution() -> None:
+    """`prepare_target` proves the distribution is installed; only an import proves it works.
+
+    The two names differ often enough to matter (`pyyaml` imports as `yaml`), so probing the
+    distribution name verbatim would report a healthy target as broken.
+    """
+    ok, detail = import_probe(Path(sys.executable), "pyyaml")
+    assert ok
+    assert detail.startswith("yaml ")
+
+    broken, why = import_probe(Path(sys.executable), "not-installed-anywhere")
+    assert not broken
+    assert "No module named" in why
+
+
+def test_harvest_keeps_only_the_reproducers_the_tasks_declare(tmp_path: Path) -> None:
+    """What the generator leaves behind is not automatically ground truth worth keeping."""
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    for name in ("code-train.py", "code-test.py", "prose-train.py", "leftover.py"):
+        (staged / name).write_text("pass\n")
+    scripts_root = tmp_path / "project" / "tasks"
+    tasks = [_task("code"), _task("prose", needs_script=False), _task("nocode")]
+
+    harvest = harvest_scripts(tasks, staged, scripts_root)
+
+    assert sorted(p.name for p in harvest.scripts) == ["code-test.py", "code-train.py"]
+    assert sorted(p.name for p in scripts_root.iterdir()) == ["code-test.py", "code-train.py"]
+    # A split that expected a script and got none is a reported gap, not a silent pass.
+    assert harvest.missing == (("nocode", "train"), ("nocode", "test"))
+    # Neither a script for a prose task nor a file matching no task is kept.
+    assert harvest.unexpected == ("leftover.py", "prose-train.py")
+
+
+def test_harvest_leaves_no_directory_behind_when_there_is_nothing_to_keep(tmp_path: Path) -> None:
+    """The project is only touched once there is a reproducer to put in it.
+
+    ``generate_tasks`` harvests after the generated tasks validate, so a rejected generation
+    must leave the project exactly as it was — not an empty ``tasks/`` implying coverage.
+    """
+    scripts_root = tmp_path / "project" / "tasks"
+
+    harvest = harvest_scripts([_task("code")], tmp_path / "staged-that-never-existed", scripts_root)
+
+    assert harvest.scripts == ()
+    assert harvest.missing == (("code", "train"), ("code", "test"))
+    assert not scripts_root.exists()
+
+
+# --- reviewing task coherence ----------------------------------------------------------
+
+
+def _result(task_id: str, split: str, status: str = "ok", **kwargs) -> CheckResult:
+    """A CheckResult as `check_task_split` builds them: `expected` is always the recorded answer."""
+    default = "TRAIN" if split == "train" else "TEST"
+    return CheckResult(
+        task_id=task_id,
+        split=split,
+        status=status,
+        script=kwargs.pop("script", None),
+        # `answer` is what the script wrote, so it is None when none ran; `expected` comes from
+        # tasks.yaml and is therefore always present.
+        answer=kwargs.pop("answer", default),
+        expected=kwargs.pop("expected", default),
+        seconds=1.0,
+        **kwargs,
+    )
+
+
+def test_parse_reviews_maps_verdicts_onto_the_rows_that_were_reviewed() -> None:
+    rows = [_result("bulk", "train"), _result("bulk", "test")]
+    raw = {
+        "reviews": [
+            {"task": "bulk", "split": "train", "verdict": "ok"},
+            {
+                "task": "bulk",
+                "split": "test",
+                "verdict": "mismatch",
+                "issue": "prompt says ascending; script and answer are descending",
+                "fix": "say descending in the prompt",
+            },
+        ]
+    }
+
+    verdicts, warnings = parse_reviews(raw, rows)
+
+    assert [(v.task_id, v.split, v.status) for v in verdicts] == [
+        ("bulk", "train", "ok"),
+        ("bulk", "test", "mismatch"),
+    ]
+    assert verdicts[1].issue.startswith("prompt says ascending")
+    assert verdicts[1].fix == "say descending in the prompt"
+    assert warnings == []
+
+
+def test_parse_reviews_enforces_brevity_rather_than_trusting_it() -> None:
+    """The prompt asks for one short clause; the table stays readable when it does not comply."""
+    rows = [_result("bulk", "train")]
+    raw = {
+        "reviews": [
+            {
+                "task": "bulk",
+                "split": "train",
+                "verdict": "mismatch",
+                "issue": "the prompt\n  spans several\n  lines " + "x" * 400,
+                "fix": "short",
+            }
+        ]
+    }
+
+    (verdict,), _warnings = parse_reviews(raw, rows)
+
+    assert "\n" not in verdict.issue
+    assert len(verdict.issue) <= MAX_NOTE_CHARS
+    assert verdict.issue.startswith("the prompt spans several lines")
+
+
+def test_parse_reviews_degrades_instead_of_discarding_a_good_deterministic_run() -> None:
+    """A review is a judgement layered on results that already stand on their own.
+
+    So every way the agent can be sloppy has to survive as a warning plus an `unreviewed` row,
+    never as an exception that throws away half an hour of reproducer runs.
+    """
+    rows = [_result("bulk", "train"), _result("bulk", "test"), _result("scell", "train")]
+    raw = {
+        "reviews": [
+            {"task": "bulk", "split": "train", "verdict": "mismatch"},  # flagged, no reason
+            {"task": "bulk", "split": "test", "verdict": "ok"},
+            {"task": "bulk", "split": "test", "verdict": "mismatch"},  # duplicate
+            {"task": "ghost", "split": "train", "verdict": "ok"},  # not under review
+            {"task": "scell", "split": "train", "verdict": "probably fine"},  # not a verdict
+            "not a mapping at all",
+        ]
+    }
+
+    verdicts, warnings = parse_reviews(raw, rows)
+
+    assert [v.status for v in verdicts] == ["mismatch", "ok", "unreviewed"]
+    joined = " | ".join(warnings)
+    assert "bulk/train was flagged with no reason given" in joined
+    assert "reviewed twice; keeping the first" in joined
+    assert "'ghost'" in joined and "not under review" in joined
+    assert "not 'ok' or 'mismatch'" in joined
+    assert "is not a mapping" in joined
+    assert "no verdict for scell/train" in joined
+
+
+def test_parse_reviews_treats_a_verdict_file_with_no_reviews_as_nothing_reviewed() -> None:
+    rows = [_result("bulk", "train")]
+
+    for raw in ({}, {"reviews": "nope"}, []):
+        verdicts, warnings = parse_reviews(raw, rows)
+        assert [v.status for v in verdicts] == ["unreviewed"]
+        assert "wrote no 'reviews' list" in warnings[0]
+
+
+def test_parse_reviews_drops_commentary_on_a_task_that_holds_together() -> None:
+    """An `ok` verdict has nothing to say, so a stray note on one is not shown."""
+    rows = [_result("bulk", "train")]
+    raw = {"reviews": [{"task": "bulk", "split": "train", "verdict": "ok", "issue": "looks nice", "fix": "none"}]}
+
+    (verdict,), warnings = parse_reviews(raw, rows)
+
+    assert (verdict.issue, verdict.fix) == (None, None)
+    assert warnings == []
+
+
+def test_review_packet_copies_everything_and_points_nowhere_near_the_project(tmp_path: Path) -> None:
+    """The reviewer must not be able to reach tasks.yaml or the real tasks/ tree.
+
+    It knows the test-split answers, so a path back into the project is the one thing that
+    could turn it into a leak. Copies, and a digest that names scripts by filename only.
+    """
+    project = tmp_path / "project"
+    scripts = project / "tasks"
+    scripts.mkdir(parents=True)
+    (scripts / "bulk-train.py").write_text("# the real reproducer\nprint('hi')\n")
+    (project / "tasks.yaml").write_text("tasks: []\n")
+    tasks = [_task("bulk", train="FOXD1", test="FOXO1"), _task("prose", needs_script=False)]
+    results = [
+        _result("bulk", "train", script=scripts / "bulk-train.py", answer="FOXD1", expected="FOXD1"),
+        _result("bulk", "test", "wrong_answer", answer="SOMETHING", expected="FOXO1"),
+        _result("prose", "train", "skipped", answer=None, expected="BSD"),
+    ]
+    packet = tmp_path / "work" / "review"
+
+    written = write_packet(packet, tasks, results)
+
+    assert [(r.task_id, r.split) for r in written] == [("bulk", "train"), ("bulk", "test"), ("prose", "train")]
+    digest = (packet / PACKET_DIGEST).read_text()
+    # Every split's prompt, recorded answer and outcome are in the digest.
+    assert "## bulk / train" in digest and "## prose / train" in digest
+    assert "do the thing" in digest and "FOXD1" in digest and "BSD" in digest
+    assert "reproduced the recorded answer exactly" in digest
+    assert "produced `SOMETHING`, NOT the recorded answer" in digest
+    # The script is copied in, and named relatively.
+    assert (packet / PACKET_SCRIPTS / "bulk-train.py").read_text() == "# the real reproducer\nprint('hi')\n"
+    assert f"`{PACKET_SCRIPTS}/bulk-train.py`" in digest
+    # Nothing anywhere in the packet points back at the project.
+    for path in packet.rglob("*"):
+        if path.is_file():
+            assert str(project) not in path.read_text(), f"{path} leaks a path into the project"
+    # Train and test differ on purpose; the digest has to say so or the reviewer flags the design.
+    assert "differ on purpose" in digest
+
+
+def test_review_packet_explains_a_split_with_no_script(tmp_path: Path) -> None:
+    """A missing or unrunnable reproducer still leaves prompt vs answer worth reviewing."""
+    packet = tmp_path / "review"
+    tasks = [_task("gone"), _task("broken")]
+    results = [
+        _result("gone", "train", "missing", answer=None),
+        _result("broken", "train", "error", answer=None, returncode=1),
+    ]
+
+    write_packet(packet, tasks, results)
+
+    digest = (packet / PACKET_DIGEST).read_text()
+    assert "There is no reproducer for this split" in digest
+    assert "The script failed to run" in digest
+    assert not list((packet / PACKET_SCRIPTS).iterdir())
+
+
+def _review_target(tmp_path: Path) -> Target:
+    """A target whose source and venv exist, so the reviewer's read roots resolve."""
+    src = tmp_path / "src"
+    src.mkdir(exist_ok=True)
+    return Target(
+        source="target",
+        ref="main",
+        src_dir=src,
+        venv_dir=_fake_venv(tmp_path),
+        commit="abc1234",
+        pkg_name="target",
+        pkg_version="1.0",
+    )
+
+
+def _agent_result() -> AgentResult:
+    return AgentResult(
+        is_error=False,
+        subtype="success",
+        result="done",
+        num_turns=6,
+        duration_ms=1000,
+        total_cost_usd=0.25,
+        usage=None,
+        session_id="s",
+        provider="claude",
+        errors=None,
+    )
+
+
+def test_review_tasks_hands_the_agent_a_packet_and_reads_its_verdicts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, object] = {}
+
+    async def fake_run_agent(prompt, *, options, on_event=None):
+        seen["prompt"] = prompt
+        seen["read_dirs"] = options.read_dirs
+        seen["discover_skills"] = options.discover_skills
+        # The packet the agent is told to read must actually be there before it runs.
+        digest = options.cwd / PACKET_DIRNAME / PACKET_DIGEST
+        seen["digest"] = digest.read_text()
+        (options.cwd / REVIEW_FILE).write_text(
+            json.dumps(
+                {
+                    "reviews": [
+                        {"task": "bulk", "split": "train", "verdict": "ok"},
+                        {
+                            "task": "bulk",
+                            "split": "test",
+                            "verdict": "mismatch",
+                            "issue": "prompt says ascending; script is descending",
+                            "fix": "say descending",
+                        },
+                    ]
+                }
+            )
+        )
+        return _agent_result()
+
+    monkeypatch.setattr("acumen.review.run_agent", fake_run_agent)
+    monkeypatch.setattr("acumen.review.build_agent_env", lambda **_kwargs: {})
+    target = _review_target(tmp_path)
+    tasks = [_task("bulk")]
+    results = [_result("bulk", "train"), _result("bulk", "test")]
+
+    review = asyncio.run(
+        review_tasks(
+            cfg=parse_config({"repo": "/tmp/target-demo", "check_model": "claude-opus-5"}),
+            target=target,
+            tasks=tasks,
+            results=results,
+        )
+    )
+
+    assert review.status_for("bulk", "train") == "ok"
+    assert review.status_for("bulk", "test") == "mismatch"
+    assert [v.task_id for v in review.flagged] == ["bulk"]
+    assert review.cost_usd == 0.25
+    assert review.turns == 6
+    assert review.warnings == ()
+    # The prompt points at the staged packet, and the reviewer gets the package like the drafter.
+    assert PACKET_DIRNAME in str(seen["prompt"])
+    assert seen["read_dirs"] == (target.src_dir, target.venv_dir)
+    # A skill shipped by the target must not colour its own tasks' review.
+    assert seen["discover_skills"] is False
+    assert "## bulk / train" in seen["digest"]
+
+
+def test_review_tasks_refuses_to_call_an_unreviewed_task_set_reviewed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An agent that writes nothing must raise, not return a table of silent passes."""
+
+    async def writes_nothing(prompt, *, options, on_event=None):
+        return _agent_result()
+
+    monkeypatch.setattr("acumen.review.run_agent", writes_nothing)
+    monkeypatch.setattr("acumen.review.build_agent_env", lambda **_kwargs: {})
+
+    with pytest.raises(ReviewError, match=f"did not write {REVIEW_FILE}"):
+        asyncio.run(
+            review_tasks(
+                cfg=parse_config({"repo": "/tmp/target-demo"}),
+                target=_review_target(tmp_path),
+                tasks=[_task("bulk")],
+                results=[_result("bulk", "train")],
+            )
+        )
+
+
+def test_review_tasks_reports_unparseable_output_as_a_failed_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def writes_junk(prompt, *, options, on_event=None):
+        (options.cwd / REVIEW_FILE).write_text("this is not JSON {")
+        return _agent_result()
+
+    monkeypatch.setattr("acumen.review.run_agent", writes_junk)
+    monkeypatch.setattr("acumen.review.build_agent_env", lambda **_kwargs: {})
+
+    with pytest.raises(ReviewError, match="not readable JSON"):
+        asyncio.run(
+            review_tasks(
+                cfg=parse_config({"repo": "/tmp/target-demo"}),
+                target=_review_target(tmp_path),
+                tasks=[_task("bulk")],
+                results=[_result("bulk", "train")],
+            )
+        )
+
+
+def test_check_model_defaults_to_the_first_benchmark_model() -> None:
+    """Same rule as every other meta-agent model, so one `models:` line configures the lot."""
+    cfg = parse_config({"repo": "/tmp/target-demo", "models": ["gpt-5.6-sol", "claude-opus-5"]})
+    assert cfg.check_model == "gpt-5.6-sol"
+
+    named = parse_config({"repo": "/tmp/target-demo", "check_model": "claude-haiku-4-5-20251001"})
+    assert named.check_model == "claude-haiku-4-5-20251001"

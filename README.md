@@ -21,6 +21,9 @@ that loop: point it at a Python package and a few tasks, and it drafts a skill, 
 against a no-skill baseline, and improves it across a train/test split so the gains are real
 generalization, not memorized answers.
 
+- **`acumen check`** — rerun the script behind each task's answer, then have an agent judge
+  whether the prompt actually asks for what that script and answer produce. Both before a
+  benchmark pass pays to find out.
 - **`acumen draft`** — write `skills/v1` from the package's own source.
 - **`acumen bench`** — score a skill against a no-skill baseline, in a scrubbed sandbox where
   the skill is the only difference between arms.
@@ -40,7 +43,8 @@ rather than genuinely helping.
 acumen init
 
 # 2. Fill in config.yaml (repo). Write tasks.yaml by hand, or generate it:
-acumen tasks                     # mine the package for real analyses -> tasks.yaml
+acumen tasks                     # mine the package for real analyses -> tasks.yaml + tasks/
+acumen check                     # is the ground truth right, and does each prompt ask for it?
 
 # 3. Then run the loop:
 acumen bench --no-skill          # the baseline arm
@@ -60,6 +64,68 @@ acumen ship --skill v2           # add a <dist>-install-skills console script (P
 agent the user names — `--agent {claude,codex,agents,claude-science}`, or an explicit `--dest` —
 so the package's own users get the guidance with one command, wherever they run their agent. The
 same bundle installs verbatim into every framework.
+
+## Checking the ground truth
+
+A task is only worth benchmarking if its recorded answer is actually correct. A wrong answer makes
+every model fail that task: real money spent, and the failure reads in the report as the model's
+fault rather than the task's. `acumen check` catches the two ways that happens.
+
+**Does the answer still come out of running the code?** Each task keeps a **reproducer** at
+`tasks/<id>-<split>.py`, a self-contained script that redoes the analysis in the target venv and
+writes its answer to `answer.md` — the same contract a benchmark run has, graded the same way.
+`acumen tasks` writes them as it generates the tasks; `acumen check` reruns them:
+
+```bash
+acumen check                                 # every task, both splits
+acumen check --task bulk --split train       # one cell, while you fix it
+acumen check --jobs 8 --timeout 600          # or: --keep to inspect what a script wrote
+```
+
+You get one row per task and split — reproduced, wrong answer, script error, timed out, or no
+script at all — then the summary statistics: how much of the task set has a reproducer, how much
+of it reproduces, and how many tasks reproduce on both splits. Before running anything it checks
+that the package imports in the venv at all, since that one failure would otherwise be reported
+once per task.
+
+**Does the prompt actually ask for what the script and answer produce?** Reproducing an answer
+proves the code and the answer agree. It says nothing about the prompt, and a prompt describing
+something else fails every agent that reads it correctly. A real example:
+
+> Find the 3 most deactivated PROGENy pathways in Megakaryocytes … Report only the pathway names
+> sorted by score **(ascending)**.
+
+The script sorted descending, the recorded answer was descending, the reproducer check said `ok` —
+and every agent that honoured the prompt produced the reverse order and was graded wrong. So after
+the scripts run, one agent reads every split's prompt, recorded answer and reproducer together and
+adds a `review` column of `ok` or `mismatch`, with one line naming the contradiction and one naming
+the fix. It never edits `tasks.yaml`: which of the three artifacts to repair is your call.
+
+```
+task     split  status  review    detail
+scell    train  ok      ok        MAPK;Estrogen;TGFb
+scell    test   ok      mismatch  Trail;JAK-STAT;Estrogen
+
+1 split the review flagged
+  scell/test    prompt says ascending; script and answer are descending
+                fix: say descending in the prompt, or reverse the answer
+```
+
+The review is on by default and picks its model from `check_model`; it is the one phase that costs
+money, so `acumen check --no-review` runs the reproducers alone and spends nothing — what you want
+while iterating on a script. `check` takes the same `--auth`, `--stream` and `--log-dir` flags as
+the other agentic commands, and `--max-turns`/`--max-usd` bound the reviewer.
+
+Either phase failing exits non-zero, so `acumen check` works as a gate before a pass.
+
+A task that needs no code to answer (a licence, a supported species, a documented default) sets
+`needs_script: false`; its reproducer column reads `n/a` rather than counting as a gap, and its
+prompt and answer are still reviewed.
+
+The reproducers hold the answers to the held-out test split, so nothing must feed them to an agent
+under test. They are safe where they are: `bench`, `draft`, and `improve` confine their agents to
+explicit read roots that never include your project directory, and the reviewer reads a staged copy
+with no path back to `tasks.yaml`.
 
 `acumen tasks`, `acumen draft`, and `acumen improve` each accept `--feedback "…"` to steer the
 agent with context it can't infer — which functionality to skip when generating tasks, what a
@@ -131,8 +197,8 @@ move, and each run's cost is frozen into its `result.json` and never recomputed,
 compiled into a release would store numbers that were already wrong. `bench` resolves rates
 before it spends anything and **fails the pass** if the pages cannot be read: cost is a headline
 metric, and a benchmark that cannot establish rates has not earned the numbers it would print.
-`draft`, `improve`, `tasks`, and `ship` fetch too but degrade to unpriced instead — their cost
-line is progress reporting, not stored evidence.
+`draft`, `improve`, `tasks`, `check`, and `ship` fetch too but degrade to unpriced instead — their
+cost line is progress reporting, not stored evidence.
 
 Alongside the rates themselves each run records `price_source` (`config` or `fetched`) and
 `price_rates_as_of`, so a pass run in August and another in October stay individually
@@ -157,10 +223,11 @@ free.
 > unpriced model under Codex has no enforceable budget cap. Bound those runs with `max_turns`,
 > or pin the rates.
 
-`draft`, `improve`, `tasks`, and `ship` each drive a long autonomous agent. Every run writes a
-live `logs/acumen-<command>-<datetime>.jsonl` (one event per step, flushed as it goes — so you
-can watch progress by reading the file) and a rendered `.html` transcript. Add `--stream` to
-mirror the conversation to the terminal, or `--log-dir` to change where the logs land.
+`draft`, `improve`, `tasks`, `ship`, and `check`'s review phase each drive an autonomous agent.
+Every run writes a live `logs/acumen-<command>-<datetime>.jsonl` (one event per step, flushed as it
+goes — so you can watch progress by reading the file) and a rendered `.html` transcript. Add
+`--stream` to mirror the conversation to the terminal, or `--log-dir` to change where the logs
+land.
 
 ## Getting started
 

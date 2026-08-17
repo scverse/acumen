@@ -351,12 +351,33 @@ analysis with two different correct answers — so a skill cannot pass by memori
 # Ground truth by execution
 
 Get each answer by actually DOING the analysis in the venv with `{python}` and reading the real
-result — never from a tutorial's printed output or the docs. Your scratch scripts stay in this
-working directory and are discarded; only the tasks written to `{out}` are kept, so the
-benchmarked agent must rederive everything from the goal alone. Before recording an answer,
-confirm the goal has exactly ONE defensible answer: if a competent analyst could read the goal
-two ways and get two results, tighten only the OUTPUT sentence (what to report, or its
-precision) until one answer stands — never by adding back instructions.
+result — never from a tutorial's printed output or the docs. Before recording an answer, confirm
+the goal has exactly ONE defensible answer: if a competent analyst could read the goal two ways
+and get two results, tighten only the OUTPUT sentence (what to report, or its precision) until
+one answer stands — never by adding back instructions.
+
+# Keep the script that produced each answer — it is a deliverable
+
+The script you run to obtain an answer is NOT scratch. Save one per split to
+`{scripts_dir}/<id>-<split>.py`, using the SAME `id` you gave the task in `{out}` — so the task
+`bulk` needs `{scripts_dir}/bulk-train.py` and `{scripts_dir}/bulk-test.py`. These are what
+`acumen check` reruns later to confirm the answer still holds, so each one must:
+
+- Be SELF-CONTAINED and runnable from ANY empty working directory: `<python> <script>` with no
+  arguments, no setup, no input files. Do not read or write anything outside the working
+  directory it is started in, do not depend on files you leave in this directory, and do not
+  depend on another script having run first.
+- Write the answer, and NOTHING else, to `answer.md` in its working directory — exactly the
+  string you record as that split's `answer`, with no label, heading, code fence, or markup.
+  Progress messages and diagnostics go to stdout/stderr instead, where they are ignored.
+- Install nothing. Use only what is already in the venv.
+- Be deterministic. If a step involves randomness, set the seed inside the script so the answer
+  is the same on every rerun.
+
+Confirm each script by running it in an empty directory and reading the `answer.md` it produced;
+the `answer` you record is that file's exact content. A task that needs no code at all to answer
+(a licence, a supported species, a fact stated in the docs) gets `needs_script: false` in the
+task and no script.
 
 # What you must write
 
@@ -375,17 +396,104 @@ tasks:
       answer: "<the exact answer string the real test run produced>"
 
 `id` must be unique across all tasks. Both `train` and `test` are required, each with a
-non-empty `prompt` and a non-empty `answer`. Do not add other keys unless you deliberately
-want a per-task override (`max_turns`, `max_usd`, or `model` are the only ones allowed).
+non-empty `prompt` and a non-empty `answer`. Add `needs_script: false` at the task level (a
+sibling of `id`) only for a task that needs no code to answer; it defaults to true and is then
+omitted. Do not add other keys unless you deliberately want a per-task override (`max_turns`,
+`max_usd`, or `model` are the only ones allowed).
 {feedback}
 # Before you finish
 
-- Every `answer` is the real output of a script you ran in the venv — not a guess, not lifted
-  from docs.
+- Every `answer` is the exact content of the `answer.md` written by the script you ran in the
+  venv — not a guess, not lifted from docs.
+- Every task with `needs_script` unset has BOTH `{scripts_dir}/<id>-train.py` and
+  `{scripts_dir}/<id>-test.py`, each verified by running it in an empty directory.
 - Every prompt is ONE paragraph: a goal in plain English, with no steps, no code, no package
   name, no version, no data description — only the goal and a precise statement of the output.
 - You wrote at least one task per tutorial, and covered all of them.
 - `{out}` exists and parses as the YAML above with at least one task.
+"""
+
+
+REVIEW_PROMPT = """\
+You are reviewing a benchmark of analysis tasks for a Python package (`{package}` {version}) for
+INTERNAL CONSISTENCY. Each task states a goal in plain language, records the single answer a
+correct analysis produces, and (usually) ships a reproducer script that recomputes that answer.
+
+Your one question, for each task split: **do the prompt, the recorded answer, and the script
+describe the same thing?** When they do not, every agent that reads the prompt correctly is
+graded wrong, and a whole benchmark pass measures the task's phrasing instead of the model. That
+is what you are here to catch, and nothing else.
+
+# What you are given
+
+- `{packet_dir}/TASKS.md` lists every task split: its prompt verbatim, the answer recorded for
+  it, what happened when acumen ran its reproducer, and the script's filename.
+- `{packet_dir}/scripts/` holds those reproducers. Read the ones you are judging.
+- The package's source is at `{src}` and the package is installed; run `{python}` if you need it.
+
+# Do not redo the analysis
+
+acumen has ALREADY run every reproducer and told you the outcome in `TASKS.md`. Do not rerun a
+pipeline and do not recompute an answer — that work is done and repeating it is what makes this
+review expensive. You may read the source, or run a couple of lines, to confirm what a function
+returns or which sign convention it uses. That is the limit.
+
+# What counts as a mismatch
+
+- **The prompt's stated order or direction disagrees with the script or the answer.** The prompt
+  says ascending where the script sorts descending; it asks for the most X where the script takes
+  the least; the recorded answer is in the opposite order from the one the prompt requests. This
+  is the most common defect and the easiest to read past, so check it on every split that states
+  an ordering.
+- **The prompt asks about something else than the script does**: a different dataset, group, cell
+  type, condition, statistic, or a different number of items.
+- **The answer's FORM is not what the prompt asks for**: the wrong separator, more or fewer items
+  than requested, a different rounding or precision, a name where a number was asked for.
+- **The prompt cannot be answered as written**: it names a dataset, field, or capability the
+  package does not have, so no correct analysis reaches the recorded answer.
+
+# What is NOT a mismatch
+
+- **Train and test differ on purpose.** They are two instances of one analysis with two different
+  answers, deliberately asking about different groups, conditions, datasets, or directions. A
+  difference between the two splits is the design, not a defect.
+- **A terse prompt naming no function, parameter, or output field.** Working out HOW is exactly
+  what the benchmark tests; a prompt that only states the goal is correct by design.
+- **A script that is longer, slower, or less elegant than it needs to be.** You are not reviewing
+  code quality.
+- **A reproducer that merely failed to run** (a crash, a missing script, a timeout). That is
+  already reported. Judge only whether the artifacts you CAN read contradict each other; if a
+  split has no script, review its prompt against its recorded answer alone.
+
+# Be brief — that is the deliverable
+
+For a mismatch, `issue` names the contradiction in one short clause and `fix` names what to
+change in one short clause. Do NOT rewrite the prompt, do not quote it back, do not explain the
+analysis, and do not suggest improvements to a task that holds together. Anything past one line
+is truncated, so put the contradiction first. Say nothing at all for a verdict of `ok`.
+
+# What you must write
+
+Write `{out}` as JSON with exactly this shape, with ONE entry for every task split listed in
+`TASKS.md` and no other keys:
+
+{{"reviews": [
+  {{"task": "<task id>", "split": "train", "verdict": "ok"}},
+  {{"task": "<task id>", "split": "test", "verdict": "mismatch",
+   "issue": "prompt says ascending; script and answer are descending",
+   "fix": "say descending in the prompt, or reverse the answer"}}
+]}}
+
+`verdict` is `"ok"` or `"mismatch"` — there is no third value. `issue` and `fix` are required on
+every `mismatch` and omitted on every `ok`. A verdict of `mismatch` with no reason cannot be
+acted on, and a task you are unsure about is `ok`: say `mismatch` only where you can name the
+contradiction.
+
+# Before you finish
+
+- `{out}` exists, parses as the JSON above, and has one entry per split in `TASKS.md`.
+- Every `mismatch` names a contradiction you actually read in the artifacts, not one you suspect.
+- No `issue` or `fix` is longer than one short clause.
 """
 
 
@@ -826,7 +934,9 @@ def improve_prompt(
     )
 
 
-def taskgen_prompt(*, package: str, src: Path, python: Path, out: Path, feedback: str | None = None) -> str:
+def taskgen_prompt(
+    *, package: str, src: Path, python: Path, out: Path, scripts_dir: Path, feedback: str | None = None
+) -> str:
     """Build the prompt for the task-generation agent.
 
     Like the drafter, the generator gets read access to the target's source — it must
@@ -847,6 +957,10 @@ def taskgen_prompt(*, package: str, src: Path, python: Path, out: Path, feedback
         The interpreter with the package installed, used to run pipelines for ground truth.
     out
         The ``tasks.yaml`` file the agent writes into its working directory.
+    scripts_dir
+        Where the agent saves the reproducer script for each split. Unlike everything else in
+        its working directory these are harvested and kept, because ``acumen check`` reruns them
+        to confirm the answers still hold.
     feedback
         Optional maintainer guidance, subordinated below the hard rules — e.g. functionality to
         skip. ``None`` leaves the prompt byte-identical to a run without the flag.
@@ -861,7 +975,47 @@ def taskgen_prompt(*, package: str, src: Path, python: Path, out: Path, feedback
         python=python,
         out=out,
         out_dir=out.parent,
+        scripts_dir=scripts_dir,
         feedback=feedback_block(feedback),
+    )
+
+
+def review_prompt(*, package: str, version: str, src: Path, python: Path, packet_dir: Path, out: Path) -> str:
+    """Build the prompt for the task-review agent.
+
+    The reviewer judges whether each task's prompt, recorded answer, and reproducer script agree
+    with each other. It reads a staged packet acumen writes (never the project's own files) plus
+    the target's source and venv, since deciding whether a prompt describes what a script computes
+    can need the package's own semantics — which direction a statistic runs, what a function
+    returns.
+
+    It is deliberately told not to rerun the pipelines: acumen has already run every reproducer
+    and hands the outcome over in the packet, so recomputing answers is pure cost.
+
+    Parameters
+    ----------
+    package, version
+        The target's name and installed version, for orientation.
+    src
+        The package checkout, readable by this agent.
+    python
+        The interpreter with the package installed, for confirming an API's behaviour.
+    packet_dir
+        The staged review packet: ``TASKS.md`` plus copies of the reproducers.
+    out
+        The JSON verdict file the agent writes.
+
+    Returns
+    -------
+    The review prompt.
+    """
+    return REVIEW_PROMPT.format(
+        package=package,
+        version=version,
+        src=src,
+        python=python,
+        packet_dir=packet_dir,
+        out=out,
     )
 
 

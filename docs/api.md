@@ -1,6 +1,6 @@
 # API
 
-acumen is a CLI (`acumen init/tasks/draft/bench/improve/report/ship`) that is a thin shell over
+acumen is a CLI (`acumen init/tasks/check/draft/bench/improve/report/ship`) that is a thin shell over
 an importable Python API. Everything below is re-exported from the top-level `acumen` package,
 so `from acumen import build_report` works.
 
@@ -39,9 +39,53 @@ so `from acumen import build_report` works.
     generate_tasks
     TaskGenResult
     dump_tasks
+    harvest_scripts
+    Harvest
     build_filtered_source
     find_skill_access
     make_skill_guard
+```
+
+## Checking task ground truth
+
+`acumen check` runs in two phases, because a task can be broken in two ways.
+
+The first is deterministic and spends nothing: run the reproducer for each task and split —
+`tasks/<id>-<split>.py`, which writes its answer to `answer.md` the way a benchmark run does — in
+the target venv, and grade it against the answer recorded in `tasks.yaml`. A task that needs no
+code to answer sets `needs_script: false` and is reported as `skipped`.
+
+```{eval-rst}
+.. autosummary::
+    :toctree: generated
+
+    check_tasks
+    check_task_split
+    run_reproducer
+    summarize_checks
+    CheckResult
+    CheckSummary
+    ScriptRun
+    script_path
+    orphan_scripts
+    select_tasks
+    import_probe
+```
+
+The second is agentic: reproducing the answer proves the code and the answer agree, not that the
+*prompt* asks for what they produce. One agent reads every split's prompt, recorded answer and
+reproducer together and returns `ok` or `mismatch`, with one line naming the contradiction and one
+naming the fix. `--no-review` skips it.
+
+```{eval-rst}
+.. autosummary::
+    :toctree: generated
+
+    review_tasks
+    ReviewResult
+    ReviewVerdict
+    parse_reviews
+    write_packet
 ```
 
 ## Target environment and sandboxing

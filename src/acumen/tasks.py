@@ -33,6 +33,11 @@ class Task:
     max_turns: int | None = None
     max_usd: float | None = None
     model: str | None = None
+    #: Whether this task's answers are reproducible by running code. ``acumen check`` expects
+    #: a reproducer script per split for such a task and reports a missing one as a gap; a task
+    #: that needs none (a licence, a species name, a fact from the docs) sets this ``False``.
+    #: Task-level, not per-split: both splits of one task are the same analysis.
+    needs_script: bool = True
 
     def split(self, split: Split) -> TaskSplit:
         """Return the ``train`` or ``test`` half of this task."""
@@ -65,7 +70,7 @@ def _parse_task(raw: Any, index: int) -> Task:
     where = f"tasks[{index}]"
     if not isinstance(raw, dict):
         raise TaskError(f"{where} must be a mapping, got {type(raw).__name__}")
-    unknown = set(raw) - {"id", "train", "test", "max_turns", "max_usd", "model"}
+    unknown = set(raw) - {"id", "train", "test", "max_turns", "max_usd", "model", "needs_script"}
     if unknown:
         raise TaskError(f"{where} has unknown keys: {sorted(unknown)}")
     if "id" not in raw:
@@ -88,6 +93,11 @@ def _parse_task(raw: Any, index: int) -> Task:
     model = raw.get("model")
     if model is not None:
         model = _require_str(model, f"{where}.model")
+    needs_script = raw.get("needs_script", True)
+    # Strictly a bool: `needs_script: 1` or `"no"` would silently mean something the author
+    # did not write, and this key decides whether a missing reproducer is a gap or expected.
+    if not isinstance(needs_script, bool):
+        raise TaskError(f"{where}.needs_script must be true or false, got {needs_script!r}")
     return Task(
         id=task_id,
         train=_parse_split(raw["train"], f"{where}.train"),
@@ -95,6 +105,7 @@ def _parse_task(raw: Any, index: int) -> Task:
         max_turns=max_turns,
         max_usd=max_usd,
         model=model,
+        needs_script=needs_script,
     )
 
 

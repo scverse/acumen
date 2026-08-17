@@ -12,6 +12,32 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- Review each task for internal consistency in `acumen check`, in a second phase after the
+  reproducers run: one agent reads every split's prompt, recorded answer and reproducer
+  together and adds an `ok`/`mismatch` column, with one line naming the contradiction and one
+  naming the fix. Reproducing an answer only proves the code and the answer agree; a prompt
+  asking for something else — ordering, statistic, group, count, or answer format — fails every
+  agent that reads it correctly, and costs a whole pass to discover. The reviewer reads a staged
+  copy of the task set with no path back to `tasks.yaml`, never edits a task, and picks its model
+  from the new `check_model` config key. `--no-review` runs the reproducers alone and spends
+  nothing.
+- Add `acumen check`, which verifies every task's ground truth by rerunning the script that
+  produced it. Each task keeps a reproducer at `tasks/<id>-<split>.py` that redoes the
+  analysis in the target venv and writes its answer to `answer.md`, graded by the same
+  comparison a benchmark run gets. The command reports a row per task and split, the summary
+  statistics (share of the task set with a reproducer, share that reproduces, tasks that
+  reproduce on both splits), and exits non-zero if anything did not, so a wrong answer or a
+  broken pipeline is caught before a pass pays to discover it. It probes that the package
+  imports at all before running anything, since that failure would otherwise be reported once
+  per task.
+- Keep the scripts `acumen tasks` runs to obtain each answer instead of discarding them: the
+  generator now writes one reproducer per split into `--scripts` (default `tasks/`), and
+  reports any split it left without one. An answer nothing can recompute is an answer nobody
+  can check.
+- Add an optional task-level `needs_script` key to `tasks.yaml`, defaulting to true. A task
+  that needs no code to answer sets it false and is reported as not applicable by
+  `acumen check` rather than as a missing reproducer.
+
 - Run Claude and Codex models side by side in benchmark matrices and use either
   provider for drafting, improving, task generation, and shipping.
 - Compute `cost_usd` from each run's token breakdown rather than the provider's own
@@ -41,6 +67,21 @@ and this project adheres to [Semantic Versioning][].
   pass at planning rather than being dropped from the comparison.
 
 ### Changed
+
+- Order the report's cost-vs-success figure with arrows instead of marker shapes. Skill
+  versions are a sequence, so each model's own marks are now joined baseline to v1 to v2 and
+  on, in that model's colour and never crossing to another model, with the pooled grey marks
+  carrying their own chain. Shape is left to say only whether a mark is a skill or the
+  baseline, which frees the version labels off the panel entirely: nothing is named in place,
+  and the key holds two marks and an arrow however many versions ran. Every hop is drawn and
+  every hop is straight, leaving one mark's rim and landing on the next; two versions that
+  landed on the same result simply hide their arrow under the overlap, which is the reading.
+  The pooled mark is now the size of every other one, set apart by its colour and its error
+  bars alone, since drawn larger it read as a bigger measurement rather than a summary.
+- Run the Pareto staircase out to the right edge of the cost-vs-success panel, and dash it. It
+  stopped at the dearest frontier mark, which left the stretch beyond it looking like open
+  ground when paying more than the best mark cannot buy less than it did; dashing separates a
+  line no run lies along from the arrows, which are drawn between marks that do.
 
 - Make both backends optional, so a Claude-only and a Codex-only install are each complete:
   the Claude Agent SDK moves to the `claude` extra (`pip install acumen[claude]`, or

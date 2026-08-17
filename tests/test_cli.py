@@ -9,11 +9,15 @@ single token is spent.
 from __future__ import annotations
 
 import csv
+import json
+import os
+import sys
 from datetime import date
 from pathlib import Path
 
 import pytest
 
+from acumen.agents import AgentError
 from acumen.bench import BenchmarkInvalidError
 from acumen.cli import _agent_prices, _Progress, build_parser, main
 from acumen.config import load_config
@@ -21,6 +25,7 @@ from acumen.env import Target
 from acumen.paths import RunKey
 from acumen.pricefeed import PriceFeedError
 from acumen.prices import Rates
+from acumen.review import ReviewError, ReviewResult, ReviewVerdict
 from acumen.runner import RunOutcome
 from acumen.tasks import load_tasks
 
@@ -633,3 +638,302 @@ def test_agent_commands_keep_working_when_pricing_is_unavailable(
     err = capsys.readouterr().err
     assert "reports no cost" in err
     assert "max_usd cannot be enforced" in err, "the Codex budget-cap consequence must be named"
+
+
+def _stub_target(project: Path, monkeypatch: pytest.MonkeyPatch, *, pkg_name: str = "pyyaml") -> Target:
+    """Point `acumen check` at a venv-shaped directory holding the test interpreter.
+
+    ``pkg_name`` is the distribution the import probe looks for: ``pyyaml`` is installed here
+    and imports as ``yaml``, so it also covers the name mismatch. A name nothing provides
+    models a target whose install went wrong.
+    """
+    venv = project / "venv"
+    bin_dir = venv / ("Scripts" if os.name == "nt" else "bin")
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    interpreter = bin_dir / ("python.exe" if os.name == "nt" else "python")
+    if not interpreter.exists():
+        interpreter.symlink_to(sys.executable)
+    target = Target(
+        source="target",
+        ref="main",
+        src_dir=project / "target",
+        venv_dir=venv,
+        commit="abc1234def",
+        pkg_name=pkg_name,
+        pkg_version="1.0",
+    )
+    monkeypatch.setattr("acumen.cli.prepare_target", lambda *_args, **_kwargs: target)
+    return target
+
+
+def check_args(project: Path, *extra: str) -> list[str]:
+    """The paths every ``acumen check`` invocation in these tests needs.
+
+    ``--log-dir`` is pinned to the scratch project: the review phase opens a real
+    :class:`~acumen.logs.LiveLog` before the agent is stubbed out, and its default is ``logs/``
+    relative to the *cwd* — so leaving it out has the suite writing agent logs into whatever
+    directory pytest was started from.
+    """
+    return [
+        "check",
+        "--config",
+        str(project / "config.yaml"),
+        "--tasks",
+        str(project / "tasks.yaml"),
+        "--scripts",
+        str(project / "tasks"),
+        "--log-dir",
+        str(project / "logs"),
+        *extra,
+    ]
+
+
+def _write_reproducer(project: Path, split: str, answer: str) -> None:
+    scripts = project / "tasks"
+    scripts.mkdir(exist_ok=True)
+    (scripts / f"example_task-{split}.py").write_text(
+        f'from pathlib import Path\n\nPath("answer.md").write_text({answer!r})\n'
+    )
+
+
+def _squash(text: str) -> str:
+    """Collapse the table's column padding, so a test asserts content and not alignment."""
+    return " ".join(text.split())
+
+
+def test_check_passes_when_every_answer_reproduces(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _stub_target(project, monkeypatch)
+    _write_reproducer(project, "train", "TRAIN_ANSWER")
+    _write_reproducer(project, "test", "TEST_ANSWER")
+
+    assert main(check_args(project, "--no-review", "--jobs", "1")) == 0
+
+    out = capsys.readouterr().out
+    assert "imports as yaml" in out, "the probe reports the module it actually imported"
+    assert "reproduced 2/2 (100%)" in _squash(out)
+    assert "tasks fully reproduced 1/1 (100%)" in _squash(out)
+    assert "every task's ground truth reproduced" in out
+
+
+def test_check_exits_nonzero_and_names_what_is_wrong(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A typo'd answer and a missing reproducer are different repairs, so both are named."""
+    _stub_target(project, monkeypatch)
+    _write_reproducer(project, "train", "SOMETHING_ELSE")
+
+    assert main(check_args(project, "--no-review", "--jobs", "1")) == 1
+
+    captured = capsys.readouterr()
+    assert "got SOMETHING_ELSE / want TRAIN_ANSWER" in captured.out
+    assert "no reproducer at" in captured.out
+    squashed = _squash(captured.out)
+    assert "reproduced 0/2 (0%)" in squashed
+    assert "wrong_answer 1" in squashed and "missing 1" in squashed
+    assert "fix the reproducers and answers above" in captured.err
+
+
+def test_check_refuses_to_run_anything_when_the_package_will_not_import(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One broken install would otherwise be reported once per task, at full runtime cost."""
+    _stub_target(project, monkeypatch, pkg_name="never-installed-anywhere")
+    _write_reproducer(project, "train", "TRAIN_ANSWER")
+
+    assert main(check_args(project, "--no-review")) == 2
+
+    err = capsys.readouterr().err
+    assert "does not import in the target venv" in err
+    assert "Every task would fail the same way, so nothing was run" in err
+
+
+def test_check_filters_to_one_cell_and_writes_json(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _stub_target(project, monkeypatch)
+    _write_reproducer(project, "train", "TRAIN_ANSWER")
+    report = project / "check.json"
+
+    assert (
+        main(check_args(project, "--no-review", "--task", "example_task", "--split", "train", "--json", str(report)))
+        == 0
+    )
+
+    payload = json.loads(report.read_text())
+    assert [(r["task_id"], r["split"], r["status"]) for r in payload["results"]] == [("example_task", "train", "ok")]
+    assert payload["summary"]["ok"] is True
+    assert payload["target"]["commit"] == "abc1234def"
+    # The held-out split was not asked for, so its absent reproducer is not a failure here.
+    assert "no reproducer" not in capsys.readouterr().out
+
+
+def test_check_rejects_an_unknown_task_before_preparing_a_target(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _unreachable(*_args, **_kwargs):
+        raise AssertionError("a typo'd --task must be caught before the costly target prep")
+
+    monkeypatch.setattr("acumen.cli.prepare_target", _unreachable)
+
+    assert main(check_args(project, "--no-review", "--task", "typo")) == 2
+    assert "unknown task ids: ['typo']" in capsys.readouterr().err
+
+
+def test_check_warns_about_a_reproducer_no_task_claims(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _stub_target(project, monkeypatch)
+    _write_reproducer(project, "train", "TRAIN_ANSWER")
+    _write_reproducer(project, "test", "TEST_ANSWER")
+    (project / "tasks" / "renamed_away-train.py").write_text("pass\n")
+
+    assert main(check_args(project, "--no-review", "--jobs", "1")) == 0
+
+    assert "renamed_away-train.py matches no task and split" in capsys.readouterr().err
+
+
+def _stub_review(monkeypatch: pytest.MonkeyPatch, verdicts: dict[tuple[str, str], tuple[str, str | None]]):
+    """Stand in for the review agent, returning a fixed verdict per (task, split)."""
+    monkeypatch.setattr("acumen.cli.check_agent_cli", lambda *_a, **_k: None)
+    monkeypatch.setattr("acumen.cli.resolve_auth_mode", lambda *_a, **_k: "session")
+    monkeypatch.setattr("acumen.cli._agent_prices", lambda *_a, **_k: None)
+
+    async def fake_review(**kwargs):
+        built = {}
+        for result in kwargs["results"]:
+            key = (result.task_id, result.split)
+            status, issue = verdicts.get(key, ("ok", None))
+            built[key] = ReviewVerdict(
+                task_id=result.task_id,
+                split=result.split,
+                status=status,
+                issue=issue,
+                fix="say descending in the prompt" if status == "mismatch" else None,
+            )
+        return ReviewResult(verdicts=built, cost_usd=0.31, turns=9)
+
+    monkeypatch.setattr("acumen.cli.review_tasks", fake_review)
+
+
+def test_check_no_review_spawns_nothing_and_never_reaches_a_credential(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The deterministic phase must stay free, and usable in a loop while fixing a script."""
+    _stub_target(project, monkeypatch)
+    _write_reproducer(project, "train", "TRAIN_ANSWER")
+    _write_reproducer(project, "test", "TEST_ANSWER")
+    monkeypatch.setattr("acumen.cli.check_agent_cli", _boom)
+    monkeypatch.setattr("acumen.cli.review_tasks", _boom)
+
+    assert main(check_args(project, "--no-review", "--jobs", "1")) == 0
+
+    out = capsys.readouterr().out
+    assert "auth:" not in out, "no credential is resolved when no agent runs"
+    assert "reviewing" not in out
+    assert "reviewed" not in out, "the summary has no review line to report"
+    assert "every task's ground truth reproduced" in out
+
+
+def test_check_flags_a_coherent_looking_task_whose_prompt_asks_for_something_else(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The failure this phase exists for: the code reproduces, but the prompt disagrees with it.
+
+    The deterministic column says ok, so nothing else in acumen would ever notice.
+    """
+    _stub_target(project, monkeypatch)
+    _write_reproducer(project, "train", "TRAIN_ANSWER")
+    _write_reproducer(project, "test", "TEST_ANSWER")
+    _stub_review(
+        monkeypatch,
+        {("example_task", "test"): ("mismatch", "prompt says ascending; script and answer are descending")},
+    )
+
+    assert main(check_args(project, "--jobs", "1")) == 1
+
+    captured = capsys.readouterr()
+    squashed = _squash(captured.out)
+    assert "reproduced 2/2 (100%)" in squashed, "the deterministic phase saw nothing wrong"
+    assert "reviewed 2/2 (100%)" in squashed
+    assert "mismatch 1" in squashed
+    # The reason and the fix are both shown, and briefly.
+    assert "prompt says ascending; script and answer are descending" in captured.out
+    assert "fix: say descending in the prompt" in captured.out
+    assert "review flagged" in captured.err or "review flagged" in captured.out
+    assert "$0.31 over 9 turns" in captured.out
+
+
+def test_check_reports_a_failed_review_as_an_incomplete_check(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A review that could not run must never read as a green check, but must not lose the runs."""
+    _stub_target(project, monkeypatch)
+    _write_reproducer(project, "train", "TRAIN_ANSWER")
+    _write_reproducer(project, "test", "TEST_ANSWER")
+    _stub_review(monkeypatch, {})
+
+    async def die(**_kwargs):
+        raise ReviewError("the review agent did not write review.json")
+
+    monkeypatch.setattr("acumen.cli.review_tasks", die)
+
+    assert main(check_args(project, "--jobs", "1")) == 2
+
+    captured = capsys.readouterr()
+    assert "reproduced 2/2 (100%)" in _squash(captured.out), "the deterministic results survive"
+    assert "did not write review.json" in captured.err
+    assert "not a clean check" in captured.err
+
+
+def test_check_needs_the_agent_cli_before_it_prepares_a_target(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Half an hour of analyses must not be spent to discover the reviewer cannot run."""
+    monkeypatch.setattr("acumen.cli.prepare_target", _boom)
+    monkeypatch.setattr("acumen.cli.check_agent_cli", lambda *_a, **_k: (_ for _ in ()).throw(AgentError("no cli")))
+
+    assert main(check_args(project)) == 2
+
+
+def test_check_json_carries_the_review_verdicts(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _stub_target(project, monkeypatch)
+    _write_reproducer(project, "train", "TRAIN_ANSWER")
+    _stub_review(monkeypatch, {("example_task", "train"): ("mismatch", "asks for a count, answer is a name")})
+    report = project / "check.json"
+
+    assert main(check_args(project, "--task", "example_task", "--split", "train", "--json", str(report))) == 1
+
+    payload = json.loads(report.read_text())
+    (row,) = payload["results"]
+    assert row["review"] == {
+        "verdict": "mismatch",
+        "issue": "asks for a count, answer is a name",
+        "fix": "say descending in the prompt",
+    }
+    assert payload["review"]["flagged"] == 1
+    assert payload["review"]["turns"] == 9
+    capsys.readouterr()
+
+
+def test_check_writes_its_review_log_where_it_was_told_to(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--log-dir is honoured, and nothing lands in the cwd.
+
+    The review phase opens its log before the agent runs, so a default-valued --log-dir writes
+    into whatever directory the command was started from. Pinning it here is what keeps the
+    suite from dropping agent logs into the repository.
+    """
+    _stub_target(project, monkeypatch)
+    _write_reproducer(project, "train", "TRAIN_ANSWER")
+    _stub_review(monkeypatch, {})
+    before = set(Path.cwd().iterdir())
+
+    assert main(check_args(project, "--task", "example_task", "--split", "train")) == 0
+
+    logs = sorted((project / "logs").glob("acumen-check-*.jsonl"))
+    assert len(logs) == 1, "the review phase writes exactly one live log"
+    assert set(Path.cwd().iterdir()) == before, "the command wrote into the cwd"
+    capsys.readouterr()

@@ -36,8 +36,9 @@ import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 from matplotlib.colors import is_color_like
+from matplotlib.legend_handler import HandlerPatch
 from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
+from matplotlib.patches import FancyArrowPatch, Patch
 
 from acumen.paths import NOSKILL_ARM, RESULT_FILE, TRANSCRIPT_HTML, skill_from_arm
 from acumen.skills import SkillError, read_meta, skill_content, skill_dir
@@ -159,27 +160,39 @@ def _skill_label(arm: str) -> str:
     return f"Skill {version}" if version else arm
 
 
-def _arm_marker(arm: str) -> str | tuple[int, int, int]:
-    """Scatter marker for an arm — an ✕ for the baseline, then a widening polygon per version.
+#: What the trade-off figure's key calls its arrow entry: the hop from one version to the next.
+_NEXT_VERSION_LABEL = "next version"
 
-    The trade-off figure spends hue on the *model*, the same as every other figure here, so
-    the arm needs a second channel: shape. Arms are ordinal, and most shape sets are not, so
-    the versions walk a polygon ladder — v1 a triangle, v2 a square, v3 a pentagon — where the
-    side count rises with the version and the progression reads in order. matplotlib takes the
-    ``(numsides, style, angle)`` form, so the ladder is arithmetic rather than a lookup table
-    that eventually runs out of shapes.
 
-    The baseline sits deliberately off the ladder: it is not a version of anything, and an ✕
-    says so at a glance. Past roughly v6 the polygons start converging on a circle; there the
-    legend and the labelled pooled marks carry the identity instead.
+def _skill_key(arms: Sequence[str]) -> list[tuple[str, str]]:
+    """The ``(arm, label)`` pairs the trade-off figure's shape key shows.
 
-    Each polygon is drawn point-up, so v1 reads as a triangle and v2 as a diamond rather than
-    a square — the side count is what carries the order, not the orientation.
+    Shape separates baseline from skill and nothing finer, so the key runs to two entries
+    however many versions the report holds — one representative arm per shape, and only for
+    the shapes that are actually on the page.
     """
-    if arm == NOSKILL_ARM:
-        return "X"
-    version = skill_from_arm(arm)
-    return (int(version[1:]) + 2, 0, 0) if version else "o"
+    key = []
+    if NOSKILL_ARM in arms:
+        key.append((NOSKILL_ARM, _skill_label(NOSKILL_ARM)))
+    skills = [arm for arm in arms if arm != NOSKILL_ARM]
+    if skills:
+        key.append((skills[0], "Skill"))
+    return key
+
+
+def _arm_marker(arm: str) -> str:
+    """Scatter marker for an arm — an ✕ for the baseline, a disc for every skill version.
+
+    Shape carries the one distinction that is categorical: skill or no skill. The baseline is
+    not a version of anything, and an ✕ says so at a glance.
+
+    Which version a disc is does not ride on shape at all. Versions are a *sequence*, and a
+    sequence is better drawn than encoded: the trade-off figure joins each model's arms with
+    arrows, noskill → v1 → v2 → …, so the order is read off the path rather than decoded from
+    a shape against a key (see :func:`_trajectory_arrows`). That keeps the mark set to two
+    shapes however many versions a report holds.
+    """
+    return "X" if arm == NOSKILL_ARM else "o"
 
 
 def _arm_sort_key(arm: str) -> int:
@@ -697,13 +710,18 @@ def _pareto_front(points: Sequence[tuple[float, float]]) -> list[tuple[float, fl
     return front
 
 
-def _pareto_steps(front: Sequence[tuple[float, float]], y_min: float) -> tuple[list[float], list[float]]:
+def _pareto_steps(front: Sequence[tuple[float, float]], y_min: float, x_max: float) -> tuple[list[float], list[float]]:
     """The frontier as a staircase: x and y for a path tracing the edge of what was achieved.
 
     Between two frontier points the best rate available is the cheaper one's, so the path holds
     that rate until the price of the next one is reached and then steps up — a curve through the
     points would claim results between them that nobody measured. The path drops to the floor at
     the cheapest point, closing the region off: to its left, nothing was achieved at any rate.
+
+    Past the dearest frontier point it runs flat to ``x_max`` rather than stopping there. The
+    line is the boundary of the dominated region, and paying more than the best mark cannot buy
+    less than it did: everything to the right of that last riser is dominated too. Ending the
+    line at the mark would leave that stretch looking like open ground.
     """
     xs: list[float] = []
     ys: list[float] = []
@@ -712,7 +730,101 @@ def _pareto_steps(front: Sequence[tuple[float, float]], y_min: float) -> tuple[l
         xs += [cost, cost]
         ys += [held, rate]
         held = rate
+    if front:
+        xs.append(x_max)
+        ys.append(held)
     return xs, ys
+
+
+#: Mark radius in points, edge included: how far an arrow's tail and head stand back from the
+#: two centres, so each end lands on the rim of its mark rather than under it. Every mark on the
+#: panel is the same 7pt across, pooled ones included, so one value covers them all.
+_ARROW_GAP_PT = 3.9
+
+#: Arrow line width in points. One weight for every chain: the pooled chain is set apart by its
+#: colour, and a heavier line would read as a stronger result rather than a summary of the rest.
+_ARROW_WIDTH_PT = 1.0
+
+#: Arrow head size in points (matplotlib's mutation scale; the head runs 0.4 of it long). Small
+#: on purpose: with one chain per model the heads are numerous, and they only have to say which
+#: way the hop goes.
+_ARROW_HEAD_PT = 11.0
+
+#: Points of head inset per point of line width. matplotlib pulls a filled head back from the
+#: end of its path so the projecting cap cannot overshoot it, by half the line width over the
+#: sine of the head's half-angle — for the default ``-|>`` proportions, 0.5 / sin(atan(0.2/0.4)).
+#: Taken off the head's standoff, or every arrow stops a full point short of what it points at.
+_HEAD_INSET_PER_PT = 1.118
+
+
+def _trajectory_arrows(ax: plt.Axes, series: Sequence[tuple[str, float, float]], color: str) -> None:
+    """Join one model's arms with arrows, in version order: noskill → v1 → v2 → …
+
+    The trade-off figure's marks say only skill or no skill (see :func:`_arm_marker`), so the
+    ordering lives here. One chain per model, in that model's colour, and never a hop between
+    models: the question the figure answers is whether a version moved *that* model up and to
+    the left, which is a comparison within a column of the matrix, not across it.
+
+    ``series`` is the model's ``(arm, cost, rate)`` points, in any order; arms the model never
+    ran are simply absent, and the chain closes over the gap rather than breaking, since the
+    sequence being drawn is the versions that exist for this model.
+
+    Every hop is drawn, straight, whatever the distance. Two versions that landed on the same
+    result are the pair a reader most needs the order for, and there is nothing to bend around:
+    their marks overlap, so the arrow between them ends up under the pair and the overlap is
+    itself the reading — one place, two versions. Only two marks at exactly the same point have
+    no arrow, and there the pair is a single dot.
+
+    Both ends stand back by :data:`_ARROW_GAP_PT`, the mark's own radius, so the tail leaves one
+    rim and the head lands on the other. That is in *points*, so this has to run against the
+    figure's final geometry, after ``tight_layout``, or the offsets would be measured against an
+    axes size that no longer holds.
+
+    Each arrow is a patch rather than an empty annotation carrying one, which is the other way
+    matplotlib draws these: an arrow is not text, and filing it under the axes' text would put
+    a dozen blank labels on a figure whose whole point is that it needs none.
+    """
+    ordered = sorted(series, key=lambda point: _arm_sort_key(point[0]))
+    for (_from, x0, y0), (_to, x1, y1) in zip(ordered, ordered[1:], strict=False):
+        (px0, py0), (px1, py1) = ax.transData.transform([(x0, y0), (x1, y1)])
+        if not math.hypot(px1 - px0, py1 - py0):
+            continue  # one mark drawn twice: there is no direction to point in
+        ax.add_patch(
+            FancyArrowPatch(
+                (x0, y0),
+                (x1, y1),
+                arrowstyle="-|>",
+                color=color,
+                linewidth=_ARROW_WIDTH_PT,
+                shrinkA=_ARROW_GAP_PT,
+                # The tail is a line end and lands where it is put; the head is inset from the
+                # end of its own path, so it needs that much less standoff to reach the rim.
+                shrinkB=_ARROW_GAP_PT - _HEAD_INSET_PER_PT * _ARROW_WIDTH_PT,
+                mutation_scale=_ARROW_HEAD_PT,
+                # Under every mark, so a head never covers the point it lands on, and over the
+                # frontier staircase (zorder 2), which is background here.
+                zorder=2.5,
+            )
+        )
+
+
+def _legend_arrow(*, width: float, height: float, **_unused: object) -> FancyArrowPatch:
+    """The arrow entry in the trade-off figure's key, drawn across its handle box.
+
+    A key about direction needs a handle with a direction in it. matplotlib has no marker for
+    that, so the entry is a patch and this puts a real arrow in the box through
+    :class:`~matplotlib.legend_handler.HandlerPatch`; the colour comes from the proxy the legend
+    was given. It is built the same way the chains are, head size included, so the key is a
+    sample of the figure rather than a drawing of one — a head scaled to the handle box would
+    come out as a long thin wedge nothing on the panel resembles.
+    """
+    return FancyArrowPatch(
+        (0, 0.5 * height),
+        (width, 0.5 * height),
+        arrowstyle="-|>",
+        linewidth=1.2,
+        mutation_scale=_ARROW_HEAD_PT,
+    )
 
 
 def tradeoff_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None) -> plt.Figure:
@@ -722,17 +834,25 @@ def tradeoff_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None
     "was it worth it?". This plots the two headline measures against each other, so the reader
     can see whether a version bought accuracy, saved money, or both. Up and to the left is better.
 
-    Each model gets its own mark per arm, in the model's colour; each arm also gets a larger grey
-    mark pooling every model, carrying standard errors on both axes — the same statistic the
-    grid's grey bar reports. Only the pooled marks are labelled; labelling every point would
-    collide. Hue stays the *model*, as in every other figure here, so the arm rides a second
-    channel: marker shape (see :func:`_arm_marker`). Identity therefore never rests on colour alone.
+    Each model gets its own mark per arm, in the model's colour; each arm also gets a grey mark
+    pooling every model, carrying standard errors on both axes — the same statistic the grid's
+    grey bar reports. It is drawn at the size of every other mark: the colour and the error bars
+    already set it apart, and a bigger mark would read as a bigger measurement. Hue stays the *model*, as in every other figure here, so the arm
+    rides two further channels. Shape says whether a mark is the baseline or a skill, an ✕
+    against a disc (see :func:`_arm_marker`); *which* skill is said by the arrows, which walk
+    each model's own marks in version order, noskill → v1 → v2 → … (see
+    :func:`_trajectory_arrows`). Identity therefore never rests on colour alone.
+
+    Reading the order off a path rather than a shape is what lets the figure carry no text at
+    all: nothing has to be labelled in place, and the key shrinks to two marks and an arrow
+    however many versions the report holds.
 
     A staircase traces the **Pareto frontier** over every mark shown — the combinations nothing
     else beats on both counts at once. Anything below and to the right of it is dominated:
     something on the line costs less *and* succeeds more, so there is no reason to choose it.
     The frontier is drawn over the pooled marks as well as the per-model ones, so it really is
-    the outer edge of the whole plot and no mark can float above it.
+    the outer edge of the whole plot and no mark can float above it, and it runs the full width
+    of the panel (see :func:`_pareto_steps`) so the dominated region is closed on both sides.
 
     Cost is anchored at zero, but the rate axis starts just below the lowest mark rather than at
     zero. Anchoring it too would strand every point in the top third of an otherwise empty panel,
@@ -775,11 +895,16 @@ def tradeoff_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None
     front = _pareto_front([(cost, rate) for _a, _m, cost, _e, rate, _re in points])
 
     with plt.rc_context(_RC):
-        fig, ax = plt.subplots(figsize=(5.0, 3.5))
+        # Marks and arrowheads are sized in points, so a larger panel is more air between them
+        # rather than bigger furniture. The chains need that air: a hop shorter than its own
+        # head is dropped, and on a crowded panel that is most of them.
+        fig, ax = plt.subplots(figsize=(5.8, 4.0))
         ax.set_xlim(0, x_max)
         ax.set_ylim(y_min, y_max)
-        steps_x, steps_y = _pareto_steps(front, y_min)
-        ax.plot(steps_x, steps_y, color=INK, alpha=0.38, linewidth=1.1, zorder=2)
+        steps_x, steps_y = _pareto_steps(front, y_min, x_max)
+        # Dashed, because it is not a measurement: no run lies along its treads, and the arrows
+        # crossing it are. A solid line here would read as one more path through the marks.
+        ax.plot(steps_x, steps_y, color=INK, alpha=0.38, linewidth=1.1, linestyle=(0, (5, 3)), zorder=2)
         if front:
             # Named at the foot of its first riser — the cheap-and-poor corner, which by
             # construction has nothing plotted in it.
@@ -812,7 +937,9 @@ def tradeoff_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None
                 linestyle="none",
                 zorder=3,
             )
-        # The pooled marks go on last so they sit above the per-model cloud they summarise.
+        # The pooled marks go on last so they sit above the per-model cloud they summarise. Same
+        # size as the rest of them: they are already set apart by their colour and their error
+        # bars, and drawing them larger too made the pooled arm look like a bigger measurement.
         for arm, model, cost, cost_err, rate, rate_err in points:
             if model != _ALL_MODELS:
                 continue
@@ -823,24 +950,14 @@ def tradeoff_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None
                 yerr=rate_err,
                 marker=_arm_marker(arm),
                 color=_ALL_MODELS_COLOR,
-                markersize=10,
+                markersize=7,
                 markeredgecolor=INK,
-                markeredgewidth=0.9,
+                markeredgewidth=0.7,
                 linestyle="none",
                 capsize=3,
                 ecolor=INK,
                 elinewidth=1,
                 zorder=4,
-            )
-            ax.annotate(
-                _skill_label(arm),
-                (cost, rate),
-                textcoords="offset points",
-                xytext=(10, 6),
-                fontsize=8,
-                fontweight="bold",
-                color=INK,
-                zorder=5,
             )
 
         ax.yaxis.set_major_locator(mticker.MultipleLocator(0.1))
@@ -885,25 +1002,32 @@ def tradeoff_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None
             handletextpad=0.4,
             borderaxespad=0.0,
         )
-        # Shape is the channel on show here, so these proxies are drawn as outlines only: any
-        # fill would read as a model colour, and there is no model to name in a key about shape.
+        # Shape is one of the channels on show here, so these proxies are drawn as outlines
+        # only: any fill would read as a model colour, and there is no model to name in a key
+        # about shape. The key holds the two marks the figure actually uses plus the arrow that
+        # orders them, which is the whole encoding however many versions there are.
+        key = _skill_key(arms)
         arm_handles = [
             Line2D(
                 [],
                 [],
                 linestyle="none",
-                marker=_arm_marker(a),
+                marker=_arm_marker(arm),
                 markerfacecolor="none",
                 markersize=7,
                 markeredgecolor=INK,
                 markeredgewidth=1.1,
-                label=_skill_label(a),
+                label=label,
             )
-            for a in arms
+            for arm, label in key
         ]
+        arm_labels = [label for _arm, label in key]
+        if len(arms) > 1:  # with one arm there is nothing to order, and no arrow is drawn
+            arm_handles.append(FancyArrowPatch((0, 0), (1, 0), color=INK, label=_NEXT_VERSION_LABEL))
+            arm_labels.append(_NEXT_VERSION_LABEL)
         fig.legend(
             arm_handles,
-            [_skill_label(a) for a in arms],
+            arm_labels,
             title="skill",
             frameon=False,
             loc="upper left",
@@ -913,8 +1037,17 @@ def tradeoff_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None
             labelspacing=0.35,
             handletextpad=0.4,
             borderaxespad=0.0,
+            handler_map={FancyArrowPatch: HandlerPatch(patch_func=_legend_arrow)},
         )
         fig.tight_layout()
+        # The chains go on after the layout settles: their offsets are in points against the
+        # marks, so they need the axes' final size (see :func:`_trajectory_arrows`). Drawing
+        # order does not matter — zorder is what puts them under the marks.
+        series: dict[str, list[tuple[str, float, float]]] = {}
+        for arm, model, cost, _err, rate, _rate_err in points:
+            series.setdefault(model, []).append((arm, cost, rate))
+        for model, model_series in series.items():
+            _trajectory_arrows(ax, model_series, colors[model])
     return fig
 
 
@@ -2073,10 +2206,12 @@ def render_report(
 <p class="task-desc">Per-run means over test runs; error bars are standard errors.</p>
 <figure><img alt="Success rate, tokens, cost and time per skill" src="{overview_uri}"></figure>
 <h3 id="tradeoff">Cost vs. success</h3>
-<p class="task-desc">One mark per model and skill version, where colour is the model and shape is
- the skill version. The grey mark pools every model for that version, with standard errors on
- both axes. The staircase is the Pareto frontier: anything below and to the right of it is
- dominated, because something on the line costs less <em>and</em> succeeds more.</p>
+<p class="task-desc">One mark per model and skill version, where colour is the model and the
+ &#10005; is that model's no-skill baseline. Arrows join one model's own marks in version order,
+ baseline to v1 to v2 and on, so a chain is that model's path and never crosses to another. The
+ grey mark pools every model for that version, with standard errors on both axes, and its chain
+ is the pooled path. The staircase is the Pareto frontier: anything below and to the right of it
+ is dominated, because something on the line costs less <em>and</em> succeeds more.</p>
 <figure><img alt="Cost per run against success rate, by model and skill version" src="{tradeoff_uri}"></figure>
 <h3 id="dominance">Is the difference real?</h3>
 <p class="task-desc">A version <em>dominates</em> the baseline when it is both cheaper and more

@@ -22,11 +22,17 @@ one of them — or to the original unfiltered tree — wherever the agent points
 (:func:`find_skill_access`). ``setting_sources=[]`` additionally means no skill is ever
 discovered or loaded into the generator itself.
 
-The script the agent writes to confirm an answer is **scratch**: it lives in a throwaway work
-dir that is deleted when this returns, so nothing about the ground-truth pipeline is persisted —
-only the task (prompt + answer) lands in ``tasks.yaml``. The output is validated through
-:func:`acumen.tasks.parse_tasks` before it is written, so ``acumen tasks`` can never emit a
+The script the agent runs to confirm an answer is **kept**, as ``tasks/{id}-{split}.py`` next to
+the tasks file: an answer nothing can recompute is an answer nobody can check, and a wrong one
+costs a whole benchmark pass to discover. :mod:`acumen.check` reruns them on demand. Harvesting
+happens only after the agent's ``tasks.yaml`` validates through :func:`acumen.tasks.parse_tasks`,
+so a rejected generation leaves no scripts behind and ``acumen tasks`` can never emit a
 ``tasks.yaml`` the rest of the pipeline would reject.
+
+These scripts hold the ground truth for the **held-out test split**, so no agent may ever read
+them. That holds because ``bench``, ``draft`` and ``improve`` confine their agents to explicit
+read roots (:mod:`acumen.guard`) that never include the project directory — a property to
+preserve when changing any of them.
 """
 
 from __future__ import annotations
@@ -43,9 +49,11 @@ if TYPE_CHECKING:
     from claude_agent_sdk import HookMatcher
 
 from acumen.agents import AgentOptions, AgentResult, provider_for_model, run_agent
+from acumen.check import SCRIPTS_DIRNAME, script_name, script_path
 from acumen.config import Config
 from acumen.env import AuthMode, Target, build_agent_env
 from acumen.logs import LiveLog
+from acumen.paths import SPLITS, Split
 from acumen.prices import PriceTable, price_usage, pricer, resolve_cost
 from acumen.procs import label_env, reap
 from acumen.prompts import taskgen_prompt
@@ -82,6 +90,13 @@ class TaskGenResult:
     out_path: Path
     cost_usd: float | None
     turns: int
+    #: Reproducer scripts harvested into the scripts root, in task order.
+    scripts: tuple[Path, ...] = ()
+    #: Splits that expected a reproducer and got none, as ``(task_id, split)`` pairs. The tasks
+    #: are still written: a missing script is a gap ``acumen check`` reports, not a failure.
+    missing_scripts: tuple[tuple[str, Split], ...] = ()
+    #: Files the agent left in its scripts directory that match no task and split.
+    unexpected_scripts: tuple[str, ...] = ()
     #: Live log paths for this run, when a :class:`LiveLog` was attached.
     log_jsonl: Path | None = None
     log_html: Path | None = None
@@ -233,11 +248,14 @@ def make_skill_guard(original_src: Path) -> HookMatcher:
 
 def _task_to_dict(task: Task) -> dict[str, object]:
     """Serialise a :class:`Task` back to the ``tasks.yaml`` mapping shape."""
-    entry: dict[str, object] = {
-        "id": task.id,
-        "train": {"prompt": task.train.prompt, "answer": task.train.answer},
-        "test": {"prompt": task.test.prompt, "answer": task.test.answer},
-    }
+    entry: dict[str, object] = {"id": task.id}
+    # Beside the id rather than below the prompts: it says how to read the whole task, and after
+    # two multi-line prompt blocks a reader would never see it. Only the non-default is written,
+    # since `needs_script: true` on every task is noise and its absence already means that.
+    if not task.needs_script:
+        entry["needs_script"] = False
+    entry["train"] = {"prompt": task.train.prompt, "answer": task.train.answer}
+    entry["test"] = {"prompt": task.test.prompt, "answer": task.test.answer}
     if task.max_turns is not None:
         entry["max_turns"] = task.max_turns
     if task.max_usd is not None:
@@ -271,6 +289,57 @@ def dump_tasks(tasks: list[Task]) -> str:
     return yaml.dump(doc, Dumper=_TaskDumper, sort_keys=False, default_flow_style=False, allow_unicode=True, width=100)
 
 
+@dataclass(frozen=True)
+class Harvest:
+    """What :func:`harvest_scripts` moved, and what it could not."""
+
+    scripts: tuple[Path, ...]
+    missing: tuple[tuple[str, Split], ...]
+    unexpected: tuple[str, ...]
+
+
+def harvest_scripts(tasks: list[Task], staged_dir: Path, scripts_root: Path) -> Harvest:
+    """Copy the agent's reproducer scripts out of its work dir into the project.
+
+    Only names that match a real ``(task id, split)`` are taken, and only for tasks that declare
+    they need one. Anything else the agent left there is reported rather than copied: a file
+    named after no task is never run by :mod:`acumen.check`, so silently keeping it would look
+    like coverage that does not exist.
+
+    Parameters
+    ----------
+    tasks
+        The validated tasks, read for their ids and ``needs_script``.
+    staged_dir
+        The agent's scripts directory inside its throwaway work dir.
+    scripts_root
+        Where the reproducers are kept, created if missing.
+
+    Returns
+    -------
+    The scripts copied, the splits that expected one and had none, and the unmatched files.
+    """
+    copied: list[Path] = []
+    missing: list[tuple[str, Split]] = []
+    wanted: set[str] = set()
+    for task in tasks:
+        if not task.needs_script:
+            continue
+        for split in SPLITS:
+            name = script_name(task.id, split)
+            wanted.add(name)
+            source = staged_dir / name
+            if not source.is_file():
+                missing.append((task.id, split))
+                continue
+            dest = script_path(scripts_root, task.id, split)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, dest)
+            copied.append(dest)
+    staged = {path.name for path in staged_dir.glob("*.py")} if staged_dir.is_dir() else set()
+    return Harvest(scripts=tuple(copied), missing=tuple(missing), unexpected=tuple(sorted(staged - wanted)))
+
+
 def _validate_generated(staged: Path) -> list[Task]:
     """Load and validate the agent's ``tasks.yaml``, mapping failures to a TaskGenError."""
     if not staged.is_file():
@@ -289,6 +358,7 @@ async def generate_tasks(
     cfg: Config,
     target: Target,
     out_path: Path,
+    scripts_root: Path | None = None,
     auth_mode: AuthMode = "session",
     prices: PriceTable | None = None,
     model: str | None = None,
@@ -317,6 +387,10 @@ async def generate_tasks(
         avoid re-covering functionality already present, and appending would silently grow the
         set with semantic duplicates. To combine generated tasks with a curated file, write to a
         separate ``out_path`` and merge by hand, where the overlap can actually be judged.
+    scripts_root
+        Where the reproducer scripts are kept. Defaults to a ``tasks/`` directory beside
+        ``out_path``. Scripts are harvested only after the generated tasks validate, and only
+        for the ``(task, split)`` pairs the tasks themselves declare.
     model
         Override for the generation model; defaults to ``cfg.tasks_model``.
     max_turns, max_usd
@@ -339,6 +413,8 @@ async def generate_tasks(
     if out_path.exists() and not force:
         raise TaskGenError(f"{out_path} already exists — pass force=True to overwrite it")
 
+    scripts_root = scripts_root if scripts_root is not None else out_path.parent / SCRIPTS_DIRNAME
+
     holder = Path(tempfile.mkdtemp(prefix="acumen-tasks-"))
     try:
         work = holder / "work"
@@ -347,7 +423,10 @@ async def generate_tasks(
         table = prices if prices is not None else PriceTable(overrides=cfg.prices)
         provider = provider_for_model(selected_model)
         config_dir = home / (".claude" if provider == "claude" else ".codex")
-        for path in (work, home, config_dir, home / "tmp"):
+        # The scripts directory is created up front so the agent writes into a path that exists,
+        # rather than having to work out that it must make one first.
+        staged_scripts = work / SCRIPTS_DIRNAME
+        for path in (work, home, config_dir, home / "tmp", staged_scripts):
             path.mkdir(parents=True, exist_ok=True)
         staged = work / TASKS_FILE
 
@@ -373,6 +452,7 @@ async def generate_tasks(
             src=source_copy,
             python=target.python,
             out=staged,
+            scripts_dir=staged_scripts,
             feedback=feedback,
         )
         options = AgentOptions(
@@ -428,9 +508,15 @@ async def generate_tasks(
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(dump_tasks(generated))
+        # After the tasks are validated and written, so a rejected generation leaves the
+        # project's scripts directory exactly as it was.
+        harvest = harvest_scripts(generated, staged_scripts, scripts_root)
         return TaskGenResult(
             tasks=generated,
             out_path=out_path,
+            scripts=harvest.scripts,
+            missing_scripts=harvest.missing,
+            unexpected_scripts=harvest.unexpected,
             cost_usd=resolve_cost(
                 result.total_cost_usd,
                 price_usage(
