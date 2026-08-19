@@ -19,9 +19,11 @@ import importlib.util
 import json
 import shlex
 import shutil
+import signal
 import sys
 import time
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -359,7 +361,12 @@ def _codex_command(options: AgentOptions, prompt: str) -> list[str]:
         cli,
         "exec",
         "--json",
-        "--ephemeral",
+        # Deliberately not --ephemeral. The JSONL stream reports usage exactly once, in
+        # ``turn.completed``, so a run acumen stops at a cap — or one whose CLI dies mid-turn —
+        # would report no tokens at all and be priced at zero. Codex's rollout session file
+        # records the running total as the turn proceeds, and it is the only source for it.
+        # It is written inside the run-local CODEX_HOME and discarded with the sandbox.
+        # See :class:`_CodexUsageTail`.
         "--ignore-user-config",
         "--ignore-rules",
         "--strict-config",
@@ -580,6 +587,123 @@ def _is_turn_item(event: dict[str, Any]) -> bool:
     return isinstance(item, dict) and item.get("type") in _TURN_ITEM_TYPES
 
 
+#: Token counters acumen reads out of a rollout ``token_count`` event. They are the same names
+#: ``turn.completed`` uses, which is what lets :func:`acumen.prices.normalize_usage` price either
+#: source without knowing which one it got. ``total_tokens`` is dropped: it is the sum of the
+#: others and ``turn.completed`` does not report it.
+_ROLLOUT_USAGE_KEYS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_write_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+)
+
+
+def _rollout_usage(line: bytes) -> dict[str, int] | None:
+    """Return the running token total carried by a rollout ``token_count`` line, or ``None``."""
+    if b"token_count" not in line:
+        return None
+    try:
+        record = json.loads(line)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    payload = record.get("payload") if isinstance(record, dict) else None
+    if not isinstance(payload, dict) or payload.get("type") != "token_count":
+        return None
+    info = payload.get("info")
+    # ``info`` is null on the token_count events that only refresh rate limits.
+    total = info.get("total_token_usage") if isinstance(info, dict) else None
+    if not isinstance(total, dict):
+        return None
+    return {key: int(total[key] or 0) for key in _ROLLOUT_USAGE_KEYS if isinstance(total.get(key), int | float)}
+
+
+class _CodexUsageTail:
+    """Follow the running token total Codex writes to its rollout session file.
+
+    ``codex exec --json`` reports usage once, in ``turn.completed``. A run acumen terminates at
+    a cap never reaches that event, and neither does a run whose CLI dies mid-turn, so both used
+    to record zero tokens and price at zero. Codex separately appends a ``token_count`` event to
+    ``$CODEX_HOME/sessions/**/rollout-*.jsonl`` after every model response, carrying the turn's
+    cumulative usage, and this reads that file as it grows.
+
+    Best-effort by construction. The rollout layout is Codex's own and is not a documented
+    interface, so every failure to find, open, or parse it is a no-op that leaves the last known
+    total in place. ``turn.completed`` remains authoritative whenever it does arrive; this only
+    fills the gap when it does not.
+
+    The recovered figure is a lower bound on a stopped run. Codex writes each record slightly
+    behind the stdout event it belongs to, so the very last response can be cut off before it is
+    recorded even with the interrupt :func:`_stop_codex` sends. Under-reporting the tail of a
+    capped run is the honest failure direction; reporting nothing was not.
+    """
+
+    def __init__(self, codex_home: str | None) -> None:
+        self._home = Path(codex_home) if codex_home else None
+        self._thread_id: str | None = None
+        self._path: Path | None = None
+        self._offset = 0
+        self.usage: dict[str, int] = {}
+
+    def attach(self, thread_id: str) -> None:
+        """Note the thread whose rollout to follow, as reported by ``thread.started``."""
+        self._thread_id = thread_id or None
+
+    def _locate(self) -> Path | None:
+        """Resolve the rollout path, retrying until Codex has created the file."""
+        if self._path is not None:
+            return self._path
+        if self._home is None or self._thread_id is None:
+            return None
+        sessions = self._home / "sessions"
+        try:
+            matches = sorted(sessions.glob(f"**/rollout-*-{self._thread_id}.jsonl"))
+            if not matches:
+                # A CODEX_HOME shared across runs can hold older sessions, so the thread-id
+                # match is what we want and the newest file is only a fallback for a naming
+                # scheme we did not anticipate. Rollout names lead with an ISO timestamp, so
+                # sorting by name sorts by age.
+                matches = sorted(sessions.glob("**/rollout-*.jsonl"))[-1:]
+        except OSError:
+            return None
+        self._path = matches[-1] if matches else None
+        return self._path
+
+    def poll(self) -> None:
+        """Consume whatever Codex has appended since the last poll."""
+        path = self._locate()
+        if path is None:
+            return
+        try:
+            with path.open("rb") as handle:
+                handle.seek(self._offset)
+                chunk = handle.read()
+        except OSError:
+            return
+        # Stop at the last newline: the tail of the file can be a half-written record, and
+        # parsing it would drop the event it belongs to.
+        cut = chunk.rfind(b"\n")
+        if cut < 0:
+            return
+        self._offset += cut + 1
+        for line in chunk[: cut + 1].splitlines():
+            usage = _rollout_usage(line)
+            if usage is not None:
+                # The event carries the turn's running total, so it replaces rather than adds.
+                self.usage = usage
+
+
+def _event_usage(event: dict[str, Any]) -> dict[str, int]:
+    """Return the usage block a ``turn.completed`` event reports, or ``{}``."""
+    if event.get("type") != "turn.completed":
+        return {}
+    raw = event.get("usage")
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): int(value or 0) for key, value in raw.items() if isinstance(value, int | float)}
+
+
 def _codex_terminal(
     events: Sequence[dict[str, Any]],
     returncode: int,
@@ -587,7 +711,14 @@ def _codex_terminal(
     capped: str | None = None,
     sandbox_failure: str | None = None,
     stderr_lines: Sequence[str] = (),
+    streamed_usage: dict[str, int] | None = None,
 ) -> AgentResult:
+    """Fold a Codex event stream into the provider-neutral result.
+
+    ``streamed_usage`` is the running total read off the rollout file by
+    :class:`_CodexUsageTail`. It is used only when ``turn.completed`` never arrived, which is
+    exactly the case a cap breach or a mid-turn crash leaves behind.
+    """
     session_id: str | None = None
     final = ""
     usage: dict[str, int] = {}
@@ -613,9 +744,7 @@ def _codex_terminal(
                 if isinstance(output, str):
                     command_output.extend(output.splitlines())
         elif kind == "turn.completed":
-            raw = event.get("usage")
-            if isinstance(raw, dict):
-                usage = {str(key): int(value or 0) for key, value in raw.items() if isinstance(value, int | float)}
+            usage = _event_usage(event) or usage
         elif kind in {"error", "turn.failed"}:
             subtype = str(event.get("type"))
             detail = event.get("message") or event.get("error")
@@ -628,6 +757,8 @@ def _codex_terminal(
     # rather than as the harness failing.
     if sandbox_failure is None:
         sandbox_failure = _sandbox_failure(command_output)
+    if not usage and streamed_usage:
+        usage = dict(streamed_usage)
 
     if sandbox_failure is not None:
         # Checked before the cap and before the exit status: when the sandbox cannot carry out
@@ -685,32 +816,53 @@ async def _drain_stderr(
             print(text, file=sys.stderr, flush=True)
 
 
-def _cap_breach(event: dict[str, Any], options: AgentOptions, turns: int) -> str | None:
+def _cap_breach(event: dict[str, Any], options: AgentOptions, turns: int, usage: dict[str, int]) -> str | None:
     """Return the cap ``event`` breached, or ``None``.
 
     ``codex exec`` has no turn or budget cap of its own, so acumen enforces both against the
-    event stream and terminates the process on a breach. The two caps are enforced at different
-    resolutions, and the difference matters:
+    event stream and stops the process on a breach (see :func:`_stop_codex`). The two caps are
+    enforced at different resolutions, and the difference matters:
 
     * ``max_turns`` is checked as each model action completes, so the run really is stopped at
-      the cap — the agent gets ``max_turns`` actions and no more. The cost of stopping mid-turn
-      is that ``turn.completed`` never arrives, so a turn-capped run reports no usage and is
-      priced at zero; it is a failed run either way, but its tokens are not recoverable.
-    * ``max_usd`` can only be checked when usage is reported, and Codex reports it once, in
-      ``turn.completed``, at the end of the turn. A single-turn ``codex exec`` therefore has
-      already spent the money by the time the breach is visible: the cap makes the *outcome*
-      honest — the run is recorded as a budget failure, exactly as it would be for Claude —
-      but it cannot prevent the overspend. Bound Codex spend with ``max_turns`` instead.
+      the cap — the agent gets ``max_turns`` actions and no more.
+    * ``max_usd`` can only be checked when usage is reported. The JSONL stream reports it once,
+      at the end of the turn, but Codex records a running total after every model response in
+      its rollout file, and ``usage`` here is whatever :class:`_CodexUsageTail` has read so far.
+      The budget therefore bites during the turn rather than after it, to the resolution of one
+      model response: a single response can still overshoot the cap, and a run whose rollout
+      cannot be read falls back to being caught at ``turn.completed``.
     """
     if options.max_turns is not None and _is_turn_item(event) and turns >= options.max_turns:
         return _MAX_TURNS_SUBTYPE
-    if options.max_usd is None or options.price_usd is None or event.get("type") != "turn.completed":
-        return None
-    usage = event.get("usage")
-    if not isinstance(usage, dict):
+    if options.max_usd is None or options.price_usd is None or not usage:
         return None
     spent = options.price_usd(usage)
     return _MAX_BUDGET_SUBTYPE if spent is not None and spent > options.max_usd else None
+
+
+#: How long a capped run is given to shut down on its own before it is killed. Codex writes the
+#: usage record for the response that has just landed as it exits, and losing that record costs
+#: the run tokens it really paid for. A clean exit takes milliseconds; the ceiling is only there
+#: so a build that ignores the interrupt cannot hang the benchmark.
+_STOP_GRACE_S = 5.0
+
+
+async def _stop_codex(process: asyncio.subprocess.Process) -> None:
+    """Stop a capped run, giving Codex the chance to flush its last usage record.
+
+    SIGINT is the operator interrupt Codex handles, and it exits cleanly enough to finish
+    writing the rollout. SIGTERM does not: measured against the same capped run, the hard kill
+    lost the tokens of the last model responses, which is exactly the accounting this is here to
+    get right. A run that ignores the interrupt is killed rather than left hanging.
+    """
+    if process.returncode is not None:
+        return
+    try:
+        process.send_signal(signal.SIGINT)
+        await asyncio.wait_for(process.wait(), timeout=_STOP_GRACE_S)
+    except (ProcessLookupError, TimeoutError):
+        with suppress(ProcessLookupError):
+            process.terminate()
 
 
 async def _run_codex(
@@ -735,6 +887,7 @@ async def _run_codex(
     events: list[dict[str, Any]] = []
     turns = 0
     capped: str | None = None
+    tail = _CodexUsageTail(options.env.get("CODEX_HOME"))
     try:
         while line := await process.stdout.readline():
             try:
@@ -746,13 +899,19 @@ async def _run_codex(
             events.append(event)
             if on_event is not None:
                 on_event(event)
+            if event.get("type") == "thread.started":
+                tail.attach(str(event.get("thread_id") or ""))
             if _is_turn_item(event):
                 turns += 1
-            capped = _cap_breach(event, options, turns)
+            tail.poll()
+            capped = _cap_breach(event, options, turns, _event_usage(event) or tail.usage)
             if capped is not None:
-                process.terminate()
+                await _stop_codex(process)
                 break
         returncode = await process.wait()
+        # Codex flushes the turn's last token_count after its last stdout line, and a
+        # terminated run's final counts land only once the process is gone.
+        tail.poll()
         await stderr_task
     except BaseException:
         process.terminate()
@@ -760,7 +919,7 @@ async def _run_codex(
         stderr_task.cancel()
         raise
     duration_ms = round((time.monotonic() - started) * 1000)
-    return _codex_terminal(events, returncode, duration_ms, capped, _sandbox_failure(noise), noise)
+    return _codex_terminal(events, returncode, duration_ms, capped, _sandbox_failure(noise), noise, tail.usage)
 
 
 async def run_agent(

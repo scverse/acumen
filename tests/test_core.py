@@ -11,12 +11,13 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import time
 import warnings
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
@@ -932,6 +933,128 @@ def test_codex_stops_at_the_turn_cap(tmp_path: Path) -> None:
     assert result.result == ""
     # …and the run is a cap breach, not a crashed CLI.
     assert result.errors == ["acumen stopped the run at its turn cap"]
+    # Without a rollout to read there is nothing to recover, and that stays a quiet no-op.
+    assert result.usage == {}
+
+
+def _fake_codex_with_rollout(
+    path: Path,
+    codex_home: Path,
+    thread_id: str,
+    steps: list[tuple[dict | None, dict | None]],
+) -> Path:
+    """Write a stub ``codex`` that records rollout usage as it emits stdout events.
+
+    Each step is ``(running_total, event)``: the cumulative token usage Codex would append to
+    its rollout session file, and the JSONL event it would print next. Either half may be
+    ``None``. This is the only source of usage for a run that never reaches ``turn.completed``.
+    """
+    session = codex_home / "sessions" / "2026" / "08" / "19"
+    rollout = session / f"rollout-2026-08-19T00-00-00-{thread_id}.jsonl"
+    lines = [f"mkdir -p {shlex.quote(str(session))}"]
+    for total, event in steps:
+        if total is not None:
+            record = {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": total}}}
+            lines.append(f"printf '%s\\n' {shlex.quote(json.dumps(record))} >> {shlex.quote(str(rollout))}")
+        if event is not None:
+            lines.append(f"printf '%s\\n' {shlex.quote(json.dumps(event))}")
+    cli = path / "codex"
+    cli.write_text("#!/bin/sh\n" + "\n".join(lines) + "\n")
+    cli.chmod(0o755)
+    return cli
+
+
+def _codex_home_options(tmp_path: Path, codex_home: Path, **kwargs: object) -> AgentOptions:
+    options = _codex_options(tmp_path, **kwargs)
+    return replace(options, env={**options.env, "CODEX_HOME": str(codex_home)})
+
+
+def test_codex_recovers_usage_from_the_rollout_when_the_turn_cap_kills_the_run(tmp_path: Path) -> None:
+    """A capped run spent real tokens, and its rollout is the only place they survive.
+
+    ``codex exec --json`` reports usage once, in ``turn.completed``, which a run stopped at the
+    cap never reaches. Recording zero there priced a run that did minutes of work at $0.00.
+    """
+    codex_home = tmp_path / "codex-home"
+    _fake_codex_with_rollout(
+        tmp_path,
+        codex_home,
+        "thread-1",
+        [
+            (None, {"type": "thread.started", "thread_id": "thread-1"}),
+            (None, {"type": "turn.started"}),
+            (
+                {"input_tokens": 900, "cached_input_tokens": 400, "output_tokens": 30},
+                {"type": "item.completed", "item": {"id": "a", "type": "command_execution", "command": "echo one"}},
+            ),
+            (
+                {"input_tokens": 1_800, "cached_input_tokens": 900, "output_tokens": 70, "total_tokens": 1_870},
+                {"type": "item.completed", "item": {"id": "b", "type": "command_execution", "command": "echo two"}},
+            ),
+            (None, {"type": "item.completed", "item": {"id": "c", "type": "agent_message", "text": "never reached"}}),
+        ],
+    )
+    result = asyncio.run(run_agent("go", options=_codex_home_options(tmp_path, codex_home, max_turns=2)))
+
+    assert result.subtype == "error_max_turns"
+    assert result.num_turns == 2
+    # The running total, not a sum of the reports, and without the derived total_tokens key.
+    assert result.usage == {"input_tokens": 1_800, "cached_input_tokens": 900, "output_tokens": 70}
+    assert normalize_usage(result.usage, provider="codex") == Usage(
+        input=1_800, cache_read=900, cache_write=0, output=70
+    )
+
+
+def test_codex_prefers_turn_completed_usage_over_the_rollout(tmp_path: Path) -> None:
+    """The rollout fills a gap; it never overrides the figure Codex reports itself."""
+    codex_home = tmp_path / "codex-home"
+    _fake_codex_with_rollout(
+        tmp_path,
+        codex_home,
+        "thread-1",
+        [
+            (None, {"type": "thread.started", "thread_id": "thread-1"}),
+            (
+                {"input_tokens": 10, "output_tokens": 1},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+            ),
+            ({"input_tokens": 11, "output_tokens": 2}, {"type": "turn.completed", "usage": {"input_tokens": 12}}),
+        ],
+    )
+    result = asyncio.run(run_agent("go", options=_codex_home_options(tmp_path, codex_home)))
+
+    assert not result.is_error
+    assert result.usage == {"input_tokens": 12}
+
+
+def test_codex_budget_cap_bites_before_the_turn_ends(tmp_path: Path) -> None:
+    """The rollout total is what lets max_usd stop a Codex run rather than only report it."""
+    codex_home = tmp_path / "codex-home"
+    _fake_codex_with_rollout(
+        tmp_path,
+        codex_home,
+        "thread-1",
+        [
+            (None, {"type": "thread.started", "thread_id": "thread-1"}),
+            (
+                {"input_tokens": 1_000_000, "output_tokens": 0},
+                {"type": "item.completed", "item": {"id": "a", "type": "command_execution", "command": "echo one"}},
+            ),
+            (None, {"type": "item.completed", "item": {"id": "b", "type": "agent_message", "text": "never reached"}}),
+        ],
+    )
+    # gpt-5.6-sol bills $5/M input, so a million fresh input tokens is $5 against a $1 cap.
+    prices = PriceTable(
+        fetched={"gpt-5.6-sol": Rates(input=5.0, cached_input=0.5, cache_write=6.25, output=30.0)},
+        fetched_as_of="2026-08-04",
+    )
+    options = _codex_home_options(tmp_path, codex_home, max_usd=1.0, price_usd=pricer("gpt-5.6-sol", prices))
+    result = asyncio.run(run_agent("go", options=options))
+
+    assert result.subtype == "error_max_budget_usd"
+    # Stopped on the first report past the cap, before the agent's next action.
+    assert result.result == ""
+    assert result.usage == {"input_tokens": 1_000_000, "output_tokens": 0}
 
 
 def test_codex_stops_at_the_budget_cap(tmp_path: Path) -> None:
@@ -1036,8 +1159,8 @@ def test_provider_exhaustion_result_is_diagnostic_not_complete(tmp_path: Path, m
         provider="codex",
     )
 
-    @contextmanager
-    def fake_sandbox(*_args, **_kwargs):
+    @asynccontextmanager
+    async def fake_sandbox(*_args, **_kwargs):
         yield box
 
     async def exhausted(*_args, **_kwargs) -> AgentResult:
@@ -1083,6 +1206,142 @@ def test_provider_exhaustion_result_is_diagnostic_not_complete(tmp_path: Path, m
     assert outcome.reason == "provider_exhausted"
     assert persisted["valid"] is False
     assert not is_complete(directory)
+
+
+def _run_once_with(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    result: AgentResult,
+    answer: str | None,
+    prices: PriceTable | None = None,
+) -> dict:
+    """Drive ``run_once`` against a canned agent result and return the persisted payload."""
+    box_root = tmp_path / "box"
+    box_root.mkdir(exist_ok=True)
+    box = Sandbox(
+        root=box_root,
+        home=tmp_path / "home",
+        config_dir=tmp_path / "agent-home",
+        env={},
+        authenticated=True,
+        provider=result.provider,
+    )
+
+    @asynccontextmanager
+    async def fake_sandbox(*_args, **_kwargs):
+        yield box
+
+    async def fake_run_agent(*_args, **_kwargs) -> AgentResult:
+        return result
+
+    def collect(_box: Sandbox, directory: Path) -> None:
+        if answer is not None:
+            (directory / "answer.md").write_text(answer)
+
+    monkeypatch.setattr("acumen.runner.sandbox", fake_sandbox)
+    monkeypatch.setattr("acumen.runner.run_agent", fake_run_agent)
+    monkeypatch.setattr("acumen.runner._collect_artifacts", collect)
+    monkeypatch.setattr("acumen.runner.render_agent_transcript", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr("acumen.runner.agent_version", lambda _provider: "test")
+
+    model = "gpt-5.6-sol" if result.provider == "codex" else "claude-opus-5"
+    run_dir = tmp_path / "run"
+    asyncio.run(
+        run_once(
+            key=RunKey(arm="noskill", split="test", model=model, task_id="task", rep=1),
+            task=Task(id="task", train=TaskSplit("prompt", "SPI1"), test=TaskSplit("prompt", "SPI1")),
+            target=Target(
+                source="target",
+                ref="main",
+                src_dir=tmp_path / "src",
+                venv_dir=tmp_path / "venv",
+                commit="abc",
+                pkg_name="target",
+                pkg_version="1",
+            ),
+            run_dir=run_dir,
+            model=model,
+            max_turns=1,
+            max_usd=1.0,
+            prices=prices,
+        )
+    )
+    return json.loads((run_dir / "result.json").read_text())
+
+
+def _capped_result(subtype: str, provider: str = "codex") -> AgentResult:
+    return AgentResult(
+        provider=provider,  # type: ignore[arg-type]
+        is_error=True,
+        subtype=subtype,
+        errors=["acumen stopped the run at its turn cap"],
+        session_id="thread-1",
+        result="",
+        num_turns=1,
+        total_cost_usd=None,
+        duration_ms=10,
+        usage={"input_tokens": 100, "output_tokens": 10},
+    )
+
+
+@pytest.mark.parametrize("subtype", ["error_max_turns", "error_max_budget_usd"])
+@pytest.mark.parametrize("provider", ["codex", "claude"])
+def test_capped_run_is_graded_on_the_answer_it_managed_to_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, subtype: str, provider: str
+) -> None:
+    """A cap says the run was cut short, not that the answer it already wrote is worthless.
+
+    Discarding it scored a correct answer as a failure, which is the opposite of what the run
+    measured. The cap stays on the record in ``subtype`` and in the agent's errors.
+    """
+    payload = _run_once_with(tmp_path, monkeypatch, result=_capped_result(subtype, provider), answer="SPI1\n")
+
+    assert payload["success"] is True
+    assert payload["reason"] == "ok"
+    assert payload["subtype"] == subtype
+    assert payload["valid"] is True
+
+
+@pytest.mark.parametrize(("answer", "reason"), [("PU.1", "wrong_answer"), (None, "max_turns"), ("", "max_turns")])
+def test_capped_run_without_a_usable_answer_still_fails_on_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: str | None, reason: str
+) -> None:
+    """No answer.md, or an empty one, leaves nothing to grade — the cap is the whole story."""
+    payload = _run_once_with(tmp_path, monkeypatch, result=_capped_result("error_max_turns"), answer=answer)
+
+    assert payload["success"] is False
+    assert payload["reason"] == reason
+
+
+def test_a_broken_run_is_not_rescued_by_an_answer_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only caps defer to the grade. A failed sandbox means the run itself cannot be trusted."""
+    broken = replace(
+        _capped_result("error_max_turns"),
+        subtype="error_sandbox",
+        errors=["the Codex sandbox could not complete the run's file operations: bwrap: ..."],
+    )
+    payload = _run_once_with(tmp_path, monkeypatch, result=broken, answer="SPI1\n")
+
+    assert payload["success"] is False
+    assert payload["reason"] == "error"
+
+
+def test_capped_codex_run_records_the_tokens_it_spent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The usage recovered from the rollout has to reach result.json, not just AgentResult."""
+    prices = PriceTable(
+        fetched={"gpt-5.6-sol": Rates(input=5.0, cached_input=0.5, cache_write=6.25, output=30.0)},
+        fetched_as_of="2026-08-04",
+    )
+    payload = _run_once_with(
+        tmp_path, monkeypatch, result=_capped_result("error_max_turns"), answer="SPI1\n", prices=prices
+    )
+
+    assert payload["input_tokens"] == 100
+    assert payload["output_tokens"] == 10
+    # 100 fresh input at $5/M plus 10 output at $30/M.
+    assert payload["cost_usd"] == pytest.approx(100 * 5.0e-6 + 10 * 30.0e-6)
+    assert payload["cost_available"] is True
 
 
 def test_run_matrix_cancels_remaining_cells_when_provider_is_exhausted(
@@ -1227,6 +1486,27 @@ def test_codex_transcript_renders_its_own_html(tmp_path: Path) -> None:
     # The unfinished item survives, flagged as such.
     assert "sleep 60" in body and "unfinished" in body
     assert "41214" in body
+
+
+def test_capped_codex_transcript_shows_the_usage_the_run_recovered(tmp_path: Path) -> None:
+    """A capped run has no turn.completed to read usage from, and its footer said nothing.
+
+    It is the run whose spend is most worth seeing, so the caller passes in what it recorded.
+    """
+    jsonl = tmp_path / "capped.jsonl"
+    jsonl.write_text(
+        json.dumps({"type": "thread.started", "thread_id": "thread-9"})
+        + "\n"
+        + json.dumps({"type": "item.completed", "item": {"id": "a", "type": "agent_message", "text": "hi"}})
+        + "\n"
+    )
+    html = tmp_path / "capped.html"
+    assert render_codex_transcript(jsonl, html, {"input_tokens": 1_234, "output_tokens": 56}) is True
+    assert "1234" in html.read_text()
+
+    bare = tmp_path / "bare.html"
+    assert render_codex_transcript(jsonl, bare) is True
+    assert "1234" not in bare.read_text()
 
 
 def test_codex_transcript_renders_without_events(tmp_path: Path) -> None:
@@ -1453,8 +1733,8 @@ def test_benchmark_persists_unavailable_cost_as_null(tmp_path: Path, monkeypatch
         provider="codex",
     )
 
-    @contextmanager
-    def fake_sandbox(*_args, **_kwargs):
+    @asynccontextmanager
+    async def fake_sandbox(*_args, **_kwargs):
         yield box
 
     async def fake_run_agent(*_args, **_kwargs) -> AgentResult:
@@ -1527,8 +1807,8 @@ def test_benchmark_persists_provider_first_cost_for_nested_claude_agents(
         provider="claude",
     )
 
-    @contextmanager
-    def fake_sandbox(*_args, **_kwargs):
+    @asynccontextmanager
+    async def fake_sandbox(*_args, **_kwargs):
         yield box
 
     async def fake_run_agent(*_args, **_kwargs) -> AgentResult:

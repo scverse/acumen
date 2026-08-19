@@ -150,12 +150,20 @@ def _codex_usage_table(usage: dict[str, Any]) -> str:
     return f"<table>{rows}</table>"
 
 
-def render_codex_events(events: Iterable[dict[str, Any]], html: Path) -> bool:
+def render_codex_events(
+    events: Iterable[dict[str, Any]],
+    html: Path,
+    usage: dict[str, Any] | None = None,
+) -> bool:
     """Render a ``codex exec --json`` event stream to a standalone HTML file.
 
     Items are rendered in the order Codex completed them. An item that only ever ``started`` —
     what a run terminated at its turn cap leaves behind — is rendered too, marked unfinished, so
     a capped run still shows what it was doing when acumen stopped it.
+
+    ``usage`` is the tally the caller recorded for the run. A capped run has no
+    ``turn.completed`` event to read one from, so passing it is what keeps the footer from going
+    blank on exactly the runs whose spend is most worth seeing.
 
     Returns
     -------
@@ -164,7 +172,7 @@ def render_codex_events(events: Iterable[dict[str, Any]], html: Path) -> bool:
     started: dict[str, dict[str, Any]] = {}
     blocks: list[str] = []
     session = ""
-    usage: dict[str, Any] = {}
+    tally: dict[str, Any] = dict(usage or {})
     errors: list[str] = []
     for event in events:
         kind = event.get("type")
@@ -173,7 +181,7 @@ def render_codex_events(events: Iterable[dict[str, Any]], html: Path) -> bool:
         elif kind == "turn.completed":
             raw = event.get("usage")
             if isinstance(raw, dict):
-                usage = raw
+                tally = raw
         elif kind in {"error", "turn.failed"}:
             errors.append(str(event.get("message") or event.get("error") or event))
         elif kind in {"item.started", "item.completed"}:
@@ -193,7 +201,7 @@ def render_codex_events(events: Iterable[dict[str, Any]], html: Path) -> bool:
 
     meta = f"thread {escape(session)}" if session else "no thread id"
     body = "".join(blocks) or '<div class="item"><div class="label">no events</div></div>'
-    footer = _codex_usage_table(usage) if usage else ""
+    footer = _codex_usage_table(tally) if tally else ""
     html.parent.mkdir(parents=True, exist_ok=True)
     html.write_text(
         "<!doctype html>\n"
@@ -207,7 +215,7 @@ def render_codex_events(events: Iterable[dict[str, Any]], html: Path) -> bool:
     return html.is_file()
 
 
-def render_codex_transcript(jsonl: Path, html: Path) -> bool:
+def render_codex_transcript(jsonl: Path, html: Path, usage: dict[str, Any] | None = None) -> bool:
     """Render a saved Codex event stream (one JSON object per line) to HTML."""
     try:
         lines = jsonl.read_text(encoding="utf-8").splitlines()
@@ -221,9 +229,17 @@ def render_codex_transcript(jsonl: Path, html: Path) -> bool:
             continue
         if isinstance(event, dict):
             events.append(event)
-    return render_codex_events(events, html)
+    return render_codex_events(events, html, usage)
 
 
-def render_agent_transcript(jsonl: Path, html: Path, *, provider: str) -> bool:
+def render_agent_transcript(
+    jsonl: Path,
+    html: Path,
+    *,
+    provider: str,
+    usage: dict[str, Any] | None = None,
+) -> bool:
     """Render a run's transcript with the renderer that understands its format."""
-    return render_codex_transcript(jsonl, html) if provider == "codex" else render_transcript(jsonl, html)
+    if provider == "codex":
+        return render_codex_transcript(jsonl, html, usage)
+    return render_transcript(jsonl, html)

@@ -39,6 +39,14 @@ _SUBTYPE_REASONS: dict[str, Reason] = {
     "error_max_turns": "max_turns",
 }
 
+#: Reasons that mean the run was cut short by a cap rather than broken. An agent that already
+#: wrote an answer before the cap produced a measurement, and throwing it away scored a correct
+#: answer as a failure. So a capped run is graded on what it wrote, and only a capped run with
+#: nothing to grade keeps the cap as its reason. Every other terminal reason — a crash, a
+#: refused sandbox, an exhausted account — says the run itself cannot be trusted, and those
+#: still override the grade.
+_CAP_REASONS: frozenset[Reason] = frozenset(_SUBTYPE_REASONS.values())
+
 # Provider/account exhaustion is a failure of the benchmark infrastructure, not evidence
 # about the model. Keep these deliberately narrower than generic 429/rate-limit wording:
 # transient throttling is not proof that the account has no remaining usage or credit.
@@ -402,7 +410,12 @@ async def run_once(
     skill_loaded: bool | None = None
     expected_skill = skill.name if skill is not None else skill_name
     if (run_dir / TRANSCRIPT_JSONL).is_file():
-        rendered = render_agent_transcript(run_dir / TRANSCRIPT_JSONL, run_dir / TRANSCRIPT_HTML, provider=provider)
+        rendered = render_agent_transcript(
+            run_dir / TRANSCRIPT_JSONL,
+            run_dir / TRANSCRIPT_HTML,
+            provider=provider,
+            usage=result.usage if result else None,
+        )
         if expected_skill is not None:
             skill_loaded = _skill_fired(run_dir / TRANSCRIPT_JSONL, expected_skill, provider=provider)
 
@@ -420,8 +433,10 @@ async def run_once(
         success, reason = False, "error"
     else:
         terminal = _terminal_reason(result)
-        if terminal is not None:
-            # A cap breach is a failure regardless of what landed in answer.md.
+        # ``grade.answer`` is None with no answer.md and "" when the file is empty, so a capped
+        # run is only graded when there is something in it to grade. The cap stays on the record
+        # either way: ``subtype`` and the agent's errors still report it.
+        if terminal is not None and not (terminal in _CAP_REASONS and grade.answer):
             success, reason = False, terminal
         else:
             success, reason = grade.success, grade.reason

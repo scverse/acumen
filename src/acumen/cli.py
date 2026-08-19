@@ -126,15 +126,14 @@ def _warn_codex_accounting(provider: AgentProvider) -> None:
     """Say what a Codex cap can and cannot do before the spend, not after.
 
     ``codex exec`` has no cap of its own, so acumen enforces both against the event stream.
-    That works exactly as advertised for turns, which stream. Usage does not: Codex reports it
-    once, when the turn ends, so ``max_usd`` can only be recognized after the money is spent.
-    It still records the run as a budget failure — the same outcome Claude would give it — but
-    the only cap that actually *bounds* a Codex run is ``max_turns``.
+    Turns stream, so that cap is exact. Usage arrives once per model response, read from the
+    running total Codex records for the turn, so ``max_usd`` stops the run partway through it
+    rather than the instant the cap is crossed: one response can still carry it past the limit.
     """
     if provider == "codex":
         print(
-            "note: Codex reports usage only when a turn ends, so max_usd marks an over-budget "
-            "run as a failure but cannot stop the spend — bound Codex runs with max_turns",
+            "note: Codex reports usage once per model response, so max_usd stops the run at "
+            "the first report past the cap and a single response can still overshoot it",
             file=sys.stderr,
         )
 

@@ -106,6 +106,29 @@ and this project adheres to [Semantic Versioning][].
 
 ### Fixed
 
+- Record what a capped or crashed Codex run actually spent. `codex exec --json` reports usage
+  once, in `turn.completed`, which a run acumen stops at its turn cap never reaches, so every
+  turn-capped run recorded zero tokens and a cost of `$0.00` after minutes of real work. acumen
+  now follows the running total Codex writes to its rollout session file, which means dropping
+  `--ephemeral` so that file exists; it lands inside the run-local `CODEX_HOME` and is discarded
+  with the sandbox. A shipper run given no config directory will now leave a session in the
+  operator's own `~/.codex`, as a plain `codex exec` would. A capped run is also stopped with an
+  interrupt rather than killed outright, which is what lets Codex finish writing the record for
+  the response that has just landed; a hard kill loses it. The recovered figure is still a lower
+  bound, since the very last response can be cut off before it is recorded, but a measured
+  turn-capped run went from `$0.00` on nothing to a real cost on 30k real tokens.
+  `turn.completed` stays authoritative whenever it arrives, and a rollout that cannot be read or
+  parsed leaves the run exactly as it was before. The same total is what `max_usd` is now checked
+  against, once per model response rather than once per turn, so a Codex budget cap stops the run
+  partway through the turn instead of only labelling the overspend after the fact. A single
+  response can still overshoot.
+- Grade a capped run on the answer it managed to write. A run stopped at its turn or budget cap
+  was failed on the cap alone, so an agent that had already written a correct `answer.md` before
+  being cut off was recorded as a failure with its answer sitting unscored in `result.json`. The
+  cap now defers to the grade whenever there is an answer to grade; with no `answer.md`, or an
+  empty one, the run still fails as `max_turns` or `budget`. The cap remains visible in the run's
+  `subtype` and error list. Applies to Claude and Codex alike, and does not change how a crash, a
+  failed sandbox or an exhausted account is classified: those still override the grade.
 - Give isolated agents unrestricted internet again. Sandboxing every run also put an egress
   policy in front of it, and the policy denied the hosts a target actually needs: EBI, Zenodo,
   figshare, OmniPath, NCBI and cellxgene were all unreachable while GitHub and PyPI were not.
