@@ -42,7 +42,14 @@ and this project adheres to [Semantic Versioning][].
   provider for drafting, improving, task generation, and shipping.
 - Compute `cost_usd` from each run's token breakdown rather than the provider's own
   figure, so both providers are priced by one arithmetic path and cached input is billed
-  at its own rate. The rates used are frozen into `result.json`.
+  at its own rate. The rates used are frozen into `result.json`. Where a backend reports
+  dollars of its own, that figure is recorded beside it as `provider_cost_usd` (the report's
+  sidecar CSV calls it `recorded_cost_usd`) together with its distance from the inferred
+  value, but nothing plotted, printed or summed reads it: a Claude SDK total covers nested
+  subagents its own usage block does not, so a console tally on that basis would disagree
+  with the report it summarises. A model no layer prices stays unpriced even when the
+  provider reported dollars, and the report warns at the top, naming the models that need a
+  `prices:` entry.
 - Add `acumen prices` to show the rate table and `acumen prices --refresh` to diff it
   against the providers' published pricing, plus a `prices:` config key to override it.
 - Ship no rate table at all: rates are read from the providers' pricing pages on every

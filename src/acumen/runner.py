@@ -329,9 +329,9 @@ async def run_once(
     model, max_turns, max_usd
         Already resolved against per-task overrides by the caller.
     auth_mode
-        Which credential the benchmark run authenticates with. Under ``"session"``, recorded
-        Claude's SDK cost is API-equivalent rather than necessarily an invoice charge;
-        Codex falls back to frozen-table token inference.
+        Which credential the benchmark run authenticates with. Both modes report tokens, so
+        both are priced from the frozen rate table; under ``"session"`` that figure is what
+        the run would have cost at API rates, not money charged.
     skill
         The skill to install, or ``None`` for the baseline arm. Must agree with
         ``key.arm``, else the run would be filed under an arm it doesn't belong to.
@@ -442,9 +442,11 @@ async def run_once(
             success, reason = grade.success, grade.reason
 
     usage = normalize_usage(result.usage if result else None, provider=provider)
-    # Preserve frozen-table inference for both providers, but prefer the SDK's value when it
-    # exists. For session authentication that provider figure is API-equivalent, not
-    # necessarily money charged on an invoice.
+    # Price the run from the table frozen into this result: that basis is shared by both
+    # providers and reproducible from the rates recorded beside it, so it is the figure
+    # reports and console lines use. The SDK's own value, where there is one, is recorded
+    # alongside for audit — and under session authentication it is API-equivalent anyway,
+    # not money charged on an invoice.
     lookup = (prices or PriceTable()).lookup(model)
     inferred = price_run(usage, None if lookup is None else lookup.rates)
     provider_cost = result.total_cost_usd if result else None
@@ -458,8 +460,8 @@ async def run_once(
         "agent": provider,
         "provider": "anthropic" if provider == "claude" else "openai",
         "backend": "claude_agent_sdk" if provider == "claude" else "codex_cli",
-        # Which credential paid for the run. Under "session", provider cost is an
-        # API-equivalent SDK estimate rather than necessarily metered spend.
+        # Which credential paid for the run. Under "session" the recorded cost is what the
+        # run would have cost at API rates, not metered spend.
         "auth_mode": auth_mode,
         "rep": key.rep,
         "success": success,

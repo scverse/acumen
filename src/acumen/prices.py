@@ -1,9 +1,11 @@
-"""Per-model token rates and provider-first cost resolution.
+"""Per-model token rates and inferred cost resolution.
 
 The Claude SDK reports an API-equivalent dollar cost while ``codex exec`` reports none.
-Acumen therefore preserves two measurements: the provider value when one exists and a
-reproducible inference from a rate table. The provider value is canonical; inference is
-the fallback and remains alongside it for comparison.
+Acumen therefore preserves two measurements: a reproducible inference from a rate table and
+the provider value when one exists. **Inference is canonical.** It is the one basis both
+providers share, the only one that survives re-reading an old benchmark unchanged, and the
+only one an operator can reproduce from the rates stored beside the figure. The provider
+value is recorded alongside it, for audit and for the delta between the two.
 
 Three properties this design depends on:
 
@@ -311,7 +313,13 @@ def price_run(usage: Usage, rates: Rates | None) -> float | None:
 
 @dataclass(frozen=True)
 class CostResolution:
-    """Canonical and comparative costs for one completed agent run."""
+    """The inferred cost of one completed agent run, and the provider's own figure.
+
+    ``cost_usd`` is the canonical value — what every report, figure and console line shows —
+    and equals ``inferred_cost_usd``. ``cost_delta_usd`` and ``cost_delta_pct`` measure the
+    provider's figure against that basis, so a positive delta means the provider reported
+    more than the rate table charges the run.
+    """
 
     cost_usd: float | None
     cost_source: str
@@ -327,21 +335,22 @@ class CostResolution:
 
 
 def resolve_cost(provider_cost_usd: float | None, inferred_cost_usd: float | None) -> CostResolution:
-    """Prefer a provider-reported cost while retaining reproducible inference."""
-    canonical = provider_cost_usd if provider_cost_usd is not None else inferred_cost_usd
-    source = (
-        "provider"
-        if provider_cost_usd is not None
-        else ("inferred" if inferred_cost_usd is not None else "unavailable")
-    )
+    """Price a run from its own rate table, recording the provider's figure beside it.
+
+    Inference is the canonical cost, so a model with no rates is unpriced even when the
+    provider reported dollars: substituting that figure would put one run on a basis the
+    rest of the benchmark is not on, which is worse than a known gap. The provider value is
+    still recorded, and the delta says how far it sits from the basis reports use.
+    """
+    source = "inferred" if inferred_cost_usd is not None else "unavailable"
     delta = None
     pct = None
     if provider_cost_usd is not None and inferred_cost_usd is not None:
-        delta = inferred_cost_usd - provider_cost_usd
-        if provider_cost_usd != 0:
-            pct = delta / provider_cost_usd
+        delta = provider_cost_usd - inferred_cost_usd
+        if inferred_cost_usd != 0:
+            pct = delta / inferred_cost_usd
     return CostResolution(
-        cost_usd=canonical,
+        cost_usd=inferred_cost_usd,
         cost_source=source,
         provider_cost_usd=provider_cost_usd,
         inferred_cost_usd=inferred_cost_usd,

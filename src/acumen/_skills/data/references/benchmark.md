@@ -68,15 +68,16 @@ resume safe. Useful fields: `success`, `reason`, `answer`, `expected`, `model`, 
 `cost_usd`, `input_tokens`, `output_tokens`, `duration_s`, `skill_hash`, `skill_name`,
 `skill_loaded`, `pkg_version`, `commit`, `session_id`, `subtype`, `valid`, `error`.
 
-**`cost_usd` prefers the provider's value and falls back to token inference.** Each run records
-`provider_cost_usd`, `inferred_cost_usd`, `cost_source`, and the absolute/relative delta when
-both exist. Claude's SDK total is API-equivalent (not necessarily an invoice charge under
-session authentication); Codex reports no dollars, so it uses inference. Token classes and the
-rates frozen into `price_rates` remain available for reproduction, including Claude's separate
-five-minute and one-hour cache writes plus the legacy aggregate. A model with neither provider
-cost nor rates leaves `cost_available` false and `cost_usd` null. A run without rates leaves
-`inferred_cost_usd` null even when the provider supplied a value, so reports cannot mistake it
-for a free or cross-provider-comparable run.
+**`cost_usd` is inferred from tokens, and equals `inferred_cost_usd`.** Each run also records
+`provider_cost_usd` (Claude's SDK total, API-equivalent rather than necessarily an invoice
+charge under session authentication; Codex reports no dollars), `cost_source`, and the provider
+figure's absolute/relative distance from the inferred one when both exist. Inference is the
+canonical basis because both providers report tokens and the rates are frozen into the result,
+so the figure is reproducible and comparable across providers. Token classes and the rates in
+`price_rates` remain available for reproduction, including Claude's separate five-minute and
+one-hour cache writes plus the legacy aggregate. A run without rates leaves `cost_usd` and
+`inferred_cost_usd` null and `cost_available` false even when the provider supplied a value:
+that figure would put one run on a basis no other run in the pass is on.
 
 **No rates ship with the package.** They are read from the providers' pricing pages, because a
 compiled-in table is wrong from whatever date prices next move, and each run's cost is frozen
@@ -94,10 +95,11 @@ Inspect today's rates with `acumen prices`. Set `prices:` in `config.yaml` to pr
 providers don't publish or to pin negotiated rates, which outrank a fetch; `acumen prices
 --refresh` reports pins that have drifted from the published price.
 
-Reports deliberately use `inferred_cost_usd` for every cost-per-run value and comparison, so
-Claude and Codex stay on the same pricing basis even when Claude supplies an SDK estimate. The
-sidecar CSV preserves the two values separately as `recorded_cost_usd` and
-`inferred_cost_usd`; `cost_usd` remains present as the provider-first compatibility field.
+Reports, the run table and the console all show that inferred value, so Claude and Codex stay
+on the same pricing basis even when Claude supplies an SDK estimate. The sidecar CSV carries
+`cost_usd` (the figure the charts use), `inferred_cost_usd`, and the provider's own figure as
+`recorded_cost_usd`. Unpriced runs are dropped from cost charts and comparisons, and the report
+opens with a warning naming the models that had no rates.
 
 `codex exec` has no cap of its own, so acumen enforces both from its event stream, at
 different resolutions. `max_turns` really does stop the run — counted in completed model

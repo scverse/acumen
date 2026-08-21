@@ -121,11 +121,6 @@ _RC = {
 #: held-out (test) performance.
 _REPORTED_SPLIT = "test"
 
-# Reports compare providers on one consistent basis: the frozen price table applied to
-# token usage.  Keep this separate from ``cost_usd``, whose result-schema meaning remains
-# provider-first for backwards compatibility and auditability.
-_REPORT_COST_COLUMN = "_report_cost_usd"
-
 
 #: Brand assets bundled with the package (see ``src/acumen/assets``). Inlined as ``data:``
 #: URIs so ``report.html`` stays self-contained — the favicon and the sidebar banner
@@ -289,7 +284,10 @@ def load_results(runs_root: Path) -> pd.DataFrame:
         df["inferred_cost_usd"] = pd.to_numeric(df["inferred_cost_usd"], errors="coerce")
     legacy = ~df.pop("_has_inferred_cost").astype(bool)
     df.loc[legacy, "inferred_cost_usd"] = df.loc[legacy, "cost_usd"]
-    df[_REPORT_COST_COLUMN] = df["inferred_cost_usd"]
+    # One basis for every cost this report shows: the frozen price table applied to token
+    # usage, which both providers report. A provider's own figure covers only one of them and
+    # can include work the run's usage block does not, so it stays a recorded field.
+    df["cost_usd"] = df["inferred_cost_usd"]
     df["total_tokens"] = df["input_tokens"] + df["output_tokens"]
     df["arm_label"] = df["arm"].map(arm_label)
     df["_arm_order"] = df["arm"].map(_arm_sort_key)
@@ -352,9 +350,7 @@ def arm_metrics(df: pd.DataFrame) -> pd.DataFrame:
                 "rate": rate,
                 "stderr": stderr,
                 "tokens": float(group["total_tokens"].sum()),
-                "cost": (
-                    float(group[_REPORT_COST_COLUMN].sum()) if group[_REPORT_COST_COLUMN].notna().all() else math.nan
-                ),
+                "cost": (float(group["cost_usd"].sum()) if group["cost_usd"].notna().all() else math.nan),
                 "time": float(group["duration_s"].sum()),
                 "n": len(group),
             }
@@ -395,7 +391,7 @@ _PROPORTION_COLUMN = {"rate": "success", "loaded": "skill_loaded"}
 _PROPORTION_KEYS = frozenset({*_PROPORTION_COLUMN, "rate_loaded"})
 
 #: Metric key → the resource column it averages (the proportions are handled separately).
-_MEAN_COLUMN = {"tokens": "total_tokens", "cost": _REPORT_COST_COLUMN, "time": "duration_s"}
+_MEAN_COLUMN = {"tokens": "total_tokens", "cost": "cost_usd", "time": "duration_s"}
 
 
 def _model_tier(model: str) -> str:
@@ -1135,8 +1131,8 @@ def _cluster_totals(df: pd.DataFrame, arms: Sequence[str]) -> tuple[np.ndarray, 
     for ci, cluster in enumerate(clusters):
         for ai, arm in enumerate(arms):
             rows = test[(test[_CLUSTER_COLUMN] == cluster) & (test["arm"] == arm)]
-            report_cost = rows[_REPORT_COST_COLUMN]
-            cost[ci, ai] = report_cost.sum() if report_cost.notna().all() else math.nan
+            run_cost = rows["cost_usd"]
+            cost[ci, ai] = run_cost.sum() if run_cost.notna().all() else math.nan
             successes[ci, ai] = rows["success"].sum()
             runs[ci, ai] = len(rows)
     return cost, successes, runs
@@ -1617,14 +1613,17 @@ def _integrity_notes(df: pd.DataFrame) -> list[str]:
     Occasional misses are normal and the per-run table already marks them, so a skill arm is
     only flagged once fewer than half its runs loaded the skill.
 
-    Cost carries its own comparability hazard, handled by :func:`_price_date_note`.
+    Cost is priced from the rate table each run froze, so a model no layer priced has no cost
+    at all — the note names those models, since the fix is a ``prices:`` entry for each one.
+    Cost carries a second comparability hazard, handled by :func:`_price_date_note`.
     """
     notes = []
-    unpriced = int(df[_REPORT_COST_COLUMN].isna().sum())
-    if unpriced:
+    unpriced = df["cost_usd"].isna()
+    if unpriced.any():
+        models = ", ".join(sorted(str(m) for m in df.loc[unpriced, "model"].unique()))
         notes.append(
-            f"cost unavailable for {unpriced}/{len(df)} runs; cost charts and comparisons omit "
-            "groups containing unpriced runs"
+            f"cost unavailable for {int(unpriced.sum())}/{len(df)} runs; no token rates for "
+            f"{models}, so cost charts and comparisons omit groups containing those runs"
         )
     price_dates = _price_date_note(df)
     if price_dates is not None:
@@ -1719,7 +1718,7 @@ def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
         else:
             link = "&mdash;"
         status = "pass" if row["success"] else "fail"
-        cost = row[_REPORT_COST_COLUMN]
+        cost = row["cost_usd"]
         cost_cell = ("&mdash;", None) if pd.isna(cost) else (f"{float(cost):.3f}", float(cost))
         cells: list[tuple[str, float | None]] = [
             (html.escape(str(row["arm_label"])), None),
@@ -2298,9 +2297,10 @@ def build_report(
 
     # A sidecar CSV of the aggregated results, for anyone who wants to reanalyse or plot
     # the numbers themselves. Drop the internal helper columns (Path objects and sort
-    # keys) so it stays a clean, portable table.
+    # keys) so it stays a clean, portable table. ``cost_usd`` is the figure every chart uses;
+    # ``recorded_cost_usd`` is what the provider itself reported, kept for audit.
     data_path = out_path.with_suffix(".csv")
-    internal = [c for c in ("result_path", "transcript_path", "_arm_order", _REPORT_COST_COLUMN) if c in df.columns]
+    internal = [c for c in ("result_path", "transcript_path", "_arm_order") if c in df.columns]
     data = df.drop(columns=internal).rename(columns={"provider_cost_usd": "recorded_cost_usd"})
     if "skill_loaded" in data.columns:
         # The HTML table keeps '?' for a run whose transcript could not be read, but the CSV

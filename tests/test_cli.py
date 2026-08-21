@@ -19,7 +19,7 @@ import pytest
 
 from acumen.agents import AgentError
 from acumen.bench import BenchmarkInvalidError
-from acumen.cli import _agent_prices, _Progress, build_parser, main
+from acumen.cli import _agent_prices, _print_run_summary, _Progress, build_parser, main
 from acumen.config import load_config
 from acumen.env import Target
 from acumen.paths import RunKey
@@ -82,6 +82,36 @@ def test_progress_prints_unavailable_cost_without_casting_null(capsys: pytest.Ca
     )
 
     assert "cost n/a" in capsys.readouterr().out
+
+
+def test_console_costs_are_the_figure_the_report_plots(capsys: pytest.CaptureFixture[str], model: str) -> None:
+    """The per-run line and the pass tally must not disagree with the report.
+
+    A Claude run's SDK figure can dwarf what its own usage block prices — nested subagents —
+    so a console reading that figure would tally a pass at one number and report it at another.
+    """
+    outcome = RunOutcome(
+        key=RunKey(arm="noskill", split="test", model=model, task_id="task", rep=1),
+        success=True,
+        reason="ok",
+        payload={
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "cost_usd": 0.20,
+            "cost_available": True,
+            "provider_cost_usd": 0.90,
+            "inferred_cost_usd": 0.20,
+            "duration_s": 0.1,
+        },
+    )
+    progress = _Progress(1)
+    progress.running = 1
+    progress.on_done(outcome)
+    _print_run_summary([outcome], 1.0)
+
+    out = capsys.readouterr().out
+    assert "$0.20" in out
+    assert "$0.90" not in out
 
 
 def test_progress_prints_provider_exhaustion_as_invalid(capsys: pytest.CaptureFixture[str], model: str) -> None:

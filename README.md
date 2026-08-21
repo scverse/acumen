@@ -183,14 +183,17 @@ which has no cap of its own — acumen enforces both against its event stream:
   visible after the money is spent. The run is recorded as a budget failure — the same outcome
   Claude gives it — but bound Codex spend with `max_turns`. acumen prints this before the pass.
 
-**Reports compare inferred cost per run.** Every run records its token breakdown — fresh
-input, cache reads, cache writes, and output — and Acumen prices it with the rate table
-stored in `result.json`. That gives Claude and Codex one comparable basis and prevents an old
-benchmark from being silently re-priced. The result itself retains both
-`provider_cost_usd` (when the backend supplies one) and `inferred_cost_usd`; its compatibility
-field `cost_usd` remains provider-first. The report's sidecar CSV calls the former
-`recorded_cost_usd` and keeps it separate from `inferred_cost_usd`, while every displayed cost
-and comparison uses the inferred value.
+**Every cost acumen shows is inferred from tokens.** Each run records its breakdown (fresh
+input, cache reads, cache writes, and output) and Acumen prices it with the rate table stored
+in `result.json`. That gives Claude and Codex one comparable basis and prevents an old
+benchmark from being silently re-priced, so it is what `cost_usd` holds and what every figure,
+table, CSV column and console line reports. Where a backend supplies a dollar figure of its own
+it is recorded beside it as `provider_cost_usd` (`recorded_cost_usd` in the report's sidecar
+CSV), with the gap between the two, but nothing is plotted or tallied from it: Claude's SDK
+total covers nested subagents that the run's own usage block does not, so a console reading it
+would disagree with the report it summarises. A model no layer prices stays unpriced even when
+the provider reported dollars, since one run on a basis the rest of the pass is not on is worse
+than a visible gap.
 
 **Rates are read from the providers' pricing pages, never shipped with the package.** Prices
 move, and each run's cost is frozen into its `result.json` and never recomputed, so a table

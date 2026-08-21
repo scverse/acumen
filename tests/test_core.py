@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import html
 import json
 import os
 import re
@@ -87,7 +88,6 @@ from acumen.prices import (
 from acumen.procs import label_env, reap, supported, survivors
 from acumen.prompts import draft_prompt, feedback_block, improve_prompt
 from acumen.report import (
-    _REPORT_COST_COLUMN,
     ReportError,
     _arm_marker,
     _best_cells,
@@ -106,6 +106,7 @@ from acumen.report import (
     load_results,
     loaded_only_rates,
     metrics_figure,
+    render_report,
     resolve_palette,
     skill_tests,
     tradeoff_figure,
@@ -1666,19 +1667,32 @@ def test_claude_cache_writes_retain_five_minute_and_one_hour_classes() -> None:
     assert price_run(usage, rates) == pytest.approx((100 * 4 + 1_000 * 5 + 2_000 * 8) / 1_000_000)
 
 
-def test_provider_cost_is_canonical_while_inference_and_nested_agent_delta_survive() -> None:
-    # The SDK total includes nested agents while the parent usage block can be smaller.
+def test_inference_is_canonical_while_the_provider_figure_and_its_delta_survive() -> None:
+    # The SDK total includes nested agents while the parent usage block can be smaller, so the
+    # two figures are not measuring the same work; the delta is what makes that visible.
     cost = resolve_cost(provider_cost_usd=1.25, inferred_cost_usd=0.40)
-    assert cost.cost_usd == 1.25
-    assert cost.cost_source == "provider"
-    assert cost.inferred_cost_usd == 0.40
-    assert cost.cost_delta_usd == pytest.approx(-0.85)
-    assert cost.cost_delta_pct == pytest.approx(-0.68)
+    assert cost.cost_usd == 0.40
+    assert cost.cost_source == "inferred"
+    assert cost.provider_cost_usd == 1.25
+    assert cost.cost_delta_usd == pytest.approx(0.85)
+    assert cost.cost_delta_pct == pytest.approx(2.125)
 
 
-def test_cost_falls_back_to_inference_and_never_turns_unavailable_into_free() -> None:
-    inferred = resolve_cost(None, 0.40)
-    assert (inferred.cost_usd, inferred.cost_source, inferred.available) == (0.40, "inferred", True)
+def test_a_provider_figure_never_substitutes_for_missing_inference() -> None:
+    """An unpriced model is unpriced, however many dollars the provider reported.
+
+    Taking the provider's figure would put that one run on a basis no other run in the pass
+    is on, which is a silent wrong number rather than a visible gap.
+    """
+    unpriced = resolve_cost(1.25, None)
+    assert unpriced.cost_usd is None
+    assert unpriced.cost_source == "unavailable"
+    assert unpriced.available is False
+    assert unpriced.provider_cost_usd == 1.25
+    assert unpriced.cost_delta_usd is None
+
+    codex = resolve_cost(None, 0.40)
+    assert (codex.cost_usd, codex.cost_source, codex.available) == (0.40, "inferred", True)
 
     unavailable = resolve_cost(None, None)
     assert unavailable.cost_usd is None
@@ -1793,7 +1807,7 @@ def test_benchmark_persists_unavailable_cost_as_null(tmp_path: Path, monkeypatch
     assert persisted["agent"] == "codex"
 
 
-def test_benchmark_persists_provider_first_cost_for_nested_claude_agents(
+def test_benchmark_persists_inferred_cost_and_records_the_claude_sdk_figure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     box_root = tmp_path / "box"
@@ -1860,12 +1874,12 @@ def test_benchmark_persists_provider_first_cost_for_nested_claude_agents(
     )
 
     persisted = json.loads((run_dir / "result.json").read_text())
-    assert persisted["cost_usd"] == 1.25
-    assert persisted["cost_source"] == "provider"
+    assert persisted["cost_usd"] == pytest.approx(0.005)
+    assert persisted["cost_source"] == "inferred"
     assert persisted["provider_cost_usd"] == 1.25
     assert persisted["inferred_cost_usd"] == pytest.approx(0.005)
-    assert persisted["cost_delta_usd"] == pytest.approx(-1.245)
-    assert persisted["cost_delta_pct"] == pytest.approx(-0.996)
+    assert persisted["cost_delta_usd"] == pytest.approx(1.245)
+    assert persisted["cost_delta_pct"] == pytest.approx(249.0)
     assert persisted["provider"] == "anthropic"
     assert persisted["backend"] == "claude_agent_sdk"
     assert persisted["agent"] == "claude"
@@ -2751,10 +2765,14 @@ def test_unpriced_runs_are_unknown_in_reports_not_zero_cost(
         plt.close(figure)
 
 
-def test_reports_use_inferred_cost_and_csv_keeps_recorded_cost(
+def test_reports_show_inferred_cost_and_csv_keeps_the_recorded_one(
     runs_root: Path, model: str, make_result, tmp_path: Path
 ) -> None:
-    """Provider cost remains auditable without changing cross-provider comparisons."""
+    """A result recorded before inference became canonical still reports on that basis.
+
+    The provider figure stays auditable in the CSV, but nothing displayed is drawn from it:
+    it covers one provider only, so a report mixing the two would compare unlike numbers.
+    """
     key = RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=1)
     make_result(
         runs_root,
@@ -2768,8 +2786,7 @@ def test_reports_use_inferred_cost_and_csv_keeps_recorded_cost(
 
     df = load_results(runs_root)
     test = df[df["split"] == "test"]
-    assert test.iloc[0]["cost_usd"] == pytest.approx(0.90)
-    assert test.iloc[0][_REPORT_COST_COLUMN] == pytest.approx(0.20)
+    assert test.iloc[0]["cost_usd"] == pytest.approx(0.20)
     assert arm_metrics(test).loc[0, "cost"] == pytest.approx(0.20)
     assert "0.200" in _runs_table_html(test, tmp_path)
     assert "0.900" not in _runs_table_html(test, tmp_path)
@@ -2778,10 +2795,10 @@ def test_reports_use_inferred_cost_and_csv_keeps_recorded_cost(
     build_report(runs_root, out_path)
     exported = pd.read_csv(out_path.with_suffix(".csv"))
     test_row = exported[exported["split"] == "test"].iloc[0]
-    assert test_row["recorded_cost_usd"] == pytest.approx(0.90)
+    assert test_row["cost_usd"] == pytest.approx(0.20)
     assert test_row["inferred_cost_usd"] == pytest.approx(0.20)
+    assert test_row["recorded_cost_usd"] == pytest.approx(0.90)
     assert "provider_cost_usd" not in exported.columns
-    assert _REPORT_COST_COLUMN not in exported.columns
 
 
 def test_modern_result_without_inferred_cost_stays_unpriced_in_report(runs_root: Path, model: str, make_result) -> None:
@@ -2798,9 +2815,25 @@ def test_modern_result_without_inferred_cost_stays_unpriced_in_report(runs_root:
     )
 
     test = load_results(runs_root).query("split == 'test'")
-    assert test.iloc[0]["cost_usd"] == pytest.approx(0.90)
-    assert pd.isna(test.iloc[0][_REPORT_COST_COLUMN])
+    assert pd.isna(test.iloc[0]["cost_usd"])
     assert pd.isna(arm_metrics(test).loc[0, "cost"])
+
+
+def test_the_unpriced_note_names_the_model_that_could_not_be_priced(
+    runs_root: Path, model: str, make_result, tmp_path: Path
+) -> None:
+    """The fix is a ``prices:`` entry, so the warning has to say which model needs one."""
+    for rep, cost in ((1, None), (2, 0.20)):
+        key = RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=rep)
+        make_result(runs_root, key, cost_usd=cost, cost_available=cost is not None, inferred_cost_usd=cost)
+
+    df = load_results(runs_root)
+    note = next(n for n in _integrity_notes(df) if "cost unavailable" in n)
+    assert f"no token rates for {model}" in note
+
+    # The warning belongs above the figures it qualifies, not buried beside them.
+    rendered = render_report(df, tmp_path)
+    assert rendered.index(html.escape(note)) < rendered.index('<section id="overview">')
 
 
 # --- the cost/success trade-off figure --------------------------------------------------
@@ -4000,11 +4033,18 @@ def _agent_result() -> AgentResult:
         num_turns=6,
         duration_ms=1000,
         total_cost_usd=0.25,
-        usage=None,
+        usage={"input_tokens": 20_000, "output_tokens": 1_000},
         session_id="s",
         provider="claude",
         errors=None,
     )
+
+
+#: Rates for the review agent's model, so its run has a cost to infer at all.
+_REVIEW_PRICES = PriceTable(
+    fetched={"claude-opus-5": Rates(input=5.0, cached_input=0.5, cache_write=6.25, output=25.0)},
+    fetched_as_of="2026-08-04",
+)
 
 
 def test_review_tasks_hands_the_agent_a_packet_and_reads_its_verdicts(
@@ -4049,13 +4089,16 @@ def test_review_tasks_hands_the_agent_a_packet_and_reads_its_verdicts(
             target=target,
             tasks=tasks,
             results=results,
+            prices=_REVIEW_PRICES,
         )
     )
 
     assert review.status_for("bulk", "train") == "ok"
     assert review.status_for("bulk", "test") == "mismatch"
     assert [v.task_id for v in review.flagged] == ["bulk"]
-    assert review.cost_usd == 0.25
+    # The agent's own $0.25 is recorded but not reported: the review is priced from the table,
+    # like every other run, so one basis covers both providers.
+    assert review.cost_usd == pytest.approx(20_000 * 5.0e-6 + 1_000 * 25.0e-6)
     assert review.turns == 6
     assert review.warnings == ()
     # The prompt points at the staged packet, and the reviewer gets the package like the drafter.
