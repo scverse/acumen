@@ -67,6 +67,17 @@ ENV_ALLOWLIST = (
 
 _BASE_PATH = ("/usr/local/bin", "/usr/bin", "/bin")
 
+#: Bash timeouts (milliseconds) for isolated Claude agents, replacing the CLI's 120s default and
+#: 600s ceiling. A command that outruns its timeout is not failed, it is moved to the background,
+#: and a backgrounded command finishing is what re-enters an agent after its run is over — the
+#: lifecycle problem :func:`acumen.agents._quiesce_claude` exists to contain. Raising the timeout
+#: is the half of the fix that stops it happening at all: a benchmark target downloads its own
+#: datasets and priors, and one such fetch measured over 300s, so 120s backgrounds nearly every
+#: one of them. The ceiling stays well above the default so an agent can still ask for longer on
+#: a fit or a test suite it knows is slow. Read only by the Claude CLI; inert for Codex.
+BASH_DEFAULT_TIMEOUT_MS = 600_000
+BASH_MAX_TIMEOUT_MS = 1_800_000
+
 
 class EnvError(RuntimeError):
     """Raised when the target cannot be prepared."""
@@ -662,6 +673,10 @@ def scrubbed_env(
     env["CLAUDE_CODE_DISABLE_CLAUDE_MDS"] = "1"
     env["TMPDIR"] = str(home / "tmp")
     env["LANG"] = os.environ.get("LANG", "C.UTF-8")
+    # Long enough that a dataset download completes inline instead of being backgrounded; see
+    # BASH_DEFAULT_TIMEOUT_MS.
+    env["BASH_DEFAULT_TIMEOUT_MS"] = str(BASH_DEFAULT_TIMEOUT_MS)
+    env["BASH_MAX_TIMEOUT_MS"] = str(BASH_MAX_TIMEOUT_MS)
     # Keep pip/uv from reaching into the real user's caches and configs.
     env["XDG_CONFIG_HOME"] = str(home / ".config")
     env["XDG_CACHE_HOME"] = str(home / ".cache")

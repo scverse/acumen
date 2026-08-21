@@ -113,6 +113,28 @@ and this project adheres to [Semantic Versioning][].
 
 ### Fixed
 
+- Close a Claude run's session when the run is over, and record the result that run produced. A
+  terminal result was not the end of a session: a Bash command the agent left running keeps the
+  CLI alive, and when it finishes the CLI queues the notification as a *new* prompt and re-enters
+  the model. The old loop kept assigning whatever result arrived last, so one measured run of
+  1117 seconds over 41 turns that hit its cap was recorded as a 4-second, two-turn success, with
+  inferred cost 96% low and the answer graded `no_answer_file`. The re-entry was also past the
+  turn cap, where the CLI answers every tool call with a cancelled-permission denial — including
+  `echo "test"` and reads inside the run's own working directory — so the agent sat waiting for
+  an operator who does not exist while the harness had already moved on to grading. Two of 44
+  background-task runs lost their result to this; it was a race on whether a notification landed
+  before the process was torn down. The Claude backend now runs through `ClaudeSDKClient` and
+  stops reading at the first result, so the turns, duration, usage and cost a run is judged on
+  are the graded prompt's by construction. Teardown then stops every outstanding background task,
+  waits briefly for the CLI to confirm each is gone so its output file is flushed before the
+  artifacts are collected, interrupts the turn, and disconnects — on every exit path, including a
+  crash. Work the agent abandoned after declaring itself done is not resumed. The sandbox-path
+  denials are unchanged: those are the containment guard doing its job, not this.
+- Give a sandboxed Bash command 600 seconds before the CLI moves it to the background, up from
+  the default 120, with a 1800-second ceiling an agent can still ask for. A command that outruns
+  its timeout is not failed but backgrounded, and a benchmark target downloads its own datasets
+  and priors — one such fetch measured over 300 seconds — so almost every one of them was being
+  backgrounded, which is what created the session-lifecycle problem above in the first place.
 - Record what a capped or crashed Codex run actually spent. `codex exec --json` reports usage
   once, in `turn.completed`, which a run acumen stops at its turn cap never reaches, so every
   turn-capped run recorded zero tokens and a cost of `$0.00` after minutes of real work. acumen

@@ -23,9 +23,10 @@ import signal
 import sys
 import time
 from collections.abc import Callable, Sequence
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import ModuleType
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
@@ -307,15 +308,113 @@ def _from_claude(result: ResultMessage) -> AgentResult:
     )
 
 
+#: Subtype of the CLI system message that reports the run's live background tasks as a whole
+#: set rather than as start/stop edges. Its payload is authoritative and replaces whatever we
+#: were tracking, so a bookend we never saw cannot leave a phantom task behind. The Python SDK
+#: has no typed class for it, so it arrives as a plain ``SystemMessage``.
+_LIVE_TASKS_SUBTYPE = "background_tasks_changed"
+
+#: How long teardown waits for the CLI to confirm the background tasks it was told to stop are
+#: really gone. Bounded because it sits between the agent finishing and the run being graded: a
+#: task that ignores the stop must not hold up the pass, and :func:`acumen.procs.reap` kills
+#: whatever is left when the sandbox goes. Long enough for the CLI to flush each task's output
+#: file first, which is what stops a run losing an ``answer.md`` written moments before the end.
+_TEARDOWN_GRACE_S = 10.0
+
+
+def _note_tasks(message: Any, live: dict[str, None], sdk: ModuleType) -> None:
+    """Fold one message into ``live``, the ids of the run's still-running background tasks.
+
+    Kept as an insertion-ordered dict so the ids are stopped in the order they started, which
+    makes a teardown log read in the order the agent created the work.
+
+    Three signals, deliberately all three. ``background_tasks_changed`` carries the whole live
+    set and so is authoritative — the CLI documents replace semantics for it precisely so a
+    consumer that missed an edge still converges. The typed edge messages are the fallback for a
+    CLI build that does not emit the level signal: ``task_started``/``task_progress`` add an id,
+    and a terminal status retires it. A terminal status can arrive on *either* of
+    ``task_notification`` and ``task_updated`` — a task stopped via ``TaskStop`` reports
+    ``killed`` only on the latter — so both are read the same way.
+    """
+    if isinstance(message, sdk.TaskStartedMessage | sdk.TaskProgressMessage):
+        live[message.task_id] = None
+    elif isinstance(message, sdk.TaskNotificationMessage | sdk.TaskUpdatedMessage):
+        if (message.status or "") in sdk.TERMINAL_TASK_STATUSES:
+            live.pop(message.task_id, None)
+    elif isinstance(message, sdk.SystemMessage) and message.subtype == _LIVE_TASKS_SUBTYPE:
+        tasks = message.data.get("tasks")
+        if isinstance(tasks, list):
+            live.clear()
+            live.update(
+                dict.fromkeys(str(task["task_id"]) for task in tasks if isinstance(task, dict) and task.get("task_id"))
+            )
+
+
+async def _quiesce_claude(
+    client: Any,
+    live: dict[str, None],
+    on_event: Callable[[Any], None] | None,
+    sdk: ModuleType,
+) -> None:
+    """End the run's session for good, before anything it wrote is graded.
+
+    The terminal result is not the end of a Claude session. A Bash command the agent left
+    running keeps the CLI alive, and when it finishes the CLI queues the ``task-notification``
+    as a *new* prompt and re-enters the model. That re-entry produces its own result message,
+    and it happens after the turn cap, so the CLI answers every tool call the agent then makes
+    with a cancelled-permission denial — leaving the agent politely waiting for an operator who
+    does not exist while the harness has already moved on to grading. Measured on one such run:
+    18 minutes and 100 model calls past the answer, recorded as a 4-second, two-turn success.
+
+    So the background work is stopped first, which is what stops another notification being
+    queued at all; then the CLI is given a bounded moment to confirm each task is really gone,
+    so its output file is flushed before the run's artifacts are collected; then the turn is
+    interrupted, in case a notification queued before the first step already started one.
+
+    Every step is best-effort, and called from a ``finally`` so it covers a crashed or capped
+    run as well as a clean one: those can have left background work running too. Whatever the
+    run produced has already been read by the time this is reached, and no failure to tidy up
+    afterwards may be allowed to change or discard it.
+    """
+    for task_id in list(live):
+        with suppress(Exception):
+            await client.stop_task(task_id)
+    if live:
+        with suppress(Exception):
+            async with asyncio.timeout(_TEARDOWN_GRACE_S), aclosing(client.receive_messages()) as stream:
+                async for message in stream:
+                    if on_event is not None:
+                        on_event(message)
+                    _note_tasks(message, live, sdk)
+                    if not live:
+                        break
+    with suppress(Exception):
+        await client.interrupt()
+
+
 async def _run_claude(
     prompt: str,
     options: AgentOptions,
     on_event: Callable[[Any], None] | None,
 ) -> AgentResult:
-    from claude_agent_sdk import ResultMessage, query
+    """Run one Claude agent to its terminal result, then shut its session down.
+
+    Driven through ``ClaudeSDKClient`` rather than the SDK's one-shot ``query`` helper. The
+    session has to be *steered* at the end of a run — the background tasks stopped, the turn
+    interrupted, the transport closed — and ``query`` is documented as offering none of that.
+    See :func:`_quiesce_claude` for what that teardown is for.
+
+    ``receive_response`` stops at the first result message, which is also what freezes the
+    figures the run is judged on. A re-entered session reports turns, duration and usage for
+    the re-entry alone, so a loop that kept assigning the latest result recorded a 1117-second,
+    41-turn run that hit its cap as a 4-second, 2-turn success, and priced it 96% low. Reading
+    exactly one result makes that unrepresentable rather than guarded against.
+    """
+    import claude_agent_sdk as sdk
 
     result: ResultMessage | None = None
     noise: list[str] = []
+    live: dict[str, None] = {}
 
     def capture_stderr(line: str) -> None:
         noise.append(line)
@@ -324,11 +423,15 @@ async def _run_claude(
         else:
             print(line, file=sys.stderr, flush=True)
 
+    client = sdk.ClaudeSDKClient(options=_claude_options(replace(options, stderr=capture_stderr)))
     try:
-        async for message in query(prompt=prompt, options=_claude_options(replace(options, stderr=capture_stderr))):
+        await client.connect()
+        await client.query(prompt)
+        async for message in client.receive_response():
             if on_event is not None:
                 on_event(message)
-            if isinstance(message, ResultMessage):
+            _note_tasks(message, live, sdk)
+            if isinstance(message, sdk.ResultMessage):
                 result = message
     except Exception as err:
         # The CLI exits non-zero on purpose after reporting an ``is_error`` result — a turn
@@ -348,6 +451,17 @@ async def _run_claude(
         if detail:
             raise AgentError(f"{err}\nClaude stderr:\n{detail}") from err
         raise
+    finally:
+        # Both steps run on every path, a cap breach and a crash included: a run that died
+        # mid-turn can have left background work running just as a clean one can. Nested so the
+        # disconnect cannot be skipped — a client connected with no input stream keeps the CLI
+        # subprocess alive until it is disconnected, so losing this leaks a live agent per run,
+        # and teardown under cancellation raises straight past a plain ``suppress(Exception)``.
+        try:
+            await _quiesce_claude(client, live, on_event, sdk)
+        finally:
+            with suppress(Exception):
+                await client.disconnect()
     if result is None:
         raise AgentError("the Claude agent produced no result message")
     return _from_claude(result)

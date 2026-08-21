@@ -36,7 +36,7 @@ dependencies = [
 # adds no Python dependency at all — `codex` on PATH is the whole requirement.
 optional-dependencies.all = [ "acumen[claude]" ]
 optional-dependencies.claude = [
-  "claude-agent-sdk>=0.2.116",
+  "claude-agent-sdk>=0.2.126",
   "claude-code-log",
 ]
 # https://docs.pypi.org/project_metadata/#project-urls

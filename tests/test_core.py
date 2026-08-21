@@ -58,6 +58,8 @@ from acumen.check import (
 from acumen.config import Config, ConfigError, derive_skill_name, load_config, parse_config
 from acumen.env import (
     AUTH_ENV_VARS,
+    BASH_DEFAULT_TIMEOUT_MS,
+    BASH_MAX_TIMEOUT_MS,
     EnvError,
     Target,
     _validate_deps,
@@ -701,16 +703,96 @@ def _claude_result(**kwargs: object) -> object:
     return ResultMessage(**fields)  # type: ignore[arg-type]
 
 
-def _patch_claude_query(monkeypatch: pytest.MonkeyPatch, messages: list[object], error: Exception | None) -> None:
+class _FakeClaudeClient:
+    """A stand-in for ``ClaudeSDKClient`` that replays a scripted message stream.
+
+    ``script`` is the response to the graded prompt, replayed until (and including) the first
+    ResultMessage. ``after`` is what the CLI goes on emitting once that result has landed: the
+    task lifecycle events of a run whose background work is still going, and the extra results a
+    re-entered session produces. ``calls`` records the control-protocol calls in order, which is
+    what the teardown is asserted on.
+    """
+
+    instances: list[_FakeClaudeClient] = []
+    script: list[object] = []
+    after: list[object] = []
+    error: Exception | None = None
+
+    def __init__(self, options: object = None, transport: object = None) -> None:
+        self.options = options
+        self.calls: list[tuple[str, object]] = []
+        self.pending = list(type(self).after)
+        type(self).instances.append(self)
+
+    async def connect(self, prompt: object = None) -> None:
+        self.calls.append(("connect", prompt))
+
+    async def query(self, prompt: object, session_id: str = "default") -> None:
+        self.calls.append(("query", prompt))
+
+    async def receive_response(self):
+        from claude_agent_sdk import ResultMessage
+
+        for message in type(self).script:
+            yield message
+            if isinstance(message, ResultMessage):
+                break
+        if type(self).error is not None:
+            raise type(self).error
+
+    async def receive_messages(self):
+        while self.pending:
+            yield self.pending.pop(0)
+
+    async def stop_task(self, task_id: str) -> None:
+        self.calls.append(("stop_task", task_id))
+
+    async def interrupt(self) -> None:
+        self.calls.append(("interrupt", None))
+
+    async def disconnect(self) -> None:
+        self.calls.append(("disconnect", None))
+
+
+def _patch_claude_client(
+    monkeypatch: pytest.MonkeyPatch,
+    messages: list[object],
+    error: Exception | None = None,
+    after: list[object] | None = None,
+) -> None:
     import claude_agent_sdk
 
-    async def fake_query(**_kwargs: object):
-        for message in messages:
-            yield message
-        if error is not None:
-            raise error
+    monkeypatch.setattr(_FakeClaudeClient, "instances", [])
+    monkeypatch.setattr(_FakeClaudeClient, "script", messages)
+    monkeypatch.setattr(_FakeClaudeClient, "after", after or [])
+    monkeypatch.setattr(_FakeClaudeClient, "error", error)
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", _FakeClaudeClient)
 
-    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+
+def _claude_agent_options(tmp_path: Path, **kwargs: object) -> AgentOptions:
+    work = tmp_path / "work"
+    work.mkdir(exist_ok=True)
+    return AgentOptions(
+        cwd=work,
+        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path), "CLAUDE_CONFIG_DIR": str(tmp_path / "cfg")},
+        model="claude-opus-5",
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def _live_tasks(*task_ids: str) -> object:
+    """The CLI's level signal for the set of background tasks currently running."""
+    from claude_agent_sdk import SystemMessage
+
+    return SystemMessage(
+        subtype="background_tasks_changed",
+        data={
+            "tasks": [
+                {"task_id": task_id, "task_type": "local_bash", "description": "python script.py"}
+                for task_id in task_ids
+            ]
+        },
+    )
 
 
 def test_claude_cap_breach_keeps_the_result_the_cli_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -722,21 +804,13 @@ def test_claude_cap_breach_keeps_the_result_the_cli_reported(tmp_path: Path, mon
     """
     pytest.importorskip("claude_agent_sdk")
 
-    work = tmp_path / "work"
-    work.mkdir()
-    options = AgentOptions(
-        cwd=work,
-        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path), "CLAUDE_CONFIG_DIR": str(tmp_path / "cfg")},
-        model="claude-opus-5",
-        max_turns=40,
-    )
-    _patch_claude_query(
+    _patch_claude_client(
         monkeypatch,
         [_claude_result()],
         Exception("Claude Code returned an error result: Reached maximum number of turns (40)"),
     )
 
-    result = asyncio.run(run_agent("go", options=options))
+    result = asyncio.run(run_agent("go", options=_claude_agent_options(tmp_path, max_turns=40)))
 
     assert result.subtype == "error_max_turns"
     assert result.num_turns == 40
@@ -744,27 +818,132 @@ def test_claude_cap_breach_keeps_the_result_the_cli_reported(tmp_path: Path, mon
     assert result.total_cost_usd == 0.42
     # The runner maps the subtype onto its reason taxonomy; a discarded result cannot.
     assert _terminal_reason(result) == "max_turns"
+    # Even a run that ends in an exception must not leave its session live.
+    assert ("disconnect", None) in _FakeClaudeClient.instances[-1].calls
 
 
 def test_claude_crash_after_a_clean_result_still_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Only a deliberate non-zero exit after an error result is expected; a break is not."""
     pytest.importorskip("claude_agent_sdk")
 
-    work = tmp_path / "work"
-    work.mkdir()
-    options = AgentOptions(
-        cwd=work,
-        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path), "CLAUDE_CONFIG_DIR": str(tmp_path / "cfg")},
-        model="claude-opus-5",
-    )
-    _patch_claude_query(
+    _patch_claude_client(
         monkeypatch,
         [_claude_result(subtype="success", is_error=False, errors=None)],
         Exception("transport closed unexpectedly"),
     )
 
     with pytest.raises(Exception, match="transport closed unexpectedly"):
-        asyncio.run(run_agent("go", options=options))
+        asyncio.run(run_agent("go", options=_claude_agent_options(tmp_path)))
+
+
+def test_claude_records_the_first_result_not_a_re_entered_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backgrounded command finishing re-enters the session and produces a second result.
+
+    That second result describes the re-entry alone. One measured run took 1117 seconds over 41
+    turns and hit its cap; the trailing re-entry reported 2 turns in 4 seconds, and that is what
+    got recorded — a capped run filed as a clean success, with inferred cost 96% low. Only the
+    result the graded prompt produced may be recorded.
+    """
+    pytest.importorskip("claude_agent_sdk")
+
+    graded = _claude_result(
+        num_turns=41,
+        duration_ms=1_117_000,
+        usage={"input_tokens": 297_709, "output_tokens": 2287},
+    )
+    re_entry = _claude_result(
+        subtype="success",
+        is_error=False,
+        errors=None,
+        num_turns=2,
+        duration_ms=4_180,
+        usage={"input_tokens": 95_045, "output_tokens": 229},
+    )
+    _patch_claude_client(monkeypatch, [graded], after=[re_entry])
+
+    result = asyncio.run(run_agent("go", options=_claude_agent_options(tmp_path)))
+
+    assert result.num_turns == 41
+    assert result.duration_ms == 1_117_000
+    assert result.usage == {"input_tokens": 297_709, "output_tokens": 2287}
+    assert result.subtype == "error_max_turns"
+
+
+def test_claude_teardown_stops_background_tasks_and_closes_the_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Outstanding background work is stopped, and the session really closed, before grading.
+
+    Left alone the CLI queues each finishing task as a fresh prompt and re-enters the model past
+    its turn cap, where it answers every tool call with a cancelled-permission denial — the agent
+    waiting on an operator who does not exist while the harness has already moved on to grading.
+    """
+    pytest.importorskip("claude_agent_sdk")
+
+    seen: list[object] = []
+    stopped = _live_tasks()
+    _patch_claude_client(monkeypatch, [_live_tasks("bda1dmuki"), _claude_result()], after=[stopped])
+
+    asyncio.run(run_agent("go", options=_claude_agent_options(tmp_path), on_event=seen.append))
+
+    client = _FakeClaudeClient.instances[-1]
+    assert [name for name, _ in client.calls] == ["connect", "query", "stop_task", "interrupt", "disconnect"]
+    assert ("stop_task", "bda1dmuki") in client.calls
+    # Waiting for the stop to be confirmed is what lets the CLI flush the task's output file
+    # before the run's artifacts are collected, so those events are consumed, not skipped.
+    assert stopped in seen
+
+
+def test_claude_teardown_reads_task_lifecycle_edges_too(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A CLI that reports only start/stop edges must still be tracked, and a finished task left alone."""
+    pytest.importorskip("claude_agent_sdk")
+    from claude_agent_sdk import TaskStartedMessage, TaskUpdatedMessage
+
+    def started(task_id: str) -> object:
+        return TaskStartedMessage(
+            subtype="task_started",
+            data={},
+            task_id=task_id,
+            description="python script.py",
+            uuid="u",
+            session_id="s",
+        )
+
+    finished = TaskUpdatedMessage(
+        subtype="task_updated",
+        data={},
+        task_id="done",
+        patch={"status": "completed"},
+        status="completed",
+    )
+    _patch_claude_client(monkeypatch, [started("done"), finished, started("live"), _claude_result()])
+
+    asyncio.run(run_agent("go", options=_claude_agent_options(tmp_path)))
+
+    calls = _FakeClaudeClient.instances[-1].calls
+    assert ("stop_task", "live") in calls
+    assert ("stop_task", "done") not in calls
+
+
+def test_claude_teardown_survives_a_control_protocol_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run's result is in hand before teardown; nothing that goes wrong tidying up may lose it."""
+    pytest.importorskip("claude_agent_sdk")
+
+    _patch_claude_client(
+        monkeypatch, [_live_tasks("b1"), _claude_result(subtype="success", is_error=False, errors=None)]
+    )
+
+    async def boom(self: object, task_id: str) -> None:
+        raise RuntimeError("control request failed")
+
+    monkeypatch.setattr(_FakeClaudeClient, "stop_task", boom)
+
+    result = asyncio.run(run_agent("go", options=_claude_agent_options(tmp_path)))
+
+    assert result.subtype == "success"
+    assert ("disconnect", None) in _FakeClaudeClient.instances[-1].calls
 
 
 def test_codex_guard_denies_isolated_paths(tmp_path: Path) -> None:
@@ -2351,6 +2530,22 @@ def test_resolve_auth_mode_for_meta_commands(tmp_path: Path, monkeypatch: pytest
     assert resolve_auth_mode("session") == "session"
     with pytest.raises(EnvError, match="--auth api"):
         resolve_auth_mode("api")
+
+
+def test_sandbox_bash_timeout_outlasts_a_dataset_download(tmp_path: Path) -> None:
+    """A fetch that outruns the Bash timeout is backgrounded, not failed, and that is the bug.
+
+    The CLI's 120s default backgrounded nearly every dataset download a benchmark target makes
+    (one measured over 300s), and a backgrounded command finishing is what re-enters an agent
+    after its run is over. Raising the timeout is the half of the fix that prevents it.
+    """
+    env = scrubbed_env(config_dir=tmp_path / "cfg", home=tmp_path / "home", auth_mode="api")
+
+    assert int(env["BASH_DEFAULT_TIMEOUT_MS"]) == BASH_DEFAULT_TIMEOUT_MS
+    assert int(env["BASH_MAX_TIMEOUT_MS"]) == BASH_MAX_TIMEOUT_MS
+    assert int(env["BASH_DEFAULT_TIMEOUT_MS"]) > 300_000
+    # An agent can still ask for longer than the default on a fit or a slow test suite.
+    assert int(env["BASH_MAX_TIMEOUT_MS"]) > int(env["BASH_DEFAULT_TIMEOUT_MS"])
 
 
 def test_bench_may_bill_the_subscription(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
