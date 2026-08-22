@@ -17,9 +17,9 @@ agent-instruction files (``SKILL.md``, ``.agents/skills/``, ``.claude/skills/``,
 author already anticipated and phrase them the way the skill does — defeating the point of an
 independent benchmark. So, as with the test-split guard, this is enforced two ways: the agent
 reads a **filtered copy** of the source with those artifacts stripped out
-(:func:`build_filtered_source`), and a ``PreToolUse`` hook denies any tool call that resolves to
-one of them — or to the original unfiltered tree — wherever the agent points it
-(:func:`find_skill_access`). ``setting_sources=[]`` additionally means no skill is ever
+(:func:`acumen.scrub.build_filtered_source`), and a ``PreToolUse`` hook denies any tool call that
+resolves to one of them — or to the original unfiltered tree — wherever the agent points it
+(:func:`acumen.scrub.find_skill_access`). ``setting_sources=[]`` additionally means no skill is ever
 discovered or loaded into the generator itself.
 
 The script the agent runs to confirm an answer is **kept**, as ``tasks/{id}-{split}.py`` next to
@@ -41,12 +41,8 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
 
 import yaml
-
-if TYPE_CHECKING:
-    from claude_agent_sdk import HookMatcher
 
 from acumen.agents import AgentOptions, AgentResult, provider_for_model, run_agent
 from acumen.check import SCRIPTS_DIRNAME, script_name, script_path
@@ -57,25 +53,11 @@ from acumen.paths import SPLITS, Split
 from acumen.prices import PriceTable, price_usage, pricer, resolve_cost
 from acumen.procs import label_env, reap
 from acumen.prompts import taskgen_prompt
+from acumen.scrub import build_filtered_source, make_skill_guard
 from acumen.tasks import Task, TaskError, load_tasks
 
 #: The filename the generation agent writes and we harvest from its work dir.
 TASKS_FILE = "tasks.yaml"
-
-#: Basenames anywhere in the tree that are agent-facing skill/guidance artifacts. Reading any
-#: of these would let existing guidance bias which tasks the generator mines, so they are both
-#: stripped from the source copy the agent reads and denied by the guard hook.
-_ARTIFACT_BASENAMES = frozenset({"SKILL.md", "CLAUDE.md", "AGENTS.md", "copilot-instructions.md"})
-
-#: Directory names that hold agent guidance; dropped from the copy and denied wherever they
-#: appear on a resolved path (``.agents/skills``, ``.claude/skills``, ``.cursor/rules``, …).
-_ARTIFACT_DIRS = frozenset({".agents", ".claude", ".codex", ".cursor"})
-
-#: tool_input keys carrying a filesystem path — the coarse set the improver's guard also uses.
-_PATH_KEYS = ("file_path", "path", "notebook_path", "filename")
-
-#: Shell metacharacters we split a Bash command on to recover path-like tokens.
-_SHELL_SPLIT = str.maketrans(dict.fromkeys("\"'`|&;<>()$" + "{}", " "))
 
 
 class TaskGenError(RuntimeError):
@@ -100,147 +82,6 @@ class TaskGenResult:
     #: Live log paths for this run, when a :class:`LiveLog` was attached.
     log_jsonl: Path | None = None
     log_html: Path | None = None
-
-
-# ── Skill-bias isolation ───────────────────────────────────────────────────────────────
-
-
-def _copy_ignore(root: Path):
-    """A ``shutil.copytree`` ignore callback that drops skill/guidance artifacts (and ``.git``).
-
-    Skill directories and agent-instruction files are removed so the generator physically
-    cannot read them. A top-level ``skills/`` is treated as agent skills (the packaging
-    convention) and dropped at the root only, so a legitimately-named source directory deeper
-    in the tree is left alone.
-    """
-    root = root.resolve()
-
-    def ignore(dir_path: str, names: list[str]) -> set[str]:
-        here = Path(dir_path).resolve()
-        drop: set[str] = set()
-        for name in names:
-            if name == ".git" or name in _ARTIFACT_DIRS or name in _ARTIFACT_BASENAMES:
-                drop.add(name)
-            elif here == root and name == "skills":
-                drop.add(name)
-        return drop
-
-    return ignore
-
-
-def build_filtered_source(src: Path, dest: Path) -> Path:
-    """Copy ``src`` to ``dest`` with skills and agent-guidance stripped out.
-
-    This is the structural half of the skill-bias isolation: the generator's read policy points
-    at the returned copy, not the real checkout, so existing skills are simply absent from what
-    it can read.
-
-    Parameters
-    ----------
-    src
-        The real target source checkout.
-    dest
-        Where to write the filtered copy; must not already exist.
-
-    Returns
-    -------
-    ``dest``.
-    """
-    shutil.copytree(src, dest, ignore=_copy_ignore(src), symlinks=True)
-    return dest
-
-
-def _artifact_hit(candidate: str, original_src: Path) -> str | None:
-    """Return ``candidate`` if it resolves to a skill/guidance artifact or the original tree."""
-    try:
-        resolved = Path(candidate).expanduser().resolve()
-    except (OSError, RuntimeError, ValueError):
-        return None
-    if resolved.name in _ARTIFACT_BASENAMES:
-        return candidate
-    if set(resolved.parts) & _ARTIFACT_DIRS:
-        return candidate
-    # The unfiltered source tree is off-limits — the agent must read the filtered copy, so any
-    # path back into the original checkout (which still holds the stripped artifacts) is denied.
-    try:
-        resolved.relative_to(original_src)
-    except ValueError:
-        return None
-    return candidate
-
-
-def find_skill_access(tool_name: str, tool_input: dict[str, Any], original_src: Path) -> str | None:
-    """Return the first path in a tool call that reaches a skill/guidance artifact, else ``None``.
-
-    Pure and side-effect free, so the enforcement can be exercised directly without standing up
-    an agent (mirrors :func:`acumen.improve.find_test_access`). Checks the path-bearing
-    tool_input keys and — for shell tools — the metacharacter-split command tokens, since a Bash
-    call can name a path no structured field would.
-
-    Parameters
-    ----------
-    tool_name
-        The tool being invoked; unused today but kept so the guard can special-case tools.
-    tool_input
-        The tool's arguments.
-    original_src
-        The real (unfiltered) source checkout, resolved by the caller.
-
-    Returns
-    -------
-    The offending path string, or ``None`` if the call touches no artifact.
-    """
-    for key in _PATH_KEYS:
-        value = tool_input.get(key)
-        if isinstance(value, str):
-            hit = _artifact_hit(value, original_src)
-            if hit is not None:
-                return hit
-    command = tool_input.get("command")
-    if isinstance(command, str):
-        for raw in command.translate(_SHELL_SPLIT).split():
-            token = raw.rstrip(",;")
-            if not token:
-                continue
-            hit = _artifact_hit(token, original_src)
-            if hit is not None:
-                return hit
-    return None
-
-
-def make_skill_guard(original_src: Path) -> HookMatcher:
-    """Build the ``PreToolUse`` hook that denies the generator any existing skill/guidance.
-
-    ``matcher=None`` fires the hook for every tool. Paths are resolved against the real source
-    checkout, so the guard holds regardless of the agent's ``cwd``.
-    """
-    # Imported here, not at module scope: the Claude SDK is an optional dependency and a
-    # Codex-only install never builds an SDK hook.
-    from claude_agent_sdk import HookMatcher
-
-    root = original_src.resolve()
-
-    async def guard(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
-        hit = find_skill_access(
-            input_data.get("tool_name", ""),
-            input_data.get("tool_input", {}) or {},
-            root,
-        )
-        if hit is None:
-            return {}
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": (
-                    f"acumen hides existing skills and agent-instruction files from the task "
-                    f"generator so they cannot bias task selection ({hit}). Design tasks from the "
-                    "package's API and its user-facing docs only, using the provided source copy."
-                ),
-            }
-        }
-
-    return HookMatcher(matcher=None, hooks=[guard])
 
 
 # ── Task serialisation ─────────────────────────────────────────────────────────────────

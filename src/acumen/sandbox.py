@@ -12,6 +12,12 @@ because a target downloads its own datasets and priors.
 A skill arm differs from the baseline in exactly one way: ``skills/v{n}/`` is
 copied into the selected provider's project skill directory, where the agent's own
 discovery finds it. Same prompt, same tools, same caps, same env otherwise.
+
+That "exactly one way" also depends on the target itself carrying no skill. A package can ship
+first-party agent guidance inside itself, and an agent that greps the venv finds it whether or
+not anything registered it — so the venv arrives here already scrubbed of it
+(:func:`acumen.scrub.scrub_venv`). Without that the baseline is not skill-free and the arm delta
+is not the skill under test.
 """
 
 from __future__ import annotations

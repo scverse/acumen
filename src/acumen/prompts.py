@@ -121,6 +121,15 @@ that from the module layout.
 - `{package}` is also installed; run `{python}` to check anything you are unsure about.
   Verify claims before you write them down.
 
+# Ignore any existing skills or agent instructions — deliberately hidden
+
+The package may already ship skills or agent-instruction files written for it (`SKILL.md`,
+`.agents/skills/`, `.claude/skills/`, `.codex/`, `CLAUDE.md`, `AGENTS.md`, `.cursor/`,
+Copilot instructions). These have been stripped from the source above, and any attempt to reach
+them — or the original unfiltered checkout — is BLOCKED. This is on purpose: a skill copied from
+pre-written guidance is not a skill written from the package, and this one is about to be
+measured against no skill at all. Write yours from the API, the source, and the user-facing docs.
+
 # What you must write
 
 Your working directory is `{out}`. Write:
@@ -832,7 +841,9 @@ def draft_prompt(
     """Build the prompt for the drafting agent.
 
     Unlike a benchmark agent, the drafter gets read access to the target's source —
-    it is writing documentation about the package, so it needs to see it.
+    it is writing documentation about the package, so it needs to see it. What it gets is the
+    *filtered* copy: guidance the target already ships is stripped, so the skill it writes is
+    written from the package rather than from someone else's skill for it.
 
     Parameters
     ----------
@@ -841,7 +852,7 @@ def draft_prompt(
     version
         The installed version, so the skill describes what is actually installed.
     src
-        The package checkout, readable by this agent only.
+        The (filtered) package checkout, readable by this agent only.
     python
         The interpreter with the package installed, for verifying claims.
     out

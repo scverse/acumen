@@ -41,9 +41,6 @@ so `from acumen import build_report` works.
     dump_tasks
     harvest_scripts
     Harvest
-    build_filtered_source
-    find_skill_access
-    make_skill_guard
 ```
 
 ## Checking task ground truth
@@ -100,6 +97,23 @@ naming the fix. `--no-review` skips it.
     Sandbox
     sandbox
     install_skill
+```
+
+## Hiding the target's own skills
+
+A target package may ship agent guidance of its own, which would otherwise reach a benchmark run
+through the venv and a drafting or task-generating agent through the checkout. The venv is scrubbed
+in place; the checkout is never modified, and the agents that read source read a filtered copy of it.
+
+```{eval-rst}
+.. autosummary::
+    :toctree: generated
+
+    find_guidance
+    scrub_venv
+    build_filtered_source
+    find_skill_access
+    make_skill_guard
 ```
 
 ## Skills

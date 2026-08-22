@@ -5,7 +5,10 @@ Two jobs:
 * :func:`prepare_target` — clone (or adopt a local path), build one venv with the target
   package installed, and record the resolved commit and package version. Cached by
   (repo, ref, dependency selection) so a pass doesn't re-clone, but changing what gets
-  installed does rebuild.
+  installed does rebuild. The finished venv is scrubbed of the target's *own* agent guidance
+  (:func:`acumen.scrub.scrub_venv`) before it is handed out: the venv is the one part of the
+  target a benchmark run can read, and a run that read the package's own skill measures that
+  skill instead of the one under test.
 * :func:`scrubbed_env` — the filtered environment benchmark agents run under: auth and
   PATH only, a throwaway ``HOME`` and ``CLAUDE_CONFIG_DIR``, and nothing that could leak
   the user's own settings or memories into a run.
@@ -28,6 +31,7 @@ from typing import Literal
 from acumen.agents import AgentProvider
 from acumen.config import Config
 from acumen.paths import slugify
+from acumen.scrub import scrub_venv
 
 READY_MARKER = ".acumen-ready"
 
@@ -267,6 +271,9 @@ def prepare_target(cfg: Config, cache_root: Path, *, refresh: bool = False) -> T
         else:
             # A local target's working tree can move under us; a clone at a pinned ref cannot.
             if target.python.is_file() and (not cfg.is_local or _resolve_commit(src_dir) == target.commit):
+                # Idempotent, so this costs a tree walk on an already-clean venv — and it is the
+                # only thing that cleans a venv built before the scrub existed.
+                scrub_venv(venv_dir)
                 return target
 
     if not cfg.is_local:
@@ -291,6 +298,13 @@ def prepare_target(cfg: Config, cache_root: Path, *, refresh: bool = False) -> T
     for group in cfg.dependency_groups:
         install += ["--group", f"{src_dir / 'pyproject.toml'}:{group}"]
     _run(install)
+
+    # The target's own skills go before anything can read the venv. Only agent-facing data is
+    # removed, never code, so the package imports and behaves exactly as installed. The source
+    # checkout is deliberately left untouched — ``ship`` commits from it, and for a local target
+    # it is the user's own working tree; the agents that read source get a filtered copy instead
+    # (:func:`acumen.scrub.build_filtered_source`).
+    scrub_venv(venv_dir)
 
     target = Target(
         source=cfg.repo,

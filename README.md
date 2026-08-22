@@ -26,7 +26,8 @@ generalization, not memorized answers.
   benchmark pass pays to find out.
 - **`acumen draft`** — write `skills/v1` from the package's own source.
 - **`acumen bench`** — score a skill against a no-skill baseline, in a scrubbed sandbox where
-  the skill is the only difference between arms.
+  the skill is the only difference between arms. Agent guidance the target ships itself is
+  removed from the venv first, so the baseline really is skill-free.
 - **`acumen improve`** — refine the skill from its train results, then benchmark again.
 - **`acumen report`** — aggregate every run into one self-contained `report.html`: success
   rate per version, train vs. test. Bars are coloured by model, with a grey bar pooling all

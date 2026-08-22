@@ -4,6 +4,13 @@ Unlike a benchmark agent, the drafter reads the target's source — it is docume
 the package, so it needs to see it. It is otherwise held to the same isolation: scrubbed
 env, throwaway config dir, no user settings or memories.
 
+What it does *not* see is agent guidance the target already ships. A skill drafted from the
+maintainer's own skill is not the independent artifact the benchmark then reports on: the arms
+would be comparing that skill, re-served, against no skill at all. So the drafter reads a
+filtered copy of the checkout with skills and agent-instruction files stripped
+(:func:`acumen.scrub.build_filtered_source`) and is denied the original tree, exactly as
+``tasks`` is. The real checkout is never modified.
+
 The agent writes into a staging directory, not into ``skills/`` directly. Only a skill
 that loads and validates is promoted to a version, so a failed or half-finished draft
 never leaves a broken ``skills/vN/`` behind — versions are immutable, which means
@@ -24,6 +31,7 @@ from acumen.logs import LiveLog
 from acumen.prices import PriceTable, price_usage, pricer, resolve_cost
 from acumen.procs import label_env, reap
 from acumen.prompts import draft_prompt
+from acumen.scrub import build_filtered_source, make_skill_guard
 from acumen.skills import (
     SKILL_FILE,
     Skill,
@@ -140,10 +148,14 @@ async def draft_skill(
             holder,
         )
 
+        # A copy of the source with the target's own skills and agent guidance stripped. The
+        # drafter reads this, never the real checkout.
+        source_copy = build_filtered_source(target.src_dir, holder / "source")
+
         prompt = draft_prompt(
             package=target.pkg_name,
             version=target.pkg_version,
-            src=target.src_dir,
+            src=source_copy,
             python=target.python,
             out=staging,
             skill_name=cfg.skill_name,
@@ -159,10 +171,17 @@ async def draft_skill(
             max_usd=max_usd,
             # Codex reports no billed figure, so a budget cap needs the run's own rate table.
             price_usd=pricer(selected_model, table),
-            # The drafter reads the target source; benchmark agents never do.
-            read_dirs=(target.src_dir, target.venv_dir),
+            # The drafter reads the target source; benchmark agents never do. It points at the
+            # *filtered* copy, not the real checkout.
+            read_dirs=(source_copy, target.venv_dir),
             write_dirs=(work,),
             discover_skills=True,
+            # Belt-and-braces over the filtered copy: deny any call that reaches an existing
+            # skill/guidance artifact or the original unfiltered source, wherever pointed. Built
+            # only for Claude — the hook is an SDK object, and Codex gets ``deny_paths`` below.
+            claude_hooks={"PreToolUse": [make_skill_guard(target.src_dir)]} if provider == "claude" else None,
+            # Codex reads the filtered copy and is denied the original checkout.
+            deny_paths=(target.src_dir.resolve(),),
         )
 
         result: AgentResult | None = None

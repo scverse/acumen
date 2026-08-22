@@ -113,6 +113,26 @@ and this project adheres to [Semantic Versioning][].
 
 ### Fixed
 
+- Remove the target package's own agent guidance from the venv before any agent runs, so the
+  baseline arm is really skill-free. A package can ship a first-party skill inside itself
+  (`site-packages/<pkg>/_skills/data/SKILL.md` plus a `references/` tree, the shape `acumen ship`
+  produces), and although nothing registers it and no prompt mentions it, an agent that greps the
+  venv it was handed finds it: measured across four passes and 4608 runs, 18.2% of baseline runs
+  read it and 12.2% of skill-arm runs read both it and the skill under test, concentrated in
+  exactly the tasks that discriminate between arms and varying fiftyfold by model. So the
+  comparison the whole benchmark rests on was partly against a skill nobody chose. `prepare_target`
+  now scrubs the finished venv of skill directories, `SKILL.md`/`CLAUDE.md`/`AGENTS.md`/Copilot
+  instructions, `.claude`/`.agents`/`.codex`/`.cursor`/`.claude-plugin` trees, and any console
+  script left pointing into what it removed; only agent-facing data goes, never code, so the
+  package imports and behaves exactly as installed. A `skills/` directory holding code is kept —
+  a directory only counts as guidance when a `SKILL.md` sits somewhere beneath it. The scrub is
+  idempotent and also runs on a cache hit, so a venv built by an earlier version is cleaned in
+  place rather than needing `--refresh-target`. The source checkout is deliberately untouched:
+  `ship` commits from it, and for a local target it is the user's own working tree. `draft` instead
+  joins `tasks` in reading a filtered copy of the checkout, since a skill drafted from the
+  maintainer's own skill is not the independent artifact the report presents. The host user's skill
+  catalog is left alone — it is a realistic environment and identical across arms.
+
 - Close a Claude run's session when the run is over, and record the result that run produced. A
   terminal result was not the end of a session: a Bash command the agent left running keeps the
   CLI alive, and when it finishes the CLI queues the notification as a *new* prompt and re-enters

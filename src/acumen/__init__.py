@@ -76,6 +76,13 @@ from acumen.review import (
 from acumen.runner import RunOutcome, run_once
 from acumen.sandbox import Sandbox, install_skill, sandbox
 from acumen.scaffold import InitError, scaffold
+from acumen.scrub import (
+    build_filtered_source,
+    find_guidance,
+    find_skill_access,
+    make_skill_guard,
+    scrub_venv,
+)
 from acumen.ship import ShipError, ShipResult, installer_exists, ship_skill
 from acumen.skills import (
     Skill,
@@ -92,12 +99,9 @@ from acumen.taskgen import (
     Harvest,
     TaskGenError,
     TaskGenResult,
-    build_filtered_source,
     dump_tasks,
-    find_skill_access,
     generate_tasks,
     harvest_scripts,
-    make_skill_guard,
 )
 from acumen.tasks import Task, TaskError, TaskSplit, load_tasks, parse_tasks
 from acumen.transcript import (
@@ -163,6 +167,7 @@ __all__ = [
     "claude_sdk_available",
     "build_agent_env",
     "build_filtered_source",
+    "find_guidance",
     "build_matrix",
     "build_report",
     "check_task_split",
@@ -212,6 +217,7 @@ __all__ = [
     "sandbox",
     "scaffold",
     "script_path",
+    "scrub_venv",
     "scrubbed_env",
     "select_tasks",
     "session_auth_available",
