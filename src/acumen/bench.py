@@ -350,7 +350,7 @@ async def _preflight_model(
         if result.is_error:
             return "; ".join(result.errors or []) or result.subtype or "agent error"
         return None
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001 - any preflight failure is reported as its error string
         return str(err)
 
 
@@ -375,7 +375,7 @@ async def preflight_models(
             for m, am in resolved.items()
         )
     )
-    return {m: err for m, err in zip(resolved, errors) if err is not None}
+    return {m: err for m, err in zip(resolved, errors, strict=True) if err is not None}
 
 
 def summarize(outcomes: Sequence[RunOutcome]) -> dict[str, int]:
