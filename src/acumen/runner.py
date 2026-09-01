@@ -1,4 +1,4 @@
-"""SDK invocation for a single benchmark run.
+"""Provider-neutral invocation for a single benchmark run.
 
 Runs one agent in one sandbox, captures its transcript, grades what it wrote, and emits
 ``result.json`` — the unit of record. Writing ``result.json`` last is deliberate: its
@@ -15,10 +15,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
-
-from acumen.env import AuthMode, Target, sdk_version
-from acumen.grade import Grade, Reason, grade_run
+from acumen.agents import AgentOptions, AgentResult, provider_for_model, run_agent
+from acumen.env import AuthMode, Target, agent_version
+from acumen.grade import INVALID_REASONS, Grade, Reason, grade_run
 from acumen.paths import (
     ANSWER_FILE,
     RESULT_FILE,
@@ -27,17 +26,63 @@ from acumen.paths import (
     TRANSCRIPT_JSONL,
     RunKey,
 )
+from acumen.prices import PriceTable, normalize_usage, price_provenance, price_run, pricer, resolve_cost
 from acumen.prompts import benchmark_prompt
 from acumen.sandbox import Sandbox, sandbox
 from acumen.skills import Skill
 from acumen.tasks import Task
-from acumen.transcript import locate_transcript, render_transcript
+from acumen.transcript import locate_transcript, render_agent_transcript
 
 #: Result subtypes the CLI reports on a cap breach, mapped to our reason taxonomy.
 _SUBTYPE_REASONS: dict[str, Reason] = {
     "error_max_budget_usd": "budget",
     "error_max_turns": "max_turns",
 }
+
+#: Reasons that mean the run was cut short by a cap rather than broken. An agent that already
+#: wrote an answer before the cap produced a measurement, and throwing it away scored a correct
+#: answer as a failure. So a capped run is graded on what it wrote, and only a capped run with
+#: nothing to grade keeps the cap as its reason. Every other terminal reason — a crash, a
+#: refused sandbox, an exhausted account — says the run itself cannot be trusted, and those
+#: still override the grade.
+_CAP_REASONS: frozenset[Reason] = frozenset(_SUBTYPE_REASONS.values())
+
+# Provider/account exhaustion is a failure of the benchmark infrastructure, not evidence
+# about the model. Keep these deliberately narrower than generic 429/rate-limit wording:
+# transient throttling is not proof that the account has no remaining usage or credit.
+_PROVIDER_EXHAUSTION_MARKERS = (
+    "usage limit",
+    "usage_limit",
+    "hit your limit",
+    "quota exceeded",
+    "quota_exceeded",
+    "exceeded your current quota",
+    "insufficient_quota",
+    "billing_hard_limit",
+    "credit balance",
+    "out of credits",
+    "no credits remaining",
+    "credits are exhausted",
+    "purchase more credits",
+    "payment required",
+    "spending limit",
+    "spend limit",
+    "token quota",
+    # Authentication failures: the session or API key is invalid/expired.
+    # Treated as infrastructure failure — every remaining cell would fail the same way.
+    "failed to authenticate",
+    "oauth session expired",
+    "authentication_failed",
+)
+
+# The sandbox runtime interposes an HTTP proxy and refuses a host it was not given by
+# answering CONNECT with 403. Only a proxy in the path can produce these, so matching them
+# cannot be confused with the target's own network trouble.
+_SANDBOX_DENIAL_MARKERS = (
+    "tunnel connection failed: 403",
+    "connect tunnel failed, response 403",
+    "proxy connect aborted: 403",
+)
 
 
 @dataclass(frozen=True)
@@ -50,7 +95,7 @@ class RunOutcome:
     payload: dict
 
 
-def _terminal_reason(message: ResultMessage) -> Reason | None:
+def _terminal_reason(message: AgentResult) -> Reason | None:
     """Map a cap breach or hard error onto a reason, or ``None`` if the agent finished.
 
     ``subtype`` is a free-form string from the CLI, so match defensively rather than
@@ -68,11 +113,58 @@ def _terminal_reason(message: ResultMessage) -> Reason | None:
     return None
 
 
+def _provider_exhaustion_error(message: AgentResult | None, error: str | None = None) -> str | None:
+    """Return provider quota/credit evidence, excluding Acumen's intentional caps.
+
+    Both adapters preserve provider error text, but their subtype vocabularies differ and
+    change over time. Matching the stable billing/quota concepts keeps the classification
+    provider-neutral while avoiding a false match on ordinary transient rate limiting.
+    """
+    if message is not None and (message.subtype or "").lower() in _SUBTYPE_REASONS:
+        return None
+    parts = [error or ""]
+    if message is not None:
+        parts.extend([message.subtype or "", message.result, *(message.errors or [])])
+    detail = "\n".join(str(part) for part in parts if part).strip()
+    lowered = detail.lower()
+    if any(marker in lowered for marker in _PROVIDER_EXHAUSTION_MARKERS):
+        return detail
+    return None
+
+
+def _sandbox_denial(jsonl: Path) -> str | None:
+    """Return evidence that the sandbox's own proxy refused a host, or ``None``.
+
+    A refused host is a failure of the harness, not of the model. It does not reach the
+    agent as a policy decision it could report: the sandbox runtime answers the proxy
+    ``CONNECT`` with ``403``, which surfaces inside the run as an ordinary connection
+    error. An agent that cannot fetch a dataset or a prior does not stop — it improvises
+    from memory and returns a confident, wrong answer, which then scores as a
+    ``wrong_answer`` and enters the report as evidence about the model. Recording it as
+    infrastructure-invalid is the only way that never happens silently.
+
+    Matched narrowly on the ``CONNECT``-tunnel refusal, which only the interposing proxy
+    can produce. Ordinary DNS failures, timeouts and origin-server 403s are *not* matched:
+    those can equally be a target's own flakiness, and misreading one as harness failure
+    would discard a legitimate result.
+    """
+    try:
+        text = jsonl.read_text(errors="ignore")
+    except OSError:
+        return None
+    lowered = text.lower()
+    for marker in _SANDBOX_DENIAL_MARKERS:
+        index = lowered.find(marker)
+        if index != -1:
+            return text[max(0, index - 120) : index + len(marker) + 120].strip()
+    return None
+
+
 def _find_transcript(box: Sandbox, session_id: str) -> Path | None:
     return locate_transcript(box.config_dir, box.root, session_id)
 
 
-def _skill_fired(jsonl: Path, name: str) -> bool | None:
+def _skill_fired(jsonl: Path, name: str, *, provider: str = "claude") -> bool | None:
     """Return whether the agent loaded the skill called ``name``, read from the transcript.
 
     This is the evidence the skill arm actually used the skill — the skill arm must show it
@@ -94,6 +186,25 @@ def _skill_fired(jsonl: Path, name: str) -> bool | None:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if provider == "codex":
+            item = record.get("item")
+            if not isinstance(item, dict):
+                continue
+            # Codex loads repository skills from .agents/skills. The JSONL
+            # protocol exposes the command used to read the selected SKILL.md.
+            # The command only counts once it has actually run: a command that
+            # was issued and then failed means the agent tried to read the skill
+            # and could not, which is the opposite of loading it. Counting the
+            # attempt reports a skill as loaded-and-ineffective when its body was
+            # never seen, and that is precisely the distinction the improver acts
+            # on. Codex marks a non-zero exit as "failed", so an item that
+            # completed is one whose output reached the model.
+            command = item.get("command")
+            if isinstance(command, str) and item.get("status") == "completed":
+                normalized = command.replace("\\", "/")
+                if f".agents/skills/{name}/SKILL.md" in normalized:
+                    return True
+            continue
         if record.get("type") != "assistant":
             continue
         content = record.get("message", {}).get("content")
@@ -113,15 +224,6 @@ def _collect_artifacts(box: Sandbox, run_dir: Path) -> None:
         src = box.root / name
         if src.is_file():
             shutil.copyfile(src, run_dir / name)
-
-
-def _usage_tokens(usage: dict | None) -> tuple[int, int]:
-    if not usage:
-        return 0, 0
-    inp = int(usage.get("input_tokens", 0) or 0)
-    inp += int(usage.get("cache_read_input_tokens", 0) or 0)
-    inp += int(usage.get("cache_creation_input_tokens", 0) or 0)
-    return inp, int(usage.get("output_tokens", 0) or 0)
 
 
 class StderrFilter:
@@ -159,8 +261,10 @@ def _build_options(
     model: str,
     max_turns: int,
     max_usd: float,
+    read_dirs: tuple[Path, ...] = (),
+    prices: PriceTable | None = None,
     stderr: Callable[[str], None] | None = None,
-) -> ClaudeAgentOptions:
+) -> AgentOptions:
     """Assemble the SDK options for one run.
 
     These options are **identical for every arm** — baseline parity means the
@@ -179,15 +283,15 @@ def _build_options(
     append ``Skill(<name>)`` to ``allowed_tools`` in the skill arm only — an options-level
     difference between arms, which is the one thing parity forbids.
     """
-    return ClaudeAgentOptions(
-        cwd=str(box.root),
+    return AgentOptions(
+        cwd=box.root,
         env=box.env,
         model=model,
         max_turns=max_turns,
-        max_budget_usd=max_usd,
-        setting_sources=["project"],
-        permission_mode="bypassPermissions",
-        system_prompt={"type": "preset", "preset": "claude_code"},
+        max_usd=max_usd,
+        discover_skills=True,
+        price_usd=pricer(model, prices),
+        read_dirs=read_dirs,
         stderr=stderr,
     )
 
@@ -208,6 +312,7 @@ async def run_once(
     keep_sandbox: bool = False,
     stderr: Callable[[str], None] | None = None,
     env_passthrough: Sequence[str] | None = None,
+    prices: PriceTable | None = None,
 ) -> RunOutcome:
     """Execute one benchmark run end to end and write its ``result.json``.
 
@@ -224,8 +329,9 @@ async def run_once(
     model, max_turns, max_usd
         Already resolved against per-task overrides by the caller.
     auth_mode
-        Which credential benchmark runs authenticate with; always ``"api"`` so the recorded
-        ``cost_usd`` reflects real metered spend.
+        Which credential the benchmark run authenticates with. Both modes report tokens, so
+        both are priced from the frozen rate table; under ``"session"`` that figure is what
+        the run would have cost at API rates, not money charged.
     skill
         The skill to install, or ``None`` for the baseline arm. Must agree with
         ``key.arm``, else the run would be filed under an arm it doesn't belong to.
@@ -259,16 +365,18 @@ async def run_once(
     run_dir.mkdir(parents=True, exist_ok=True)
     split = task.split(key.split)
 
-    result: ResultMessage | None = None
+    provider = provider_for_model(model)
+    result: AgentResult | None = None
     error: str | None = None
 
-    with sandbox(
+    async with sandbox(
         target,
         auth_mode=auth_mode,
         base=sandbox_base,
         keep=keep_sandbox,
         skill=skill,
         env_passthrough=env_passthrough,
+        provider=provider,
     ) as box:
         prompt = benchmark_prompt(
             split.prompt,
@@ -276,53 +384,107 @@ async def run_once(
             python=target.python,
             package=target.pkg_name,
         )
-        options = _build_options(box=box, model=model, max_turns=max_turns, max_usd=max_usd, stderr=stderr)
+        options = _build_options(
+            box=box,
+            model=model,
+            max_turns=max_turns,
+            max_usd=max_usd,
+            read_dirs=(target.venv_dir,),
+            prices=prices,
+            stderr=stderr,
+        )
         try:
-            async for message in query(prompt=prompt, options=options):
-                if isinstance(message, ResultMessage):
-                    result = message
+            result = await run_agent(prompt, options=options)
         except Exception as err:  # noqa: BLE001 - a crashed agent is a recorded failure, not a crashed pass
             error = f"{type(err).__name__}: {err}"
 
         _collect_artifacts(box, run_dir)
-        if result is not None:
+        if result is not None and provider == "claude" and result.session_id is not None:
             jsonl = _find_transcript(box, result.session_id)
             if jsonl is not None:
                 shutil.copyfile(jsonl, run_dir / TRANSCRIPT_JSONL)
+        elif result is not None and provider == "codex":
+            (run_dir / TRANSCRIPT_JSONL).write_text("".join(f"{json.dumps(event)}\n" for event in result.transcript))
 
     rendered = False
     skill_loaded: bool | None = None
     expected_skill = skill.name if skill is not None else skill_name
     if (run_dir / TRANSCRIPT_JSONL).is_file():
-        rendered = render_transcript(run_dir / TRANSCRIPT_JSONL, run_dir / TRANSCRIPT_HTML)
+        rendered = render_agent_transcript(
+            run_dir / TRANSCRIPT_JSONL,
+            run_dir / TRANSCRIPT_HTML,
+            provider=provider,
+            usage=result.usage if result else None,
+        )
         if expected_skill is not None:
-            skill_loaded = _skill_fired(run_dir / TRANSCRIPT_JSONL, expected_skill)
+            skill_loaded = _skill_fired(run_dir / TRANSCRIPT_JSONL, expected_skill, provider=provider)
 
     grade: Grade = grade_run(run_dir, split.answer)
-    if error is not None or result is None:
+    exhaustion = _provider_exhaustion_error(result, error)
+    # Checked only when the run did not pass. A refused host the agent routed around
+    # without it costing the answer is noise, and invalidating a passing run over it would
+    # throw away a measurement that plainly survived.
+    denial = None if grade.success else _sandbox_denial(run_dir / TRANSCRIPT_JSONL)
+    if exhaustion is not None:
+        success, reason = False, "provider_exhausted"
+    elif denial is not None:
+        success, reason = False, "sandbox_blocked"
+    elif error is not None or result is None:
         success, reason = False, "error"
     else:
         terminal = _terminal_reason(result)
-        if terminal is not None:
-            # A cap breach is a failure regardless of what landed in answer.md.
+        # ``grade.answer`` is None with no answer.md and "" when the file is empty, so a capped
+        # run is only graded when there is something in it to grade. The cap stays on the record
+        # either way: ``subtype`` and the agent's errors still report it.
+        if terminal is not None and not (terminal in _CAP_REASONS and grade.answer):
             success, reason = False, terminal
         else:
             success, reason = grade.success, grade.reason
 
-    inp, out = _usage_tokens(result.usage if result else None)
+    usage = normalize_usage(result.usage if result else None, provider=provider)
+    # Price the run from the table frozen into this result: that basis is shared by both
+    # providers and reproducible from the rates recorded beside it, so it is the figure
+    # reports and console lines use. The SDK's own value, where there is one, is recorded
+    # alongside for audit — and under session authentication it is API-equivalent anyway,
+    # not money charged on an invoice.
+    lookup = (prices or PriceTable()).lookup(model)
+    inferred = price_run(usage, None if lookup is None else lookup.rates)
+    provider_cost = result.total_cost_usd if result else None
+    cost = resolve_cost(provider_cost, inferred)
     payload = {
         "task_id": key.task_id,
         "split": key.split,
         "skill": key.skill,
         "arm": key.arm,
         "model": model,
+        "agent": provider,
+        "provider": "anthropic" if provider == "claude" else "openai",
+        "backend": "claude_agent_sdk" if provider == "claude" else "codex_cli",
+        # Which credential paid for the run. Under "session" the recorded cost is what the
+        # run would have cost at API rates, not metered spend.
+        "auth_mode": auth_mode,
         "rep": key.rep,
         "success": success,
         "reason": reason,
+        # Exhausted provider credit and a sandbox-refused host both invalidate the
+        # measurement: neither says anything about the model. Keeping a diagnostic result is
+        # useful, but reports and resume must never treat one as benchmark evidence.
+        "valid": reason not in INVALID_REASONS,
         "turns": result.num_turns if result else 0,
-        "cost_usd": (result.total_cost_usd if result else None) or 0.0,
-        "input_tokens": inp,
-        "output_tokens": out,
+        "cost_usd": cost.cost_usd,
+        "cost_available": cost.available,
+        "cost_source": cost.cost_source,
+        "provider_cost_usd": cost.provider_cost_usd,
+        "inferred_cost_usd": cost.inferred_cost_usd,
+        "cost_delta_usd": cost.cost_delta_usd,
+        "cost_delta_pct": cost.cost_delta_pct,
+        **price_provenance(lookup),
+        "input_tokens": usage.input,
+        "output_tokens": usage.output,
+        "cache_read_tokens": usage.cache_read,
+        "cache_write_tokens": usage.cache_write,
+        "cache_write_5m_tokens": usage.cache_write_5m,
+        "cache_write_1h_tokens": usage.cache_write_1h,
         "duration_s": round((result.duration_ms if result else 0) / 1000, 2),
         "answer": grade.answer,
         "expected": split.answer.strip(),
@@ -332,12 +494,12 @@ async def run_once(
         "skill_name": skill.name if skill else None,
         # Evidence, not configuration: did the agent actually invoke the Skill tool?
         "skill_loaded": skill_loaded,
-        "sdk_version": sdk_version(),
+        "sdk_version": agent_version(provider),
         "session_id": result.session_id if result else None,
         "stop_reason": result.stop_reason if result else None,
         "subtype": result.subtype if result else None,
         "transcript_html": rendered,
-        "error": error or (result.errors if result else None),
+        "error": exhaustion or denial or error or (result.errors if result else None),
     }
     (run_dir / RESULT_FILE).write_text(json.dumps(payload, indent=2) + "\n")
     return RunOutcome(key=key, success=success, reason=reason, payload=payload)

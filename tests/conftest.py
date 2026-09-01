@@ -1,8 +1,8 @@
 """Shared fixtures for the acumen test suite.
 
 The suite is deliberately small and offline: it covers the CLI's main commands and the
-pure helpers underneath them, and never spawns an agent. Anything that would call the
-Claude Agent SDK (``draft``, ``improve``, ``tasks``, ``ship``) is only exercised up to
+pure helpers underneath them, and never spawns an agent. Anything that would call a
+Claude or Codex agent (``draft``, ``improve``, ``tasks``, ``ship``) is only exercised up to
 the pre-flight checks that run *before* the agent — those are the parts a unit test can
 honestly assert.
 """
@@ -48,6 +48,23 @@ Call `target.run()` first.
 """
 
 MODEL = "claude-haiku-4-5-20251001"
+
+
+@pytest.fixture(autouse=True)
+def no_price_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the suite honestly offline now that rates are only ever read live.
+
+    No rates ship with the package, so any command that prices anything reaches for the
+    providers' pricing pages. Without this a test would pass or fail on whether the
+    machine happened to have a network. Failing loudly instead forces each such test to
+    state which rates it means to run against, via the ``stub_prices`` fixture or its own
+    patch of ``pricefeed.refresh``.
+    """
+
+    def unavailable(url, **_kwargs):
+        raise AssertionError(f"test reached the network for {url}; stub the pricing fetch instead")
+
+    monkeypatch.setattr("acumen.pricefeed.fetch", unavailable)
 
 
 @pytest.fixture

@@ -18,10 +18,9 @@ carrying a given run's marker and kills it; the sandbox and the meta-agent stagi
 it on the way out, before their directory is removed, on every exit path including
 cancellation.
 
-The marker is what makes this exact rather than a guess at which paths a run touches. The
-benchmark sandboxes do put their throwaway ``HOME`` and ``TMPDIR`` under the same directory,
-but ``ship``'s agent deliberately runs in the operator's real environment and real checkout,
-where no such path appears — one explicit variable covers both.
+The marker is what makes this exact rather than a guess at which paths a run touches. Every
+agent has a throwaway ``HOME`` and ``TMPDIR`` under its run directory, but the explicit marker
+still identifies descendants that change directory or sanitize part of their environment.
 
 Reading *another* process's environment is the one step with no portable stdlib spelling:
 it is a file read on Linux, a ``KERN_PROCARGS2`` sysctl on macOS, and a ``ReadProcessMemory``

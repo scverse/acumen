@@ -20,11 +20,15 @@ CONFIG_TEMPLATE = """\
 
 repo: https://github.com/OWNER/REPO   # GitHub URL, or a local path to an installable package
 ref: main                             # branch, tag, or commit (ignored for local paths)
-extras: []                            # optional pip extras, e.g. [dev, test]
+extras: []                            # pip extras the target publishes, e.g. [test]
+dependency_groups: []                 # PEP 735 groups from the target's pyproject, e.g. [full]
+pip_packages: []                      # packages the target declares nowhere, e.g. [harmonypy]
 python: "3.12"                        # interpreter for the target's throwaway venv
 env_passthrough: []                   # extra env vars agents may keep (e.g. [OMP_NUM_THREADS]); the agent env is otherwise a clean allowlist
+                                      # naming any host denies every other one — a host the target needs but you left out
+                                      # aborts the pass rather than scoring as a wrong answer. Private addresses are always denied.
 
-models: [claude-opus-5, claude-sonnet-5, claude-haiku-4-5-20251001]   # benchmark models; a pass is models x tasks x reps x splits
+models: [claude-opus-5, claude-sonnet-5, claude-haiku-4-5-20251001, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna]   # Claude + Codex benchmark models; a pass is models x tasks x reps x splits
 n_replicates: 3                       # runs per (model, task, split) cell
 max_concurrency: 4                    # simultaneous agents
 
@@ -35,6 +39,7 @@ draft_model: claude-opus-5            # model that writes the first skill (reads
 improve_model: claude-opus-5          # model that improves a skill from its train results
 tasks_model: claude-opus-5            # model for `acumen tasks` (generates this file); runs code
 ship_model: claude-opus-5             # model for `acumen ship` (wires a multi-framework install-skills script)
+check_model: claude-opus-5            # model for `acumen check`'s review of prompt/answer/script coherence
 
 # skill_name: your_skill              # name for the built skill; defaults to the repo's name
 """
@@ -59,6 +64,11 @@ TASKS_TEMPLATE = """\
 # a skill has room to help. Replace the placeholders below with your own, or run
 # `acumen tasks` to generate this file automatically from the target package.
 #
+# Every answer should be reproducible: put a script at `tasks/<id>-<split>.py` that redoes the
+# analysis and writes the answer to `answer.md` in its working directory, then run
+# `acumen check` to confirm each one still produces the recorded answer. `acumen tasks` writes
+# those scripts for you. A task that needs no code to answer sets `needs_script: false`.
+#
 # Optional per-task overrides: `max_turns`, `max_usd`, `model`.
 
 tasks:
@@ -79,6 +89,20 @@ tasks:
 
 class InitError(ValueError):
     """Raised when scaffolding cannot proceed — e.g. files exist and ``force`` is unset."""
+
+
+def is_scaffold_tasks(path: Path) -> bool:
+    """Whether ``path`` is still the untouched ``tasks.yaml`` placeholder from :func:`scaffold`.
+
+    ``acumen init`` writes a placeholder and ``acumen tasks`` generates the real thing, so the
+    documented first two steps of the loop collide: the generator would refuse to overwrite a
+    file the user never wrote. A byte-identical match to the template is the safe test — edit
+    one character and the file is yours again, and refusing to clobber it is correct.
+    """
+    try:
+        return path.read_text() == TASKS_TEMPLATE
+    except OSError:
+        return False
 
 
 def scaffold(directory: Path, *, force: bool = False) -> list[Path]:

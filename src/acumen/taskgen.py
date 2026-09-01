@@ -11,21 +11,28 @@ to leak. Isolation is otherwise the same as the other meta-agents: scrubbed env,
 ``HOME`` and ``CLAUDE_CONFIG_DIR``.
 
 **Existing skills must not bias task generation.** A target repo may already ship skills or
-agent-instruction files (``SKILL.md``, ``.claude/skills/``, ``CLAUDE.md``, ``AGENTS.md``,
+agent-instruction files (``SKILL.md``, ``.agents/skills/``, ``.claude/skills/``,
+``CLAUDE.md``, ``AGENTS.md``,
 ``.cursor/``, Copilot instructions). If the generator read them, it would mine the tasks the
 author already anticipated and phrase them the way the skill does — defeating the point of an
 independent benchmark. So, as with the test-split guard, this is enforced two ways: the agent
 reads a **filtered copy** of the source with those artifacts stripped out
-(:func:`build_filtered_source`), and a ``PreToolUse`` hook denies any tool call that resolves to
-one of them — or to the original unfiltered tree — wherever the agent points it
-(:func:`find_skill_access`). ``setting_sources=[]`` additionally means no skill is ever
+(:func:`acumen.scrub.build_filtered_source`), and a ``PreToolUse`` hook denies any tool call that
+resolves to one of them — or to the original unfiltered tree — wherever the agent points it
+(:func:`acumen.scrub.find_skill_access`). ``setting_sources=[]`` additionally means no skill is ever
 discovered or loaded into the generator itself.
 
-The script the agent writes to confirm an answer is **scratch**: it lives in a throwaway work
-dir that is deleted when this returns, so nothing about the ground-truth pipeline is persisted —
-only the task (prompt + answer) lands in ``tasks.yaml``. The output is validated through
-:func:`acumen.tasks.parse_tasks` before it is written, so ``acumen tasks`` can never emit a
+The script the agent runs to confirm an answer is **kept**, as ``tasks/{id}-{split}.py`` next to
+the tasks file: an answer nothing can recompute is an answer nobody can check, and a wrong one
+costs a whole benchmark pass to discover. :mod:`acumen.check` reruns them on demand. Harvesting
+happens only after the agent's ``tasks.yaml`` validates through :func:`acumen.tasks.parse_tasks`,
+so a rejected generation leaves no scripts behind and ``acumen tasks`` can never emit a
 ``tasks.yaml`` the rest of the pipeline would reject.
+
+These scripts hold the ground truth for the **held-out test split**, so no agent may ever read
+them. That holds because ``bench``, ``draft`` and ``improve`` confine their agents to explicit
+read roots (:mod:`acumen.guard`) that never include the project directory — a property to
+preserve when changing any of them.
 """
 
 from __future__ import annotations
@@ -34,35 +41,23 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import yaml
-from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, ResultMessage, query
 
+from acumen.agents import AgentOptions, AgentResult, provider_for_model, run_agent
+from acumen.check import SCRIPTS_DIRNAME, script_name, script_path
 from acumen.config import Config
 from acumen.env import AuthMode, Target, build_agent_env
 from acumen.logs import LiveLog
+from acumen.paths import SPLITS, Split
+from acumen.prices import PriceTable, price_usage, pricer, resolve_cost
 from acumen.procs import label_env, reap
 from acumen.prompts import taskgen_prompt
+from acumen.scrub import build_filtered_source, make_skill_guard
 from acumen.tasks import Task, TaskError, load_tasks
 
 #: The filename the generation agent writes and we harvest from its work dir.
 TASKS_FILE = "tasks.yaml"
-
-#: Basenames anywhere in the tree that are agent-facing skill/guidance artifacts. Reading any
-#: of these would let existing guidance bias which tasks the generator mines, so they are both
-#: stripped from the source copy the agent reads and denied by the guard hook.
-_ARTIFACT_BASENAMES = frozenset({"SKILL.md", "CLAUDE.md", "AGENTS.md", "copilot-instructions.md"})
-
-#: Directory names that hold agent guidance; dropped from the copy and denied wherever they
-#: appear on a resolved path (``.claude/skills``, ``.cursor/rules``, …).
-_ARTIFACT_DIRS = frozenset({".claude", ".cursor"})
-
-#: tool_input keys carrying a filesystem path — the coarse set the improver's guard also uses.
-_PATH_KEYS = ("file_path", "path", "notebook_path", "filename")
-
-#: Shell metacharacters we split a Bash command on to recover path-like tokens.
-_SHELL_SPLIT = str.maketrans(dict.fromkeys("\"'`|&;<>()$" + "{}", " "))
 
 
 class TaskGenError(RuntimeError):
@@ -75,148 +70,18 @@ class TaskGenResult:
 
     tasks: list[Task]
     out_path: Path
-    cost_usd: float
+    cost_usd: float | None
     turns: int
+    #: Reproducer scripts harvested into the scripts root, in task order.
+    scripts: tuple[Path, ...] = ()
+    #: Splits that expected a reproducer and got none, as ``(task_id, split)`` pairs. The tasks
+    #: are still written: a missing script is a gap ``acumen check`` reports, not a failure.
+    missing_scripts: tuple[tuple[str, Split], ...] = ()
+    #: Files the agent left in its scripts directory that match no task and split.
+    unexpected_scripts: tuple[str, ...] = ()
     #: Live log paths for this run, when a :class:`LiveLog` was attached.
     log_jsonl: Path | None = None
     log_html: Path | None = None
-
-
-# ── Skill-bias isolation ───────────────────────────────────────────────────────────────
-
-
-def _copy_ignore(root: Path):
-    """A ``shutil.copytree`` ignore callback that drops skill/guidance artifacts (and ``.git``).
-
-    Skill directories and agent-instruction files are removed so the generator physically
-    cannot read them. A top-level ``skills/`` is treated as agent skills (the packaging
-    convention) and dropped at the root only, so a legitimately-named source directory deeper
-    in the tree is left alone.
-    """
-    root = root.resolve()
-
-    def ignore(dir_path: str, names: list[str]) -> set[str]:
-        here = Path(dir_path).resolve()
-        drop: set[str] = set()
-        for name in names:
-            if name == ".git" or name in _ARTIFACT_DIRS or name in _ARTIFACT_BASENAMES:
-                drop.add(name)
-            elif here == root and name == "skills":
-                drop.add(name)
-        return drop
-
-    return ignore
-
-
-def build_filtered_source(src: Path, dest: Path) -> Path:
-    """Copy ``src`` to ``dest`` with skills and agent-guidance stripped out.
-
-    This is the structural half of the skill-bias isolation: the generator's ``add_dirs`` points
-    at the returned copy, not the real checkout, so existing skills are simply absent from what
-    it can read.
-
-    Parameters
-    ----------
-    src
-        The real target source checkout.
-    dest
-        Where to write the filtered copy; must not already exist.
-
-    Returns
-    -------
-    ``dest``.
-    """
-    shutil.copytree(src, dest, ignore=_copy_ignore(src), symlinks=True)
-    return dest
-
-
-def _artifact_hit(candidate: str, original_src: Path) -> str | None:
-    """Return ``candidate`` if it resolves to a skill/guidance artifact or the original tree."""
-    try:
-        resolved = Path(candidate).expanduser().resolve()
-    except (OSError, RuntimeError, ValueError):
-        return None
-    if resolved.name in _ARTIFACT_BASENAMES:
-        return candidate
-    if set(resolved.parts) & _ARTIFACT_DIRS:
-        return candidate
-    # The unfiltered source tree is off-limits — the agent must read the filtered copy, so any
-    # path back into the original checkout (which still holds the stripped artifacts) is denied.
-    try:
-        resolved.relative_to(original_src)
-    except ValueError:
-        return None
-    return candidate
-
-
-def find_skill_access(tool_name: str, tool_input: dict[str, Any], original_src: Path) -> str | None:
-    """Return the first path in a tool call that reaches a skill/guidance artifact, else ``None``.
-
-    Pure and side-effect free, so the enforcement can be exercised directly without standing up
-    an agent (mirrors :func:`acumen.improve.find_test_access`). Checks the path-bearing
-    tool_input keys and — for shell tools — the metacharacter-split command tokens, since a Bash
-    call can name a path no structured field would.
-
-    Parameters
-    ----------
-    tool_name
-        The tool being invoked; unused today but kept so the guard can special-case tools.
-    tool_input
-        The tool's arguments.
-    original_src
-        The real (unfiltered) source checkout, resolved by the caller.
-
-    Returns
-    -------
-    The offending path string, or ``None`` if the call touches no artifact.
-    """
-    for key in _PATH_KEYS:
-        value = tool_input.get(key)
-        if isinstance(value, str):
-            hit = _artifact_hit(value, original_src)
-            if hit is not None:
-                return hit
-    command = tool_input.get("command")
-    if isinstance(command, str):
-        for raw in command.translate(_SHELL_SPLIT).split():
-            token = raw.rstrip(",;")
-            if not token:
-                continue
-            hit = _artifact_hit(token, original_src)
-            if hit is not None:
-                return hit
-    return None
-
-
-def make_skill_guard(original_src: Path) -> HookMatcher:
-    """Build the ``PreToolUse`` hook that denies the generator any existing skill/guidance.
-
-    ``matcher=None`` fires the hook for every tool. Paths are resolved against the real source
-    checkout, so the guard holds regardless of the agent's ``cwd``.
-    """
-    root = original_src.resolve()
-
-    async def guard(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
-        hit = find_skill_access(
-            input_data.get("tool_name", ""),
-            input_data.get("tool_input", {}) or {},
-            root,
-        )
-        if hit is None:
-            return {}
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": (
-                    f"acumen hides existing skills and agent-instruction files from the task "
-                    f"generator so they cannot bias task selection ({hit}). Design tasks from the "
-                    "package's API and its user-facing docs only, using the provided source copy."
-                ),
-            }
-        }
-
-    return HookMatcher(matcher=None, hooks=[guard])
 
 
 # ── Task serialisation ─────────────────────────────────────────────────────────────────
@@ -224,11 +89,14 @@ def make_skill_guard(original_src: Path) -> HookMatcher:
 
 def _task_to_dict(task: Task) -> dict[str, object]:
     """Serialise a :class:`Task` back to the ``tasks.yaml`` mapping shape."""
-    entry: dict[str, object] = {
-        "id": task.id,
-        "train": {"prompt": task.train.prompt, "answer": task.train.answer},
-        "test": {"prompt": task.test.prompt, "answer": task.test.answer},
-    }
+    entry: dict[str, object] = {"id": task.id}
+    # Beside the id rather than below the prompts: it says how to read the whole task, and after
+    # two multi-line prompt blocks a reader would never see it. Only the non-default is written,
+    # since `needs_script: true` on every task is noise and its absence already means that.
+    if not task.needs_script:
+        entry["needs_script"] = False
+    entry["train"] = {"prompt": task.train.prompt, "answer": task.train.answer}
+    entry["test"] = {"prompt": task.test.prompt, "answer": task.test.answer}
     if task.max_turns is not None:
         entry["max_turns"] = task.max_turns
     if task.max_usd is not None:
@@ -262,6 +130,57 @@ def dump_tasks(tasks: list[Task]) -> str:
     return yaml.dump(doc, Dumper=_TaskDumper, sort_keys=False, default_flow_style=False, allow_unicode=True, width=100)
 
 
+@dataclass(frozen=True)
+class Harvest:
+    """What :func:`harvest_scripts` moved, and what it could not."""
+
+    scripts: tuple[Path, ...]
+    missing: tuple[tuple[str, Split], ...]
+    unexpected: tuple[str, ...]
+
+
+def harvest_scripts(tasks: list[Task], staged_dir: Path, scripts_root: Path) -> Harvest:
+    """Copy the agent's reproducer scripts out of its work dir into the project.
+
+    Only names that match a real ``(task id, split)`` are taken, and only for tasks that declare
+    they need one. Anything else the agent left there is reported rather than copied: a file
+    named after no task is never run by :mod:`acumen.check`, so silently keeping it would look
+    like coverage that does not exist.
+
+    Parameters
+    ----------
+    tasks
+        The validated tasks, read for their ids and ``needs_script``.
+    staged_dir
+        The agent's scripts directory inside its throwaway work dir.
+    scripts_root
+        Where the reproducers are kept, created if missing.
+
+    Returns
+    -------
+    The scripts copied, the splits that expected one and had none, and the unmatched files.
+    """
+    copied: list[Path] = []
+    missing: list[tuple[str, Split]] = []
+    wanted: set[str] = set()
+    for task in tasks:
+        if not task.needs_script:
+            continue
+        for split in SPLITS:
+            name = script_name(task.id, split)
+            wanted.add(name)
+            source = staged_dir / name
+            if not source.is_file():
+                missing.append((task.id, split))
+                continue
+            dest = script_path(scripts_root, task.id, split)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, dest)
+            copied.append(dest)
+    staged = {path.name for path in staged_dir.glob("*.py")} if staged_dir.is_dir() else set()
+    return Harvest(scripts=tuple(copied), missing=tuple(missing), unexpected=tuple(sorted(staged - wanted)))
+
+
 def _validate_generated(staged: Path) -> list[Task]:
     """Load and validate the agent's ``tasks.yaml``, mapping failures to a TaskGenError."""
     if not staged.is_file():
@@ -280,7 +199,9 @@ async def generate_tasks(
     cfg: Config,
     target: Target,
     out_path: Path,
+    scripts_root: Path | None = None,
     auth_mode: AuthMode = "session",
+    prices: PriceTable | None = None,
     model: str | None = None,
     max_turns: int | None = None,
     max_usd: float | None = None,
@@ -307,6 +228,10 @@ async def generate_tasks(
         avoid re-covering functionality already present, and appending would silently grow the
         set with semantic duplicates. To combine generated tasks with a curated file, write to a
         separate ``out_path`` and merge by hand, where the overlap can actually be judged.
+    scripts_root
+        Where the reproducer scripts are kept. Defaults to a ``tasks/`` directory beside
+        ``out_path``. Scripts are harvested only after the generated tasks validate, and only
+        for the ``(task, split)`` pairs the tasks themselves declare.
     model
         Override for the generation model; defaults to ``cfg.tasks_model``.
     max_turns, max_usd
@@ -329,12 +254,20 @@ async def generate_tasks(
     if out_path.exists() and not force:
         raise TaskGenError(f"{out_path} already exists — pass force=True to overwrite it")
 
+    scripts_root = scripts_root if scripts_root is not None else out_path.parent / SCRIPTS_DIRNAME
+
     holder = Path(tempfile.mkdtemp(prefix="acumen-tasks-"))
     try:
         work = holder / "work"
         home = holder / "home"
-        config_dir = home / ".claude"
-        for path in (work, home, config_dir, home / "tmp"):
+        selected_model = model or cfg.tasks_model
+        table = prices if prices is not None else PriceTable(overrides=cfg.prices)
+        provider = provider_for_model(selected_model)
+        config_dir = home / (".claude" if provider == "claude" else ".codex")
+        # The scripts directory is created up front so the agent writes into a path that exists,
+        # rather than having to work out that it must make one first.
+        staged_scripts = work / SCRIPTS_DIRNAME
+        for path in (work, home, config_dir, home / "tmp", staged_scripts):
             path.mkdir(parents=True, exist_ok=True)
         staged = work / TASKS_FILE
 
@@ -350,6 +283,7 @@ async def generate_tasks(
                 extra_path=[target.bin_dir],
                 auth_mode=auth_mode,
                 extra_allow=cfg.env_passthrough,
+                provider=provider,
             ),
             holder,
         )
@@ -359,35 +293,40 @@ async def generate_tasks(
             src=source_copy,
             python=target.python,
             out=staged,
+            scripts_dir=staged_scripts,
             feedback=feedback,
         )
-        options = ClaudeAgentOptions(
-            cwd=str(work),
+        options = AgentOptions(
+            cwd=work,
             env=env,
-            model=model or cfg.tasks_model,
+            model=selected_model,
             # No default budget cap: only bound the agent if the caller asked.
             max_turns=max_turns,
-            max_budget_usd=max_usd,
+            max_usd=max_usd,
+            # Codex reports no billed figure, so a budget cap needs the run's own rate table.
+            price_usd=pricer(selected_model, table),
             # The generator reads the target source, like the drafter; benchmark agents
             # never do. It points at the *filtered* copy, not the real checkout.
-            add_dirs=[str(source_copy)],
+            read_dirs=(source_copy, target.venv_dir),
+            write_dirs=(work,),
             # No skill discovery at all — the generator must not load a skill that would bias it.
-            setting_sources=[],
-            permission_mode="bypassPermissions",
-            system_prompt={"type": "preset", "preset": "claude_code"},
+            discover_skills=False,
             # Belt-and-braces over the filtered copy: deny any call that reaches an existing
-            # skill/guidance artifact or the original unfiltered source, wherever pointed.
-            hooks={"PreToolUse": [make_skill_guard(target.src_dir)]},
+            # skill/guidance artifact or the original unfiltered source, wherever pointed. Built
+            # only for Claude — the hook is an SDK object, and Codex gets ``deny_paths`` below.
+            claude_hooks={"PreToolUse": [make_skill_guard(target.src_dir)]} if provider == "claude" else None,
+            # Codex reads the filtered copy and is denied the original checkout.
+            deny_paths=(target.src_dir.resolve(),),
         )
 
-        result: ResultMessage | None = None
+        result: AgentResult | None = None
         agent_error: Exception | None = None
         try:
-            async for message in query(prompt=prompt, options=options):
-                if log is not None:
-                    log.append(message)
-                if isinstance(message, ResultMessage):
-                    result = message
+            result = await run_agent(
+                prompt,
+                options=options,
+                on_event=log.append if log is not None else None,
+            )
         except Exception as err:  # noqa: BLE001 - a failed generation is an error to report, re-raised below
             agent_error = err
         finally:
@@ -410,10 +349,24 @@ async def generate_tasks(
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(dump_tasks(generated))
+        # After the tasks are validated and written, so a rejected generation leaves the
+        # project's scripts directory exactly as it was.
+        harvest = harvest_scripts(generated, staged_scripts, scripts_root)
         return TaskGenResult(
             tasks=generated,
             out_path=out_path,
-            cost_usd=result.total_cost_usd or 0.0,
+            scripts=harvest.scripts,
+            missing_scripts=harvest.missing,
+            unexpected_scripts=harvest.unexpected,
+            cost_usd=resolve_cost(
+                result.total_cost_usd,
+                price_usage(
+                    result.usage,
+                    model=selected_model,
+                    provider=result.provider,
+                    prices=table,
+                ),
+            ).cost_usd,
             turns=result.num_turns,
             log_jsonl=log.jsonl_path if log is not None else None,
             log_html=log.html_path if log is not None and log.html_rendered else None,
