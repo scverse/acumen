@@ -1524,6 +1524,11 @@ def test_capped_codex_run_records_the_tokens_it_spent(tmp_path: Path, monkeypatc
     assert payload["cost_available"] is True
 
 
+async def _no_preflight(*_args: object, **_kwargs: object) -> dict[str, str]:
+    """Stand in for `preflight_models`: no model is unreachable, so the matrix proceeds."""
+    return {}
+
+
 def test_run_matrix_cancels_remaining_cells_when_provider_is_exhausted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1555,6 +1560,7 @@ def test_run_matrix_cancels_remaining_cells_when_provider_is_exhausted(
             cancelled.append(key.task_id)
 
     monkeypatch.setattr("acumen.bench.run_once", fake_run_once)
+    monkeypatch.setattr("acumen.bench.preflight_models", _no_preflight)
     target = Target(
         source="target",
         ref="main",
@@ -1611,6 +1617,7 @@ def test_run_matrix_continues_other_provider_after_one_is_exhausted(
         return RunOutcome(key=key, success=True, reason="ok", payload={})
 
     monkeypatch.setattr("acumen.bench.run_once", fake_run_once)
+    monkeypatch.setattr("acumen.bench.preflight_models", _no_preflight)
     target = Target(
         source="target",
         ref="main",

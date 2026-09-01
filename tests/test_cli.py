@@ -12,6 +12,7 @@ import csv
 import json
 import os
 import sys
+import sysconfig
 from datetime import date
 from pathlib import Path
 
@@ -683,6 +684,13 @@ def _stub_target(project: Path, monkeypatch: pytest.MonkeyPatch, *, pkg_name: st
     interpreter = bin_dir / ("python.exe" if os.name == "nt" else "python")
     if not interpreter.exists():
         interpreter.symlink_to(sys.executable)
+    # A real pyvenv.cfg makes the import probe's subprocess treat this dir as its prefix; without
+    # one it falls back to the base interpreter, which cannot see the test env's own packages.
+    (venv / "pyvenv.cfg").write_text(f"home = {Path(sys.executable).parent}\nversion = {sys.version.split()[0]}\n")
+    # Expose the running interpreter's packages (pyyaml, importing as yaml) to that prefix.
+    site_dir = Path(sysconfig.get_path("purelib", vars={"base": str(venv), "platbase": str(venv)}))
+    site_dir.mkdir(parents=True, exist_ok=True)
+    (site_dir / "_acumen_target.pth").write_text(sysconfig.get_path("purelib") + "\n")
     target = Target(
         source="target",
         ref="main",
