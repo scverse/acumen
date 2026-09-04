@@ -95,6 +95,9 @@ class AgentResult:
     usage: dict[str, int]
     stop_reason: str | None = None
     transcript: list[dict[str, Any]] = field(default_factory=list)
+    #: The prompt the run was given. Codex's ``exec --json`` stream never echoes it, so carrying
+    #: it here is the only way the rendered transcript can show what the agent was asked to do.
+    prompt: str = ""
 
 
 @dataclass(frozen=True)
@@ -1045,5 +1048,7 @@ async def run_agent(
     """Run one Claude or Codex agent, selected from ``options.model``."""
     provider = provider_for_model(options.model)
     if provider == "claude":
-        return await _run_claude(prompt, options, on_event)
-    return await _run_codex(prompt, options, on_event)
+        result = await _run_claude(prompt, options, on_event)
+    else:
+        result = await _run_codex(prompt, options, on_event)
+    return replace(result, prompt=prompt)

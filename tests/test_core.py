@@ -138,7 +138,7 @@ from acumen.ship import _ship_env
 from acumen.skills import SkillError, load_skill, read_meta, skill_hash, write_meta
 from acumen.taskgen import dump_tasks, harvest_scripts
 from acumen.tasks import Task, TaskError, TaskSplit, load_tasks, parse_tasks
-from acumen.transcript import render_agent_transcript, render_codex_transcript
+from acumen.transcript import render_agent_transcript, render_codex_events, render_codex_transcript
 
 # --- grading ---------------------------------------------------------------------------
 
@@ -1703,6 +1703,27 @@ def test_codex_transcript_renders_without_events(tmp_path: Path) -> None:
     assert render_codex_transcript(jsonl, html) is True
     assert "no events" in html.read_text()
     assert render_codex_transcript(tmp_path / "missing.jsonl", tmp_path / "missing.html") is False
+
+
+def test_codex_transcript_renders_the_prompt_as_a_leading_block(tmp_path: Path) -> None:
+    """Codex's event stream never echoes the prompt, so the caller carries it back to be shown."""
+    events = [
+        {"type": "thread.started", "thread_id": "thread-9"},
+        {"type": "item.completed", "item": {"id": "a", "type": "agent_message", "text": "done"}},
+    ]
+    html = tmp_path / "with_prompt.html"
+    assert render_codex_events(events, html, prompt="Report the top <gene>.") is True
+    body = html.read_text()
+    # The prompt is rendered, labelled, and ahead of the agent's first message.
+    assert '<div class="item prompt">' in body
+    assert body.index("Report the top") < body.index("done")
+    # It is escaped, never injected as markup.
+    assert "&lt;gene&gt;" in body and "<gene>" not in body
+
+    # An empty prompt renders no block at all, so a run without one is unchanged.
+    bare = tmp_path / "no_prompt.html"
+    assert render_codex_events(events, bare, prompt="   ") is True
+    assert '<div class="item prompt">' not in bare.read_text()
 
 
 def test_render_agent_transcript_dispatches_on_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4287,7 +4308,7 @@ def test_review_tasks_hands_the_agent_a_packet_and_reads_its_verdicts(
 
     review = asyncio.run(
         review_tasks(
-            cfg=parse_config({"repo": "/tmp/target-demo", "check_model": "claude-opus-5"}),
+            cfg=parse_config({"repo": "/tmp/target-demo", "meta_model": "claude-opus-5"}),
             target=target,
             tasks=tasks,
             results=results,
@@ -4354,10 +4375,10 @@ def test_review_tasks_reports_unparseable_output_as_a_failed_review(
         )
 
 
-def test_check_model_defaults_to_the_first_benchmark_model() -> None:
-    """Same rule as every other meta-agent model, so one `models:` line configures the lot."""
+def test_meta_model_defaults_to_the_first_benchmark_model() -> None:
+    """The meta-agent model defaults to the first benchmark model, so one `models:` line configures the lot."""
     cfg = parse_config({"repo": "/tmp/target-demo", "models": ["gpt-5.6-sol", "claude-opus-5"]})
-    assert cfg.check_model == "gpt-5.6-sol"
+    assert cfg.meta_model == "gpt-5.6-sol"
 
-    named = parse_config({"repo": "/tmp/target-demo", "check_model": "claude-haiku-4-5-20251001"})
-    assert named.check_model == "claude-haiku-4-5-20251001"
+    named = parse_config({"repo": "/tmp/target-demo", "meta_model": "claude-haiku-4-5-20251001"})
+    assert named.meta_model == "claude-haiku-4-5-20251001"

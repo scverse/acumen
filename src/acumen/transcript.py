@@ -96,6 +96,7 @@ h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
 .meta { color: #6b7280; font-size: .8rem; margin-bottom: 1.5rem; }
 .item { border-left: 3px solid #d1d5db; margin: 0 0 1rem; padding: .25rem 0 .25rem .75rem; }
 .item > .label { color: #6b7280; font-size: .7rem; letter-spacing: .04em; text-transform: uppercase; }
+.prompt { border-left-color: #4b8b9b; }
 .agent_message { border-left-color: #6b8f71; }
 .reasoning { border-left-color: #b6a8c9; color: #6b7280; }
 .command_execution { border-left-color: #7f9cb5; }
@@ -154,6 +155,7 @@ def render_codex_events(
     events: Iterable[dict[str, Any]],
     html: Path,
     usage: dict[str, Any] | None = None,
+    prompt: str = "",
 ) -> bool:
     """Render a ``codex exec --json`` event stream to a standalone HTML file.
 
@@ -165,12 +167,18 @@ def render_codex_events(
     ``turn.completed`` event to read one from, so passing it is what keeps the footer from going
     blank on exactly the runs whose spend is most worth seeing.
 
+    ``prompt`` is the instruction the run was given. Codex's event stream never echoes it, so it
+    is rendered as a leading block from the value the caller carries back, matching what a Claude
+    transcript shows.
+
     Returns
     -------
     Whether the file was written.
     """
     started: dict[str, dict[str, Any]] = {}
     blocks: list[str] = []
+    if prompt.strip():
+        blocks.append(f'<div class="item prompt"><div class="label">prompt</div><pre>{escape(prompt)}</pre></div>')
     session = ""
     tally: dict[str, Any] = dict(usage or {})
     errors: list[str] = []

@@ -436,7 +436,7 @@ async def improve_skill(
     Parameters
     ----------
     cfg
-        The pass config; supplies ``skill_name`` and ``improve_model``.
+        The pass config; supplies ``skill_name`` and ``meta_model``.
     target
         The prepared target, supplying the interpreter (for verifying claims). Its source
         is **not** exposed — the improver works from evidence, not code.
@@ -490,7 +490,7 @@ async def improve_skill(
         train_dir = work / "train"
         rationale_path = work / "rationale.md"
         home = holder / "home"
-        selected_model = model or cfg.improve_model
+        selected_model = model or cfg.meta_model
         table = prices if prices is not None else PriceTable(overrides=cfg.prices)
         provider = provider_for_model(selected_model)
         config_dir = home / (".claude" if provider == "claude" else ".codex")

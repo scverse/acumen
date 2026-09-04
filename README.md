@@ -112,7 +112,7 @@ scell    test   ok      mismatch  Trail;JAK-STAT;Estrogen
                 fix: say descending in the prompt, or reverse the answer
 ```
 
-The review is on by default and picks its model from `check_model`; it is the one phase that costs
+The review is on by default and picks its model from `meta_model`; it is the one phase that costs
 money, so `acumen check --no-review` runs the reproducers alone and spends nothing — what you want
 while iterating on a script. `check` takes the same `--auth`, `--stream` and `--log-dir` flags as
 the other agentic commands, and `--max-turns`/`--max-usd` bound the reviewer.
@@ -158,8 +158,8 @@ so install only the one you run — `pip install acumen[claude]`, or plain `acum
 install command, before acumen prepares a target or spends anything.
 
 Claude API runs use `ANTHROPIC_API_KEY`; Codex API runs use `CODEX_API_KEY` (or
-`OPENAI_API_KEY`). The meta-agent commands also accept a Codex model through their
-`*_model` config keys or `--model`.
+`OPENAI_API_KEY`). The meta-agent commands also accept a Codex model through the
+`meta_model` config key or `--model`.
 
 Every agentic command — `bench` included — takes `--auth {auto,session,api}` and defaults to
 the provider's logged-in subscription, falling back to its API key. Both billing modes report

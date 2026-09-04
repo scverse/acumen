@@ -162,7 +162,11 @@ class LiveLog:
         if result is None:
             return False
         if getattr(result, "provider", "claude") == "codex":
-            self.html_rendered = render_codex_events(getattr(result, "transcript", []), self.html_path)
+            self.html_rendered = render_codex_events(
+                getattr(result, "transcript", []),
+                self.html_path,
+                prompt=getattr(result, "prompt", ""),
+            )
             return self.html_rendered
         if not result.session_id:
             return False

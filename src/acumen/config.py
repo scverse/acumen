@@ -49,13 +49,11 @@ class Config:
     max_turns: int = 40
     #: Budget cap (USD) for benchmark agents only; draft/improve/ship/tasks are unbounded by default.
     max_usd: float = 3.0
-    draft_model: str = "claude-opus-5"
-    improve_model: str = "claude-opus-5"
-    tasks_model: str = "claude-opus-5"
-    ship_model: str = "claude-opus-5"
-    #: Model for the coherence review in ``acumen check`` — the agent that reads each task's
-    #: prompt, recorded answer and reproducer together and says whether they agree.
-    check_model: str = "claude-opus-5"
+    #: Model for the meta-agent commands — ``draft``, ``improve``, ``tasks``, ``ship`` and
+    #: ``check``'s coherence review. Distinct from ``models``, which lists the benchmark
+    #: subjects; ``meta_model`` is the tooling that builds and vets a skill. Defaults to the
+    #: first ``models`` entry, so one ``models:`` line configures the lot.
+    meta_model: str = "claude-opus-5"
     #: Per-model token rates (USD per million), overriding or extending the built-in table
     #: in :mod:`acumen.prices`. Name a model here when you are on negotiated rates, run
     #: through a gateway, or use a model acumen does not ship a price for — an unpriced
@@ -83,11 +81,7 @@ _KNOWN = {
     "max_concurrency",
     "max_turns",
     "max_usd",
-    "draft_model",
-    "improve_model",
-    "tasks_model",
-    "ship_model",
-    "check_model",
+    "meta_model",
     "skill_name",
     "prices",
 }
@@ -214,11 +208,7 @@ def parse_config(raw: Any) -> Config:
         max_concurrency=_positive_int(raw, "max_concurrency", 4),
         max_turns=_positive_int(raw, "max_turns", 40),
         max_usd=_positive_float(raw, "max_usd", 3.0),
-        draft_model=_optional_str(raw, "draft_model", default_model),
-        improve_model=_optional_str(raw, "improve_model", default_model),
-        tasks_model=_optional_str(raw, "tasks_model", default_model),
-        ship_model=_optional_str(raw, "ship_model", default_model),
-        check_model=_optional_str(raw, "check_model", default_model),
+        meta_model=_optional_str(raw, "meta_model", default_model),
         prices=_prices(raw),
     )
 

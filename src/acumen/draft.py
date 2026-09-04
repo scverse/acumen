@@ -91,7 +91,7 @@ async def draft_skill(
     Parameters
     ----------
     cfg
-        The pass config; supplies ``skill_name`` and ``draft_model``.
+        The pass config; supplies ``skill_name`` and ``meta_model``.
     target
         The prepared target, supplying the source checkout and interpreter.
     skills_root
@@ -128,7 +128,7 @@ async def draft_skill(
         work = holder / "work"
         staging = work / version
         home = holder / "home"
-        selected_model = model or cfg.draft_model
+        selected_model = model or cfg.meta_model
         table = prices if prices is not None else PriceTable(overrides=cfg.prices)
         provider = provider_for_model(selected_model)
         config_dir = home / (".claude" if provider == "claude" else ".codex")

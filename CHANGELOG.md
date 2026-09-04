@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning][].
 [keep a changelog]: https://keepachangelog.com/
 [semantic versioning]: https://semver.org/
 
+## [0.0.2dev]
+
+### Changed
+
+- Merge the five per-command meta-agent model keys (`draft_model`, `improve_model`,
+  `tasks_model`, `ship_model`, `check_model`) into a single `meta_model` key. It still defaults
+  to the first `models` entry, and each command's `--model` flag still overrides it per run. A
+  config that sets any of the old keys now errors as an unknown key.
+
 ## [0.0.1dev]
 
 ### Added

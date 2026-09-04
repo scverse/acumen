@@ -331,7 +331,7 @@ async def review_tasks(
     Parameters
     ----------
     cfg
-        The pass config; supplies ``check_model``.
+        The pass config; supplies ``meta_model``.
     target
         The prepared target. The reviewer reads its source and venv, since judging whether a
         prompt describes what a script computes can need the package's own semantics.
@@ -344,7 +344,7 @@ async def review_tasks(
         Which credential the review agent authenticates with (see
         :func:`acumen.env.build_agent_env`).
     model
-        Override for the review model; defaults to ``cfg.check_model``.
+        Override for the review model; defaults to ``cfg.meta_model``.
     max_turns, max_usd
         Caps for the review agent. Unbounded by default, like every other meta-agent.
     log
@@ -368,7 +368,7 @@ async def review_tasks(
     try:
         work = holder / "work"
         home = holder / "home"
-        selected_model = model or cfg.check_model
+        selected_model = model or cfg.meta_model
         table = prices if prices is not None else PriceTable(overrides=cfg.prices)
         provider = provider_for_model(selected_model)
         config_dir = home / (".claude" if provider == "claude" else ".codex")
