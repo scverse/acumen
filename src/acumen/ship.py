@@ -215,7 +215,7 @@ async def ship_skill(
     Parameters
     ----------
     cfg
-        The pass config; supplies ``skill_name`` and ``ship_model``, and ``is_local`` decides
+        The pass config; supplies ``skill_name`` and ``meta_model``, and ``is_local`` decides
         whether delivery is a PR (GitHub URL) or a working-tree edit (local path).
     target
         The prepared target, supplying the checkout the agent modifies (its ``src_dir``) and the
@@ -229,7 +229,7 @@ async def ship_skill(
         subscription) or ``"api"``. The agent retains git/``gh`` environment credentials and
         public network access inside its filesystem sandbox.
     model
-        Override for the ship model; defaults to ``cfg.ship_model``.
+        Override for the ship model; defaults to ``cfg.meta_model``.
     max_turns, max_usd
         Caps for the agent. **Unbounded by default**: shipping builds and installs the
         package iteratively and runs git/``gh``, so no default budget is imposed.
@@ -256,7 +256,7 @@ async def ship_skill(
     holder = Path(tempfile.mkdtemp(prefix="acumen-ship-"))
     try:
         skill_src = _stage_skill_payload(skill, holder / "skill")
-        selected_model = model or cfg.ship_model
+        selected_model = model or cfg.meta_model
         table = prices if prices is not None else PriceTable(overrides=cfg.prices)
         provider = provider_for_model(selected_model)
         home = holder / "home"

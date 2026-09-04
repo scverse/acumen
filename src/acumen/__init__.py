@@ -104,7 +104,9 @@ from acumen.taskgen import (
     harvest_scripts,
 )
 from acumen.tasks import Task, TaskError, TaskSplit, load_tasks, parse_tasks
+from acumen.trajectory import Trajectory, render_trajectory
 from acumen.transcript import (
+    build_trajectory,
     locate_transcript,
     render_agent_transcript,
     render_codex_transcript,
@@ -157,6 +159,7 @@ __all__ = [
     "TaskGenError",
     "TaskGenResult",
     "TaskSplit",
+    "Trajectory",
     "TrainRun",
     "__version__",
     "api_auth_available",
@@ -167,6 +170,7 @@ __all__ = [
     "claude_sdk_available",
     "build_agent_env",
     "build_filtered_source",
+    "build_trajectory",
     "find_guidance",
     "build_matrix",
     "build_report",
@@ -205,6 +209,7 @@ __all__ = [
     "provider_for_model",
     "render_agent_transcript",
     "render_codex_transcript",
+    "render_trajectory",
     "render_transcript",
     "resolve_auth_mode",
     "resolve_palette",

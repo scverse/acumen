@@ -479,7 +479,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
 def _cmd_draft(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     if args.model:
-        cfg = replace(cfg, draft_model=args.model)
+        cfg = replace(cfg, meta_model=args.model)
 
     existing = available_versions(args.skills)
     if existing and not args.force:
@@ -491,7 +491,7 @@ def _cmd_draft(args: argparse.Namespace) -> int:
         )
         return 2
 
-    provider = provider_for_model(cfg.draft_model)
+    provider = provider_for_model(cfg.meta_model)
     check_agent_cli(provider)
     auth_mode = resolve_auth_mode(args.auth, provider=provider)
     _print_auth(auth_mode, provider)
@@ -499,7 +499,7 @@ def _cmd_draft(args: argparse.Namespace) -> int:
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
-    print(f"drafting with {cfg.draft_model} (this reads the package source) ...", flush=True)
+    print(f"drafting with {cfg.meta_model} (this reads the package source) ...", flush=True)
 
     log = LiveLog.open(args.log_dir, "draft", stream=args.stream)
     print(f"log → {log.jsonl_path}", flush=True)
@@ -507,7 +507,7 @@ def _cmd_draft(args: argparse.Namespace) -> int:
         result = asyncio.run(
             draft_skill(
                 cfg=cfg,
-                prices=_agent_prices(cfg, model=cfg.draft_model),
+                prices=_agent_prices(cfg, model=cfg.meta_model),
                 target=target,
                 skills_root=args.skills,
                 auth_mode=auth_mode,
@@ -534,7 +534,7 @@ def _cmd_improve(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     tasks = load_tasks(args.tasks)
     if args.model:
-        cfg = replace(cfg, improve_model=args.model)
+        cfg = replace(cfg, meta_model=args.model)
 
     versions = available_versions(args.skills)
     if not versions:
@@ -547,9 +547,9 @@ def _cmd_improve(args: argparse.Namespace) -> int:
     # Immutability guard: the improved version is always the next unused directory,
     # so an existing version is never in the write path. Say the parent plainly up front.
     skill = load_skill(args.skills, parent, expect_name=cfg.skill_name)
-    print(f"improving {skill.version} ({skill.name}, {skill.hash[:19]}…) with {cfg.improve_model}")
+    print(f"improving {skill.version} ({skill.name}, {skill.hash[:19]}…) with {cfg.meta_model}")
 
-    provider = provider_for_model(cfg.improve_model)
+    provider = provider_for_model(cfg.meta_model)
     check_agent_cli(provider)
     auth_mode = resolve_auth_mode(args.auth, provider=provider)
     _print_auth(auth_mode, provider)
@@ -564,7 +564,7 @@ def _cmd_improve(args: argparse.Namespace) -> int:
         result = asyncio.run(
             improve_skill(
                 cfg=cfg,
-                prices=_agent_prices(cfg, model=cfg.improve_model),
+                prices=_agent_prices(cfg, model=cfg.meta_model),
                 target=target,
                 skills_root=args.skills,
                 runs_root=args.runs,
@@ -599,7 +599,7 @@ def _cmd_improve(args: argparse.Namespace) -> int:
 def _cmd_tasks(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     if args.model:
-        cfg = replace(cfg, tasks_model=args.model)
+        cfg = replace(cfg, meta_model=args.model)
 
     out = args.out
     # `acumen init` writes a placeholder here, and generating over it is the documented next
@@ -615,7 +615,7 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
     if out.exists() and not args.force:
         print(f"replacing the untouched placeholder at {out}")
 
-    provider = provider_for_model(cfg.tasks_model)
+    provider = provider_for_model(cfg.meta_model)
     check_agent_cli(provider)
     auth_mode = resolve_auth_mode(args.auth, provider=provider)
     _print_auth(auth_mode, provider)
@@ -624,7 +624,7 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
     print(
-        f"generating tasks with {cfg.tasks_model} (this reads the source and runs package code) ...",
+        f"generating tasks with {cfg.meta_model} (this reads the source and runs package code) ...",
         flush=True,
     )
 
@@ -634,7 +634,7 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
         result = asyncio.run(
             generate_tasks(
                 cfg=cfg,
-                prices=_agent_prices(cfg, model=cfg.tasks_model),
+                prices=_agent_prices(cfg, model=cfg.meta_model),
                 target=target,
                 out_path=out,
                 scripts_root=args.scripts,
@@ -784,7 +784,7 @@ def _print_check_summary(summary: CheckSummary, review: ReviewResult | None = No
 def _cmd_check(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     if args.model:
-        cfg = replace(cfg, check_model=args.model)
+        cfg = replace(cfg, meta_model=args.model)
     tasks = select_tasks(load_tasks(args.tasks), args.task)
     splits = args.split or list(SPLITS)
     review_on = not args.no_review
@@ -795,12 +795,12 @@ def _cmd_check(args: argparse.Namespace) -> int:
     auth_mode: AuthMode = "api"
     prices: PriceTable | None = None
     if review_on:
-        provider = provider_for_model(cfg.check_model)
+        provider = provider_for_model(cfg.meta_model)
         check_agent_cli(provider)
         auth_mode = resolve_auth_mode(args.auth, provider=provider)
         _print_auth(auth_mode, provider)
         _warn_codex_accounting(provider)
-        prices = _agent_prices(cfg, model=cfg.check_model)
+        prices = _agent_prices(cfg, model=cfg.meta_model)
 
     orphans = orphan_scripts(tasks, args.scripts) if not args.task else []
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
@@ -850,7 +850,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
         # The second phase. Reproducing the answer says the code and the answer agree; it says
         # nothing about whether the PROMPT asks for what they produce, which is the other way a
         # task silently costs a whole pass.
-        print(f"\nreviewing {len(results)} task splits with {cfg.check_model} ...", flush=True)
+        print(f"\nreviewing {len(results)} task splits with {cfg.meta_model} ...", flush=True)
         log = LiveLog.open(args.log_dir, "check", stream=args.stream)
         print(f"log → {log.jsonl_path}", flush=True)
         try:
@@ -932,7 +932,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
                     "review": None
                     if review is None
                     else {
-                        "model": cfg.check_model,
+                        "model": cfg.meta_model,
                         "cost_usd": review.cost_usd,
                         "turns": review.turns,
                         "flagged": len(review.flagged),
@@ -989,7 +989,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
 def _cmd_ship(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     if args.model:
-        cfg = replace(cfg, ship_model=args.model)
+        cfg = replace(cfg, meta_model=args.model)
 
     # Validate the version exists before the (costly) target prep.
     load_skill(args.skills, args.version, expect_name=cfg.skill_name)
@@ -1000,7 +1000,7 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         else ("a GitHub URL — the change is delivered as a pull request")
     )
     print(f"shipping {args.version} of {cfg.skill_name} into {cfg.repo} ({where})")
-    provider = provider_for_model(cfg.ship_model)
+    provider = provider_for_model(cfg.meta_model)
     check_agent_cli(provider)
     auth_mode = resolve_auth_mode(args.auth, provider=provider)
     _print_auth(auth_mode, provider)
@@ -1009,7 +1009,7 @@ def _cmd_ship(args: argparse.Namespace) -> int:
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
     print(
-        f"running the ship agent with {cfg.ship_model} (real env: it builds, installs, and "
+        f"running the ship agent with {cfg.meta_model} (real env: it builds, installs, and "
         f"{'opens a PR' if not cfg.is_local else 'edits the working tree'}) ...",
         flush=True,
     )
@@ -1020,7 +1020,7 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         result = asyncio.run(
             ship_skill(
                 cfg=cfg,
-                prices=_agent_prices(cfg, model=cfg.ship_model),
+                prices=_agent_prices(cfg, model=cfg.meta_model),
                 target=target,
                 skills_root=args.skills,
                 version=args.version,
@@ -1170,7 +1170,7 @@ def build_parser() -> argparse.ArgumentParser:
     draft = sub.add_parser("draft", help="draft a skill from the target package's source")
     draft.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
     draft.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
-    draft.add_argument("--model", help="override config draft_model")
+    draft.add_argument("--model", help="override config meta_model")
     draft.add_argument("--max-turns", type=int, help="cap turns for the drafting agent (default: unbounded)")
     draft.add_argument("--max-usd", type=float, help="cap spend for the drafting agent (default: unbounded)")
     draft.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
@@ -1187,7 +1187,7 @@ def build_parser() -> argparse.ArgumentParser:
     improve.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
     improve.add_argument("--runs", type=Path, default=Path("runs"), help="root of the run tree")
     improve.add_argument("--from", dest="from_version", metavar="VERSION", help="version to improve (default: latest)")
-    improve.add_argument("--model", help="override config improve_model")
+    improve.add_argument("--model", help="override config meta_model")
     improve.add_argument("--max-turns", type=int, help="cap turns for the improving agent (default: unbounded)")
     improve.add_argument("--max-usd", type=float, help="cap spend for the improving agent (default: unbounded)")
     improve.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
@@ -1209,7 +1209,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path(SCRIPTS_DIRNAME),
         help="directory to keep the reproducer script for each split in, for `acumen check`",
     )
-    tasks_cmd.add_argument("--model", help="override config tasks_model")
+    tasks_cmd.add_argument("--model", help="override config meta_model")
     tasks_cmd.add_argument("--max-turns", type=int, help="cap turns for the generation agent (default: unbounded)")
     tasks_cmd.add_argument("--max-usd", type=float, help="cap spend for the generation agent (default: unbounded)")
     tasks_cmd.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
@@ -1256,7 +1256,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip the coherence review: run the reproducers only, spawning no agent and spending nothing",
     )
-    check.add_argument("--model", help="override config check_model (the review agent)")
+    check.add_argument("--model", help="override config meta_model (the review agent)")
     check.add_argument("--max-turns", type=int, help="cap turns for the review agent (default: unbounded)")
     check.add_argument("--max-usd", type=float, help="cap spend for the review agent (default: unbounded)")
     _add_auth_arg(check)
@@ -1269,7 +1269,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ship.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
     ship.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
-    ship.add_argument("--model", help="override config ship_model")
+    ship.add_argument("--model", help="override config meta_model")
     ship.add_argument("--max-turns", type=int, help="cap turns for the ship agent (default: unbounded)")
     ship.add_argument("--max-usd", type=float, help="cap spend for the ship agent (default: unbounded)")
     ship.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")

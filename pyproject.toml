@@ -4,7 +4,7 @@ requires = [ "hatchling" ]
 
 [project]
 name = "acumen"
-version = "0.0.1.dev0"
+version = "0.0.2.dev0"
 description = "Build, Benchmark, and Optimize Agentic Skills for Python Packages."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -32,12 +32,12 @@ dependencies = [
   "session-info2",
 ]
 # Backends are optional and independent: install the ones you actually run. Claude needs a
-# Python SDK (and claude-code-log to render its transcripts); Codex is an external CLI, so it
-# adds no Python dependency at all — `codex` on PATH is the whole requirement.
+# Python SDK; Codex is an external CLI, so it adds no Python dependency at all — `codex` on PATH
+# is the whole requirement. Both providers' transcripts are rendered in-house (see
+# `acumen.trajectory`), so no external renderer is required for either.
 optional-dependencies.all = [ "acumen[claude]" ]
 optional-dependencies.claude = [
   "claude-agent-sdk>=0.2.126",
-  "claude-code-log",
 ]
 # https://docs.pypi.org/project_metadata/#project-urls
 urls.Documentation = "https://acumen.readthedocs.io/"

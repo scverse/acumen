@@ -23,10 +23,12 @@ ANSWER_FILE = "answer.md"
 SCRIPT_FILE = "script.py"
 TRANSCRIPT_JSONL = "transcript.jsonl"
 TRANSCRIPT_HTML = "transcript.html"
+#: The run mapped into acumen's harness-neutral trajectory model (see :mod:`acumen.trajectory`).
+TRANSCRIPT_JSON = "trajectory.json"
 RESULT_FILE = "result.json"
 
 #: Every file a completed run leaf is expected to contain.
-RUN_FILES = (ANSWER_FILE, SCRIPT_FILE, TRANSCRIPT_JSONL, TRANSCRIPT_HTML, RESULT_FILE)
+RUN_FILES = (ANSWER_FILE, SCRIPT_FILE, TRANSCRIPT_JSONL, TRANSCRIPT_HTML, TRANSCRIPT_JSON, RESULT_FILE)
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 _ARM_RE = re.compile(r"^skill_v(\d+)$")

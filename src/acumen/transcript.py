@@ -1,35 +1,33 @@
-"""Locating and rendering agent transcripts — shared by the runner and the meta-agents.
+"""Locating agent transcripts and rendering them — a thin layer over :mod:`acumen.trajectory`.
 
-The benchmark runner has always done this per run: after an agent finishes, find the
-transcript the ``claude`` CLI wrote (under ``<CLAUDE_CONFIG_DIR>/projects/<key>/<session>.jsonl``),
-copy it into the run dir, and render it to HTML with ``claude-code-log``. This module factors
-that machinery out here so the four single-agent commands (``draft``/``improve``/``tasks``/``ship``)
-can render an HTML log of their own agent the same way, instead of losing the transcript to the
-``rmtree`` of a throwaway config dir.
+Every harness records a run in its own native format, but acumen renders them all through one
+path: map the native record into the harness-neutral :class:`~acumen.trajectory.Trajectory`, then
+hand it to the single renderer. This module keeps the per-run plumbing — finding the Claude
+SDK-native transcript on disk, reading a saved Codex event stream — and the provider dispatch;
+the model, mappers and renderer live in :mod:`acumen.trajectory`.
 
-The Claude transcript path is fully determined by the throwaway ``CLAUDE_CONFIG_DIR`` and the
-agent's ``cwd`` (both of which acumen sets) plus the ``session_id`` on the ``ResultMessage``.
-
-Codex is rendered here rather than handed to ``claude-code-log``: that tool reads the SDK-native
-format only, and given a Codex event stream it skips every line, **still exits 0**, and writes an
-empty page — a silent wrong answer. :func:`render_codex_transcript` renders the event stream
-acumen already captures, so both providers produce a readable HTML log from their own format.
+Claude is no longer handed to an external ``claude-code-log`` CLI: both providers map into the
+same model and render through the same code, so the two reports finally look alike. Nothing here
+imports the Claude SDK at module scope, so a Codex-only install still renders its own runs.
 """
 
 from __future__ import annotations
 
 import json
-import shutil
-import subprocess
-import sys
-from collections.abc import Iterable
-from html import escape
 from pathlib import Path
 from typing import Any
 
+from acumen.trajectory import (
+    Trajectory,
+    from_claude_transcript,
+    from_codex_events,
+    render_trajectory,
+    write_trajectory_json,
+)
+
 
 def locate_transcript(config_dir: Path, work_dir: Path, session_id: str) -> Path | None:
-    """Find the SDK-native transcript for a finished agent run.
+    """Find the SDK-native transcript for a finished Claude run.
 
     The ``claude`` CLI writes transcripts to
     ``<config_dir>/projects/<project_key_for(work_dir)>/<session_id>.jsonl``. That encoding is
@@ -63,164 +61,12 @@ def locate_transcript(config_dir: Path, work_dir: Path, session_id: str) -> Path
     return matches[0] if matches else None
 
 
-def claude_code_log() -> str | None:
-    """Locate the ``claude-code-log`` CLI.
-
-    It ships with acumen's ``claude`` extra, so it lives next to the interpreter running us —
-    look there before PATH, which won't contain the venv's ``bin`` when acumen is invoked by
-    absolute path rather than through an activated venv. ``None`` when it is not installed,
-    which is the normal state of a Codex-only install.
-    """
-    local = Path(sys.executable).parent / "claude-code-log"
-    if local.is_file():
-        return str(local)
-    return shutil.which("claude-code-log")
-
-
-def render_transcript(jsonl: Path, html: Path) -> bool:
-    """Render an SDK-native transcript to a standalone HTML file via ``claude-code-log``.
-
-    Returns whether the render succeeded and produced the file.
-    """
-    cli = claude_code_log()
-    if cli is None:
-        return False
-    proc = subprocess.run([cli, str(jsonl), "-o", str(html)], capture_output=True, text=True)
-    return proc.returncode == 0 and html.is_file()
-
-
-_CODEX_CSS = """\
-:root { color-scheme: light dark; }
-body { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; margin: 0 auto; max-width: 60rem; padding: 2rem 1rem; }
-h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
-.meta { color: #6b7280; font-size: .8rem; margin-bottom: 1.5rem; }
-.item { border-left: 3px solid #d1d5db; margin: 0 0 1rem; padding: .25rem 0 .25rem .75rem; }
-.item > .label { color: #6b7280; font-size: .7rem; letter-spacing: .04em; text-transform: uppercase; }
-.agent_message { border-left-color: #6b8f71; }
-.reasoning { border-left-color: #b6a8c9; color: #6b7280; }
-.command_execution { border-left-color: #7f9cb5; }
-.file_change { border-left-color: #d0a05a; }
-.failed { border-left-color: #c0685c; }
-pre { background: #00000010; border-radius: .25rem; margin: .35rem 0 0; overflow-x: auto; padding: .5rem .65rem; white-space: pre-wrap; word-break: break-word; }
-.text { white-space: pre-wrap; }
-.exit { color: #6b7280; font-size: .75rem; }
-table { border-collapse: collapse; font-size: .8rem; margin-top: .5rem; }
-td { border-top: 1px solid #d1d5db; padding: .2rem .75rem .2rem 0; }
-td.n { text-align: right; }
-"""
-
-#: How much of one command's captured output the page keeps. A benchmark agent can print a
-#: whole dataframe; the transcript is for reading, and the full output is in the JSONL beside it.
-_OUTPUT_CAP = 20_000
-
-
-def _codex_block(item: dict[str, Any], *, incomplete: bool) -> str:
-    """Render one Codex item as an HTML block."""
-    kind = str(item.get("type") or "item")
-    label = kind.replace("_", " ") + (" (unfinished)" if incomplete else "")
-    parts = [
-        f'<div class="item {escape(kind)}{" failed" if incomplete else ""}">',
-        f'<div class="label">{escape(label)}</div>',
-    ]
-    if kind in {"agent_message", "reasoning"}:
-        parts.append(f'<div class="text">{escape(str(item.get("text") or ""))}</div>')
-    elif kind == "command_execution":
-        parts.append(f"<pre>{escape(str(item.get('command') or ''))}</pre>")
-        output = str(item.get("aggregated_output") or "")
-        if output.strip():
-            clipped = output[:_OUTPUT_CAP]
-            suffix = "" if len(output) <= _OUTPUT_CAP else f"\n… {len(output) - _OUTPUT_CAP} more characters"
-            parts.append(f"<pre>{escape(clipped + suffix)}</pre>")
-        code = item.get("exit_code")
-        if code is not None:
-            parts.append(f'<div class="exit">exit {escape(str(code))}</div>')
-    else:
-        # file_change, mcp_tool_call, web_search, todo_list, and anything Codex adds later:
-        # dump the item verbatim rather than silently drop what we have no template for.
-        body = {key: value for key, value in item.items() if key not in {"id", "type"}}
-        parts.append(f"<pre>{escape(json.dumps(body, indent=2, default=str))}</pre>")
-    parts.append("</div>")
-    return "".join(parts)
-
-
-def _codex_usage_table(usage: dict[str, Any]) -> str:
-    rows = "".join(
-        f"<tr><td>{escape(str(key))}</td><td class='n'>{escape(str(value))}</td></tr>" for key, value in usage.items()
-    )
-    return f"<table>{rows}</table>"
-
-
-def render_codex_events(
-    events: Iterable[dict[str, Any]],
-    html: Path,
-    usage: dict[str, Any] | None = None,
-) -> bool:
-    """Render a ``codex exec --json`` event stream to a standalone HTML file.
-
-    Items are rendered in the order Codex completed them. An item that only ever ``started`` —
-    what a run terminated at its turn cap leaves behind — is rendered too, marked unfinished, so
-    a capped run still shows what it was doing when acumen stopped it.
-
-    ``usage`` is the tally the caller recorded for the run. A capped run has no
-    ``turn.completed`` event to read one from, so passing it is what keeps the footer from going
-    blank on exactly the runs whose spend is most worth seeing.
-
-    Returns
-    -------
-    Whether the file was written.
-    """
-    started: dict[str, dict[str, Any]] = {}
-    blocks: list[str] = []
-    session = ""
-    tally: dict[str, Any] = dict(usage or {})
-    errors: list[str] = []
-    for event in events:
-        kind = event.get("type")
-        if kind == "thread.started":
-            session = str(event.get("thread_id") or "")
-        elif kind == "turn.completed":
-            raw = event.get("usage")
-            if isinstance(raw, dict):
-                tally = raw
-        elif kind in {"error", "turn.failed"}:
-            errors.append(str(event.get("message") or event.get("error") or event))
-        elif kind in {"item.started", "item.completed"}:
-            item = event.get("item")
-            if not isinstance(item, dict):
-                continue
-            key = str(item.get("id") or len(blocks))
-            if kind == "item.started":
-                started[key] = item
-            else:
-                started.pop(key, None)
-                blocks.append(_codex_block(item, incomplete=False))
-    blocks.extend(_codex_block(item, incomplete=True) for item in started.values())
-    if errors:
-        joined = escape("\n".join(errors))
-        blocks.append(f'<div class="item failed"><div class="label">error</div><pre>{joined}</pre></div>')
-
-    meta = f"thread {escape(session)}" if session else "no thread id"
-    body = "".join(blocks) or '<div class="item"><div class="label">no events</div></div>'
-    footer = _codex_usage_table(tally) if tally else ""
-    html.parent.mkdir(parents=True, exist_ok=True)
-    html.write_text(
-        "<!doctype html>\n"
-        '<html lang="en"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        f"<title>codex transcript</title><style>{_CODEX_CSS}</style></head><body>"
-        f'<h1>codex transcript</h1><div class="meta">{meta}</div>{body}{footer}'
-        "</body></html>\n",
-        encoding="utf-8",
-    )
-    return html.is_file()
-
-
-def render_codex_transcript(jsonl: Path, html: Path, usage: dict[str, Any] | None = None) -> bool:
-    """Render a saved Codex event stream (one JSON object per line) to HTML."""
+def _read_events(jsonl: Path) -> list[dict[str, Any]] | None:
+    """Read a saved Codex event stream (one JSON object per line). ``None`` if unreadable."""
     try:
         lines = jsonl.read_text(encoding="utf-8").splitlines()
     except OSError:
-        return False
+        return None
     events: list[dict[str, Any]] = []
     for line in lines:
         try:
@@ -229,7 +75,38 @@ def render_codex_transcript(jsonl: Path, html: Path, usage: dict[str, Any] | Non
             continue
         if isinstance(event, dict):
             events.append(event)
-    return render_codex_events(events, html, usage)
+    return events
+
+
+def render_transcript(jsonl: Path, html: Path, *, prompt: str = "") -> bool:
+    """Render a Claude SDK-native transcript to HTML through the unified renderer."""
+    traj = from_claude_transcript(jsonl, prompt=prompt)
+    if traj is None:
+        return False
+    return render_trajectory(traj, html)
+
+
+def render_codex_events(
+    events: list[dict[str, Any]],
+    html: Path,
+    usage: dict[str, Any] | None = None,
+    prompt: str = "",
+) -> bool:
+    """Render a ``codex exec --json`` event stream (already parsed) to HTML."""
+    return render_trajectory(from_codex_events(events, prompt=prompt, usage=usage), html)
+
+
+def render_codex_transcript(
+    jsonl: Path,
+    html: Path,
+    usage: dict[str, Any] | None = None,
+    prompt: str = "",
+) -> bool:
+    """Render a saved Codex event stream (one JSON object per line) to HTML."""
+    events = _read_events(jsonl)
+    if events is None:
+        return False
+    return render_codex_events(events, html, usage, prompt)
 
 
 def render_agent_transcript(
@@ -238,8 +115,42 @@ def render_agent_transcript(
     *,
     provider: str,
     usage: dict[str, Any] | None = None,
+    prompt: str = "",
 ) -> bool:
-    """Render a run's transcript with the renderer that understands its format."""
+    """Render a run's transcript with the mapper that understands its harness, one renderer for all."""
     if provider == "codex":
-        return render_codex_transcript(jsonl, html, usage)
+        return render_codex_transcript(jsonl, html, usage, prompt)
+    # Claude's own transcript already carries the prompt as its first user message, so it needs
+    # no injected copy — call positionally so a monkeypatched stub with *args stays satisfied.
     return render_transcript(jsonl, html)
+
+
+def build_trajectory(
+    jsonl: Path,
+    *,
+    provider: str,
+    prompt: str = "",
+    usage: dict[str, Any] | None = None,
+) -> Trajectory | None:
+    """Map a saved run transcript into a :class:`Trajectory` for rendering and ``trajectory.json``.
+
+    ``usage`` is the tally the caller recorded; it is the only source of Codex usage on a capped
+    run whose stream carries no ``turn.completed``. Claude usage is read from the transcript.
+    """
+    if provider == "codex":
+        events = _read_events(jsonl)
+        return None if events is None else from_codex_events(events, prompt=prompt, usage=usage)
+    return from_claude_transcript(jsonl, prompt=prompt)
+
+
+__all__ = [
+    "Trajectory",
+    "build_trajectory",
+    "locate_transcript",
+    "render_agent_transcript",
+    "render_codex_events",
+    "render_codex_transcript",
+    "render_transcript",
+    "render_trajectory",
+    "write_trajectory_json",
+]

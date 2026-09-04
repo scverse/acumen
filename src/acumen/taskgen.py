@@ -214,7 +214,7 @@ async def generate_tasks(
     Parameters
     ----------
     cfg
-        The pass config; supplies ``tasks_model``.
+        The pass config; supplies ``meta_model``.
     target
         The prepared target, supplying the source checkout and the interpreter to run
         pipelines against for ground truth.
@@ -233,7 +233,7 @@ async def generate_tasks(
         ``out_path``. Scripts are harvested only after the generated tasks validate, and only
         for the ``(task, split)`` pairs the tasks themselves declare.
     model
-        Override for the generation model; defaults to ``cfg.tasks_model``.
+        Override for the generation model; defaults to ``cfg.meta_model``.
     max_turns, max_usd
         Caps for the generation agent. **Unbounded by default**: generating tasks means
         running package code iteratively, so no default budget is imposed — pass explicit caps
@@ -260,7 +260,7 @@ async def generate_tasks(
     try:
         work = holder / "work"
         home = holder / "home"
-        selected_model = model or cfg.tasks_model
+        selected_model = model or cfg.meta_model
         table = prices if prices is not None else PriceTable(overrides=cfg.prices)
         provider = provider_for_model(selected_model)
         config_dir = home / (".claude" if provider == "claude" else ".codex")
