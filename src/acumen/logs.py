@@ -11,9 +11,10 @@ today is written into a throwaway ``CLAUDE_CONFIG_DIR`` and ``rmtree``'d on retu
   tool results (file dumps, command output), only their status and size.
 * **A terminal mirror** when ``--stream`` is on (off by default): each turn's assistant text and a
   one-line-per-tool-call summary printed live for a human watching.
-* **An HTML log** rendered at the end from the SDK-native transcript (:func:`finalize`), via the
-  same ``claude-code-log`` path the benchmark runner uses. The rich post-hoc artifact; the JSONL
-  is the lightweight live feed.
+* **An HTML log and a ``trajectory.json``** written at the end (:func:`finalize`): the run is
+  mapped into acumen's harness-neutral :mod:`acumen.trajectory` model — the same model and
+  renderer the benchmark runner uses — giving one rich post-hoc artifact per provider. The JSONL
+  above stays the lightweight live feed.
 
 The class is stateful (it correlates tool results back to the tool that produced them) but has no
 agent dependency, so it is unit-testable on a synthetic message sequence — like ``cli._Progress``.
@@ -30,7 +31,8 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any, TextIO
 
 from acumen.agents import AgentResult
-from acumen.transcript import locate_transcript, render_codex_events, render_transcript
+from acumen.trajectory import from_claude_transcript, from_codex_events, render_trajectory, write_trajectory_json
+from acumen.transcript import locate_transcript
 
 if TYPE_CHECKING:
     from claude_agent_sdk import AssistantMessage, ResultMessage, UserMessage
@@ -152,28 +154,27 @@ class LiveLog:
                 self._echo(line)
 
     def finalize(self, *, config_dir: Path, work_dir: Path, result: ResultMessage | AgentResult | None) -> bool:
-        """Render the HTML log from whatever transcript the run's provider produced.
+        """Map the run into a trajectory, render the HTML log, and write ``trajectory.json``.
 
         Call before the throwaway config dir is removed — a Claude run's native transcript still
-        lives under it at this point. Codex writes no transcript file of its own, so its HTML is
-        rendered from the event stream carried back on the result. A no-op that returns ``False``
-        if the run produced no result.
+        lives under it at this point. Codex writes no transcript file of its own, so its
+        trajectory is built from the event stream carried back on the result. A no-op that
+        returns ``False`` if the run produced no transcript.
         """
         if result is None:
             return False
+        prompt = getattr(result, "prompt", "")
         if getattr(result, "provider", "claude") == "codex":
-            self.html_rendered = render_codex_events(
-                getattr(result, "transcript", []),
-                self.html_path,
-                prompt=getattr(result, "prompt", ""),
-            )
-            return self.html_rendered
-        if not result.session_id:
+            traj = from_codex_events(getattr(result, "transcript", []), prompt=prompt)
+        else:
+            if not result.session_id:
+                return False
+            native = locate_transcript(config_dir, work_dir, result.session_id)
+            traj = from_claude_transcript(native, prompt=prompt) if native and native.is_file() else None
+        if traj is None:
             return False
-        native = locate_transcript(config_dir, work_dir, result.session_id)
-        if native is None or not native.is_file():
-            return False
-        self.html_rendered = render_transcript(native, self.html_path)
+        write_trajectory_json(traj, self.jsonl_path.with_suffix(".trajectory.json"))
+        self.html_rendered = render_trajectory(traj, self.html_path)
         return self.html_rendered
 
     def close(self) -> None:

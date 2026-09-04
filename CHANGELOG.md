@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning][].
   `tasks_model`, `ship_model`, `check_model`) into a single `meta_model` key. It still defaults
   to the first `models` entry, and each command's `--model` flag still overrides it per run. A
   config that sets any of the old keys now errors as an unknown key.
+- Render every provider's transcript through one path. A run is mapped into a new harness-neutral
+  trajectory model (`acumen.trajectory`) — one mapper per harness (Claude Code, Codex) — and a
+  single renderer turns any trajectory into HTML, so the two providers' reports finally look
+  alike and adding a harness is one mapper, not a new renderer. Each run also writes a portable
+  `trajectory.json` beside its `.html`. Claude transcripts are now rendered in-house too, so
+  `claude-code-log` is dropped from the `claude` extra.
 
 ## [0.0.1dev]
 

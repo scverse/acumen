@@ -87,5 +87,6 @@ report. What makes a version score well:
 one compact event per agent message, **flushed as it goes** — read that file to follow
 progress instead of streaming into your context. Tool results are recorded by status and
 size, not inlined. `--stream` mirrors the conversation to the terminal; `--log-dir` moves
-the logs. A rendered `.html` transcript lands beside the jsonl at the end, for either
-provider (a Claude one is skipped, with a note, if `claude-code-log` is missing).
+the logs. At the end, the run is mapped into acumen's harness-neutral trajectory model and a
+rendered `.html` transcript plus a portable `.trajectory.json` land beside the jsonl — the same
+model and renderer for every provider, so the reports look alike.

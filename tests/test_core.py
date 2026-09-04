@@ -138,6 +138,17 @@ from acumen.ship import _ship_env
 from acumen.skills import SkillError, load_skill, read_meta, skill_hash, write_meta
 from acumen.taskgen import dump_tasks, harvest_scripts
 from acumen.tasks import Task, TaskError, TaskSplit, load_tasks, parse_tasks
+from acumen.trajectory import (
+    Metrics,
+    Observation,
+    Step,
+    ToolCall,
+    Trajectory,
+    from_claude_records,
+    from_codex_events,
+    render_trajectory,
+    write_trajectory_json,
+)
 from acumen.transcript import render_agent_transcript, render_codex_events, render_codex_transcript
 
 # --- grading ---------------------------------------------------------------------------
@@ -1422,7 +1433,7 @@ def _run_once_with(
     monkeypatch.setattr("acumen.runner.sandbox", fake_sandbox)
     monkeypatch.setattr("acumen.runner.run_agent", fake_run_agent)
     monkeypatch.setattr("acumen.runner._collect_artifacts", collect)
-    monkeypatch.setattr("acumen.runner.render_agent_transcript", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr("acumen.runner.render_trajectory", lambda *_args, **_kwargs: False)
     monkeypatch.setattr("acumen.runner.agent_version", lambda _provider: "test")
 
     model = "gpt-5.6-sol" if result.provider == "codex" else "claude-opus-5"
@@ -1635,8 +1646,7 @@ def test_run_matrix_continues_other_provider_after_one_is_exhausted(
 
 
 def test_codex_transcript_renders_its_own_html(tmp_path: Path) -> None:
-    """`claude-code-log` reads the SDK format only — given Codex events it silently exits 0
-    and writes an empty page, so Codex is rendered here instead."""
+    """A saved Codex event stream maps to a trajectory and renders through the unified renderer."""
     jsonl = tmp_path / "transcript.jsonl"
     jsonl.write_text(
         "\n".join(
@@ -1724,6 +1734,179 @@ def test_codex_transcript_renders_the_prompt_as_a_leading_block(tmp_path: Path) 
     bare = tmp_path / "no_prompt.html"
     assert render_codex_events(events, bare, prompt="   ") is True
     assert '<div class="item prompt">' not in bare.read_text()
+
+
+def test_from_codex_events_maps_items_to_a_trajectory() -> None:
+    """Each Codex item becomes an agent step; a command carries its output as an observation."""
+    events = [
+        {"type": "thread.started", "thread_id": "thread-1"},
+        {"type": "item.completed", "item": {"id": "a", "type": "reasoning", "text": "planning"}},
+        {"type": "item.completed", "item": {"id": "b", "type": "agent_message", "text": "on it"}},
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "c",
+                "type": "command_execution",
+                "command": "ls",
+                "aggregated_output": "x\n",
+                "exit_code": 0,
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "d",
+                "type": "command_execution",
+                "command": "boom",
+                "aggregated_output": "no",
+                "exit_code": 2,
+            },
+        },
+        {"type": "item.started", "item": {"id": "e", "type": "command_execution", "command": "sleep 9"}},
+        {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 20}},
+    ]
+    traj = from_codex_events(events, prompt="do it")
+    assert traj.harness == "codex" and traj.session_id == "thread-1" and traj.prompt == "do it"
+    # reasoning, message, two commands, and the unfinished command all survive as agent steps.
+    assert [s.source for s in traj.steps] == ["agent"] * 5
+    assert traj.steps[0].reasoning == "planning"
+    assert traj.steps[1].text == "on it"
+    ok = traj.steps[2]
+    assert ok.tool_calls[0].name == "command_execution" and ok.tool_calls[0].arguments["command"] == "ls"
+    assert ok.observations[0].exit_code == 0 and ok.observations[0].is_error is False
+    assert traj.steps[3].observations[0].is_error is True  # non-zero exit
+    assert traj.steps[4].incomplete is True  # started but never completed
+    assert traj.usage == Metrics(input_tokens=100, output_tokens=20)
+
+
+def test_from_codex_events_prefers_completed_over_started_and_carries_errors() -> None:
+    """An item that started then completed renders once (completed), and errors are collected."""
+    events = [
+        {"type": "item.started", "item": {"id": "a", "type": "command_execution", "command": "go"}},
+        {"type": "item.completed", "item": {"id": "a", "type": "command_execution", "command": "go", "exit_code": 0}},
+        {"type": "turn.failed", "message": "provider exploded"},
+    ]
+    traj = from_codex_events(events)
+    assert len(traj.steps) == 1 and traj.steps[0].incomplete is False
+    assert traj.errors == ("provider exploded",)
+
+
+def test_from_claude_records_maps_messages_and_attaches_observations() -> None:
+    """Assistant blocks become an agent step; a tool_result attaches to the call that made it."""
+    records = [
+        {"type": "user", "message": {"content": "the prompt"}},
+        {
+            "type": "assistant",
+            "message": {
+                "model": "claude-opus-5",
+                "usage": {"input_tokens": 10, "output_tokens": 3, "cache_read_input_tokens": 2},
+                "content": [
+                    {"type": "thinking", "thinking": "hmm"},
+                    {"type": "text", "text": "reading"},
+                    {"type": "tool_use", "id": "call-1", "name": "Read", "input": {"file_path": "x.py"}},
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "call-1", "content": "file body"}]},
+        },
+    ]
+    traj = from_claude_records(records)
+    assert traj.harness == "claude-code" and traj.model == "claude-opus-5"
+    # The first plain-string user message is the prompt, not a step.
+    assert traj.prompt == "the prompt"
+    assert len(traj.steps) == 1
+    step = traj.steps[0]
+    assert step.reasoning == "hmm" and step.text == "reading"
+    assert step.tool_calls[0].name == "Read" and step.tool_calls[0].arguments == {"file_path": "x.py"}
+    # The observation landed on the step that issued the matching call.
+    assert step.observations[0].call_id == "call-1" and step.observations[0].content == "file body"
+    assert traj.usage == Metrics(input_tokens=10, output_tokens=3, cached_tokens=2)
+
+
+def test_render_trajectory_and_json_roundtrip(tmp_path: Path) -> None:
+    """One renderer serves any trajectory, and to_dict/write_trajectory_json produce the artifact."""
+    traj = Trajectory(
+        harness="codex",
+        session_id="s1",
+        model="gpt-5.6-sol",
+        prompt="find the <gene>",
+        steps=(
+            Step(index=1, source="agent", text="working"),
+            Step(
+                index=2,
+                source="agent",
+                tool_calls=(ToolCall(call_id="c", name="command_execution", arguments={"command": "run"}),),
+                observations=(Observation(call_id="c", content="oops", is_error=True, exit_code=1),),
+            ),
+        ),
+        usage=Metrics(input_tokens=7),
+    )
+    html = tmp_path / "t.html"
+    assert render_trajectory(traj, html) is True
+    body = html.read_text()
+    assert "find the &lt;gene&gt;" in body and "<gene>" not in body  # prompt shown and escaped
+    assert "working" in body and "run" in body and "exit 1" in body and "failed" in body
+    assert "gpt-5.6-sol" in body and "thread s1" in body and "7" in body
+
+    out = tmp_path / "trajectory.json"
+    assert write_trajectory_json(traj, out) is True
+    data = json.loads(out.read_text())
+    assert data["schema"] == traj.schema and data["harness"] == "codex" and data["prompt"] == "find the <gene>"
+    assert data["steps"][1]["observations"][0]["exit_code"] == 1
+    assert data["usage"] == {"input_tokens": 7}
+
+
+def test_render_trajectory_toggles_tool_calls_and_renders_markdown(tmp_path: Path) -> None:
+    """Tool calls collapse into a <details> toggle; agent text renders as markdown."""
+    traj = Trajectory(
+        harness="codex",
+        steps=(
+            Step(index=1, source="agent", text="Here is a **bold** claim and `code`.\n\n- one\n- two"),
+            Step(
+                index=2,
+                source="agent",
+                reasoning="thinking hard",
+                tool_calls=(ToolCall(call_id="c1", name="command_execution", arguments={"command": "ls -la"}),),
+                observations=(Observation(call_id="c1", content="files", exit_code=0),),
+            ),
+            Step(
+                index=3,
+                source="agent",
+                tool_calls=(ToolCall(call_id="c2", name="command_execution", arguments={"command": "boom"}),),
+                observations=(Observation(call_id="c2", content="nope", is_error=True, exit_code=1),),
+            ),
+        ),
+    )
+    html = tmp_path / "t.html"
+    assert render_trajectory(traj, html) is True
+    body = html.read_text()
+    # Markdown: bold, inline code, and a list are rendered as HTML, not shown as raw syntax.
+    assert "<strong>bold</strong>" in body and "<code>code</code>" in body
+    assert "<li>one</li>" in body and "<li>two</li>" in body
+    # The successful command lives in a collapsed toggle that pairs it with its output.
+    assert '<details class="tool"><summary>' in body
+    assert "ls -la" in body and "files" in body
+    # Reasoning is tucked into its own toggle.
+    assert "<summary>reasoning</summary>" in body and "thinking hard" in body
+    # A failed command's toggle is opened so the error is visible without a click.
+    assert '<details class="tool" open>' in body and "nope" in body
+
+
+def test_render_trajectory_renders_gfm_tables(tmp_path: Path) -> None:
+    """A GitHub-flavored pipe table in agent text renders as an HTML table, not raw pipes."""
+    text = "Summary:\n\n| id | score |\n| :-- | --: |\n| `a` | 1 |\n| `b` | 2 |\n\nDone."
+    traj = Trajectory(harness="codex", steps=(Step(index=1, source="agent", text=text),))
+    html = tmp_path / "t.html"
+    assert render_trajectory(traj, html) is True
+    body = html.read_text()
+    assert "<table>" in body and "<th" in body
+    assert '<th style="text-align:left">id</th>' in body  # alignment from :--
+    assert '<td style="text-align:right"><code>' not in body  # code col is the first (left)
+    assert '<td style="text-align:right">1</td>' in body  # score col is right-aligned from --:
+    assert "<code>a</code>" in body and "<code>b</code>" in body  # inline markdown inside cells
+    assert "<p>| id" not in body  # the pipe rows are not left as paragraph text
 
 
 def test_render_agent_transcript_dispatches_on_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1978,7 +2161,7 @@ def test_benchmark_persists_unavailable_cost_as_null(tmp_path: Path, monkeypatch
     monkeypatch.setattr("acumen.runner.sandbox", fake_sandbox)
     monkeypatch.setattr("acumen.runner.run_agent", fake_run_agent)
     monkeypatch.setattr("acumen.runner._collect_artifacts", collect)
-    monkeypatch.setattr("acumen.runner.render_agent_transcript", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr("acumen.runner.render_trajectory", lambda *_args, **_kwargs: False)
     monkeypatch.setattr("acumen.runner.agent_version", lambda _provider: "test")
 
     run_dir = tmp_path / "run"

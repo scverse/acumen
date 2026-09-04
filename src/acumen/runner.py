@@ -23,6 +23,7 @@ from acumen.paths import (
     RESULT_FILE,
     SCRIPT_FILE,
     TRANSCRIPT_HTML,
+    TRANSCRIPT_JSON,
     TRANSCRIPT_JSONL,
     RunKey,
 )
@@ -31,7 +32,8 @@ from acumen.prompts import benchmark_prompt
 from acumen.sandbox import Sandbox, sandbox
 from acumen.skills import Skill
 from acumen.tasks import Task
-from acumen.transcript import locate_transcript, render_agent_transcript
+from acumen.trajectory import render_trajectory, write_trajectory_json
+from acumen.transcript import build_trajectory, locate_transcript
 
 #: Result subtypes the CLI reports on a cap breach, mapped to our reason taxonomy.
 _SUBTYPE_REASONS: dict[str, Reason] = {
@@ -410,12 +412,15 @@ async def run_once(
     skill_loaded: bool | None = None
     expected_skill = skill.name if skill is not None else skill_name
     if (run_dir / TRANSCRIPT_JSONL).is_file():
-        rendered = render_agent_transcript(
+        traj = build_trajectory(
             run_dir / TRANSCRIPT_JSONL,
-            run_dir / TRANSCRIPT_HTML,
             provider=provider,
+            prompt=prompt,
             usage=result.usage if result else None,
         )
+        if traj is not None:
+            write_trajectory_json(traj, run_dir / TRANSCRIPT_JSON)
+            rendered = render_trajectory(traj, run_dir / TRANSCRIPT_HTML)
         if expected_skill is not None:
             skill_loaded = _skill_fired(run_dir / TRANSCRIPT_JSONL, expected_skill, provider=provider)
 
