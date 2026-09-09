@@ -21,6 +21,7 @@ import shlex
 import shutil
 import signal
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Sequence
 from contextlib import aclosing, suppress
@@ -694,6 +695,54 @@ def _sandbox_failure(lines: Sequence[str]) -> str | None:
         if any(marker in lowered for marker in _SANDBOX_FAILURES):
             return line.strip()
     return None
+
+
+async def codex_sandbox_probe(env: dict[str, str], *, timeout: float = 30.0) -> str | None:
+    """Return ``None`` if Codex's command sandbox can start here, else an actionable error string.
+
+    Runs ``codex sandbox -- true`` — no model call, so it is free and deterministic — and reads
+    its stderr for a namespace/sandbox-init failure. Codex runs every benchmark command inside
+    this sandbox, so if it cannot start, no Codex run can save an answer; catching it in preflight
+    turns a paid, per-run ``error_sandbox`` into one free up-front message.
+
+    Conservative on purpose: a probe that cannot run, times out, or exits non-zero for a reason
+    that is *not* a recognised sandbox failure returns ``None`` (let the run proceed) rather than
+    block a setup that might work. Only a matched sandbox-init failure is reported.
+    """
+    cli = shutil.which("codex", path=env.get("PATH"))
+    if cli is None:
+        return None  # a missing CLI is reported by check_agent_cli; nothing to probe here
+    # Run in a throwaway empty directory with the read-only profile. This tests only the one thing
+    # that fails on a locked-down host — whether Codex can create its namespace sandbox at all —
+    # without the workspace profile's git-protection, which mounts a tmpfs over the workspace's
+    # ``.git`` and errors in a non-repo directory (a false positive unrelated to the real runs,
+    # which use their own filesystem profile in a temp sandbox dir).
+    probe_dir = tempfile.mkdtemp(prefix="acumen-codex-probe-")
+    argv = [cli, "sandbox", "-c", 'default_permissions=":read-only"', "--", "true"]
+    proc: asyncio.subprocess.Process | None = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, cwd=probe_dir, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (OSError, TimeoutError):
+        if proc is not None:
+            with suppress(ProcessLookupError):
+                proc.kill()
+        return None
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+    if proc.returncode == 0:
+        return None
+    hit = _sandbox_failure(stderr.decode("utf-8", "replace").splitlines())
+    if hit is None:
+        return None  # non-zero for some other reason — not a namespace block
+    return (
+        "codex's command sandbox could not start on this system, so no codex run can execute its "
+        f"commands or save an answer ({hit}). codex isolates every benchmark command inside an "
+        "unprivileged namespace sandbox, which this host does not currently permit. Enable "
+        "unprivileged user namespaces for codex, or run acumen where they are allowed."
+    )
 
 
 def _is_turn_item(event: dict[str, Any]) -> bool:

@@ -69,7 +69,7 @@ def test_progress_prints_unavailable_cost_without_casting_null(capsys: pytest.Ca
     progress.running = 1
     progress.on_done(
         RunOutcome(
-            key=RunKey(arm="noskill", split="test", model=model, task_id="task", rep=1),
+            key=RunKey(arm="noskill", split="valid", model=model, task_id="task", rep=1),
             success=True,
             reason="ok",
             payload={
@@ -92,7 +92,7 @@ def test_console_costs_are_the_figure_the_report_plots(capsys: pytest.CaptureFix
     so a console reading that figure would tally a pass at one number and report it at another.
     """
     outcome = RunOutcome(
-        key=RunKey(arm="noskill", split="test", model=model, task_id="task", rep=1),
+        key=RunKey(arm="noskill", split="valid", model=model, task_id="task", rep=1),
         success=True,
         reason="ok",
         payload={
@@ -120,7 +120,7 @@ def test_progress_prints_provider_exhaustion_as_invalid(capsys: pytest.CaptureFi
     progress.running = 1
     progress.on_done(
         RunOutcome(
-            key=RunKey(arm="noskill", split="test", model=model, task_id="task", rep=1),
+            key=RunKey(arm="noskill", split="valid", model=model, task_id="task", rep=1),
             success=False,
             reason="provider_exhausted",
             payload={
@@ -356,7 +356,7 @@ def test_bench_runs_only_the_named_arm(
 def test_bench_exits_nonzero_and_prints_provider_exhaustion(
     project: Path, model: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, stub_prices
 ) -> None:
-    key = RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=1)
+    key = RunKey(arm="noskill", split="valid", model=model, task_id="example_task", rep=1)
     outcome = RunOutcome(
         key=key,
         success=False,
@@ -452,16 +452,12 @@ def test_report_without_runs_errors(project: Path, capsys: pytest.CaptureFixture
     assert "error:" in capsys.readouterr().err
 
 
-def test_draft_refuses_when_versions_exist(project: Path, skills_root: Path, capsys: pytest.CaptureFixture) -> None:
-    """The guard fires before the target is prepared, so no agent runs."""
-    exit_code = main(["draft", "--config", str(project / "config.yaml"), "--skills", str(skills_root)])
+def test_improve_without_any_train_runs_errors(project: Path, capsys: pytest.CaptureFixture) -> None:
+    """With no skill versions the improver creates v1 — but only from benched train evidence.
 
-    assert exit_code == 2
-    assert "skills already exist (v1)" in capsys.readouterr().err
-    assert not (skills_root / "v2").exists()
-
-
-def test_improve_without_a_skill_errors(project: Path, capsys: pytest.CaptureFixture) -> None:
+    So a project with neither versions nor a benched baseline errors, pointing at the bench to run
+    first, rather than spawning an agent with nothing to learn from.
+    """
     exit_code = main(
         [
             "improve",
@@ -473,11 +469,13 @@ def test_improve_without_a_skill_errors(project: Path, capsys: pytest.CaptureFix
             str(project / "skills"),
             "--runs",
             str(project / "runs"),
+            "--wiki",
+            str(project / "wiki"),
         ]
     )
 
     assert exit_code == 2
-    assert "no skill versions" in capsys.readouterr().err
+    assert "no train-split runs found" in capsys.readouterr().err
 
 
 def test_tasks_refuses_to_overwrite_without_force(project: Path, capsys: pytest.CaptureFixture) -> None:
@@ -744,7 +742,7 @@ def test_check_passes_when_every_answer_reproduces(
 ) -> None:
     _stub_target(project, monkeypatch)
     _write_reproducer(project, "train", "TRAIN_ANSWER")
-    _write_reproducer(project, "test", "TEST_ANSWER")
+    _write_reproducer(project, "valid", "TEST_ANSWER")
 
     assert main(check_args(project, "--no-review", "--jobs", "1")) == 0
 
@@ -824,7 +822,7 @@ def test_check_warns_about_a_reproducer_no_task_claims(
 ) -> None:
     _stub_target(project, monkeypatch)
     _write_reproducer(project, "train", "TRAIN_ANSWER")
-    _write_reproducer(project, "test", "TEST_ANSWER")
+    _write_reproducer(project, "valid", "TEST_ANSWER")
     (project / "tasks" / "renamed_away-train.py").write_text("pass\n")
 
     assert main(check_args(project, "--no-review", "--jobs", "1")) == 0
@@ -861,7 +859,7 @@ def test_check_no_review_spawns_nothing_and_never_reaches_a_credential(
     """The deterministic phase must stay free, and usable in a loop while fixing a script."""
     _stub_target(project, monkeypatch)
     _write_reproducer(project, "train", "TRAIN_ANSWER")
-    _write_reproducer(project, "test", "TEST_ANSWER")
+    _write_reproducer(project, "valid", "TEST_ANSWER")
     monkeypatch.setattr("acumen.cli.check_agent_cli", _boom)
     monkeypatch.setattr("acumen.cli.review_tasks", _boom)
 
@@ -883,10 +881,10 @@ def test_check_flags_a_coherent_looking_task_whose_prompt_asks_for_something_els
     """
     _stub_target(project, monkeypatch)
     _write_reproducer(project, "train", "TRAIN_ANSWER")
-    _write_reproducer(project, "test", "TEST_ANSWER")
+    _write_reproducer(project, "valid", "TEST_ANSWER")
     _stub_review(
         monkeypatch,
-        {("example_task", "test"): ("mismatch", "prompt says ascending; script and answer are descending")},
+        {("example_task", "valid"): ("mismatch", "prompt says ascending; script and answer are descending")},
     )
 
     assert main(check_args(project, "--jobs", "1")) == 1
@@ -909,7 +907,7 @@ def test_check_reports_a_failed_review_as_an_incomplete_check(
     """A review that could not run must never read as a green check, but must not lose the runs."""
     _stub_target(project, monkeypatch)
     _write_reproducer(project, "train", "TRAIN_ANSWER")
-    _write_reproducer(project, "test", "TEST_ANSWER")
+    _write_reproducer(project, "valid", "TEST_ANSWER")
     _stub_review(monkeypatch, {})
 
     async def die(**_kwargs):

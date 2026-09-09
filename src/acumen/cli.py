@@ -29,12 +29,12 @@ from acumen.check import (
     summarize_checks,
 )
 from acumen.config import Config, ConfigError, load_config
-from acumen.draft import DraftError, draft_skill
 from acumen.env import DEFAULT_CACHE_ROOT, AuthMode, EnvError, prepare_target, resolve_auth_mode
+from acumen.epoch import resolve_epoch
 from acumen.grade import INVALID_REASONS
 from acumen.improve import ImproveError, improve_skill
 from acumen.logs import LiveLog
-from acumen.paths import SPLITS, arm_name
+from acumen.paths import SPLITS, Split, arm_name
 from acumen.pricefeed import (
     PRICE_SOURCES,
     PRICE_TIER,
@@ -51,9 +51,10 @@ from acumen.review import ReviewError, ReviewResult, ReviewStatus, ReviewVerdict
 from acumen.runner import RunOutcome, StderrFilter
 from acumen.scaffold import InitError, is_scaffold_tasks, scaffold
 from acumen.ship import ShipError, ship_skill
-from acumen.skills import Skill, SkillError, available_versions, latest_version, load_skill
+from acumen.skills import Skill, SkillError, available_versions, latest_version, load_skill, skill_dir
 from acumen.taskgen import TaskGenError, generate_tasks
 from acumen.tasks import Task, TaskError, load_tasks
+from acumen.wiki import WikiError, collect_arm_runs, update_wiki
 
 
 def _add_bench_args(parser: argparse.ArgumentParser) -> None:
@@ -380,6 +381,100 @@ def _print_skill_loading(outcomes: Sequence[RunOutcome], arm: _Arm, skill_name: 
         print(f"warning: {skill_name} loaded in {loaded} baseline runs", file=sys.stderr)
 
 
+def _resolve_bench_auth(models: set[str], auth: str) -> dict[AgentProvider, AuthMode]:
+    """Resolve one auth mode per provider present, checking each CLI and printing the choice."""
+    providers = {provider_for_model(model) for model in models}
+    auth_modes = {provider: resolve_auth_mode(auth, provider=provider) for provider in providers}
+    for provider in sorted(providers):
+        check_agent_cli(provider)
+        _print_auth(auth_modes[provider], provider)
+        _warn_codex_accounting(provider)
+    if "session" in auth_modes.values():
+        print(
+            "note: cost_usd for session-billed runs is what they would have cost at API "
+            "rates, not metered spend; each run records its auth_mode",
+            file=sys.stderr,
+        )
+    return auth_modes
+
+
+def _execute_arms(
+    arms: Sequence[_Arm],
+    *,
+    cfg: Config,
+    target,
+    runs_root: Path,
+    auth_modes: dict[AgentProvider, AuthMode],
+    prices: PriceTable,
+    keep_sandboxes: bool,
+    progress: _Progress | None = None,
+) -> list[RunOutcome]:
+    """Run each arm's pending runs sequentially, sharing one progress counter across them.
+
+    Arms run one after another: every run in a matrix shares one skill, and a sequential pass
+    keeps each arm's tally readable while the progress counter spans the whole thing. Raises
+    :class:`BenchmarkInvalidError` if a harness failure decides the pass.
+    """
+    running = [arm for arm in arms if arm.todo]
+    todo = [item for arm in running for item in arm.todo]
+    if not todo:
+        return []
+    progress = progress or _Progress(len(todo))
+    collected: list[RunOutcome] = []
+    for arm in running:
+        if len(running) > 1:
+            print(f"\n=== arm {arm.name}: {len(arm.todo)} runs ===", flush=True)
+        started = time.monotonic()
+        outcomes = asyncio.run(
+            run_matrix(
+                arm.todo,
+                target=target,
+                runs_root=runs_root,
+                max_concurrency=cfg.max_concurrency,
+                auth_modes=auth_modes,
+                skill=arm.skill,
+                skill_name=cfg.skill_name,
+                keep_sandbox=keep_sandboxes,
+                stderr=StderrFilter(),
+                on_start=progress.on_start,
+                on_done=progress.on_done,
+                env_passthrough=cfg.env_passthrough,
+                prices=prices,
+            )
+        )
+        collected.extend(outcomes)
+        _print_run_summary(outcomes, time.monotonic() - started, label=arm.name if len(running) > 1 else "")
+        _print_skill_loading(outcomes, arm, cfg.skill_name)
+    return collected
+
+
+def _build_arms(
+    specs: Sequence[tuple[str | None, Sequence[Split]]],
+    *,
+    cfg: Config,
+    tasks: Sequence[Task],
+    runs_root: Path,
+    skills_root: Path,
+    resume: bool = True,
+    task_ids: Sequence[str] | None = None,
+) -> list[_Arm]:
+    """Build arms for an explicit list of ``(version, splits)`` specs (for the epoch orchestrator)."""
+    arms = []
+    for version, splits in specs:
+        skill = None if version is None else load_skill(skills_root, version, expect_name=cfg.skill_name)
+        planned = build_matrix(cfg, tasks, skill=version, splits=splits, task_ids=task_ids)
+        todo = pending(planned, runs_root, resume=resume)
+        arms.append(_Arm(version=version, skill=skill, planned=planned, todo=todo))
+    return arms
+
+
+def _invalid_bench_note() -> None:
+    print(
+        "Fix or replenish that credential, then rerun the same command; invalid and cancelled cells remain pending.",
+        file=sys.stderr,
+    )
+
+
 def _cmd_bench(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     tasks = load_tasks(args.tasks)
@@ -400,18 +495,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
         return 0
 
     # One resolved mode per provider in the matrix, so a mixed pass bills each side correctly.
-    providers = {provider_for_model(item.model) for item in todo}
-    auth_modes = {provider: resolve_auth_mode(args.auth, provider=provider) for provider in providers}
-    for provider in sorted(providers):
-        check_agent_cli(provider)
-        _print_auth(auth_modes[provider], provider)
-        _warn_codex_accounting(provider)
-    if "session" in auth_modes.values():
-        print(
-            "note: cost_usd for session-billed runs is what they would have cost at API "
-            "rates, not metered spend; each run records its auth_mode",
-            file=sys.stderr,
-        )
+    auth_modes = _resolve_bench_auth({item.model for item in todo}, args.auth)
     # Before the target is built and before any agent runs: an unreachable pricing page
     # must cost nothing, and a pass must never be priced by a table it cannot date.
     try:
@@ -430,103 +514,28 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]} (venv {target.venv_dir})", flush=True)
 
-    # Arms run one after another: every run in a matrix shares one skill, and a sequential
-    # pass keeps each arm's tally readable while the progress counter spans the whole thing.
     running = [arm for arm in arms if arm.todo]
     print(f"running {len(todo)} runs, up to {cfg.max_concurrency} at a time:", flush=True)
     progress = _Progress(len(todo))
-    collected: list[RunOutcome] = []
     try:
-        for arm in running:
-            if len(running) > 1:
-                print(f"\n=== arm {arm.name}: {len(arm.todo)} runs ===", flush=True)
-            started = time.monotonic()
-            outcomes = asyncio.run(
-                run_matrix(
-                    arm.todo,
-                    target=target,
-                    runs_root=args.runs,
-                    max_concurrency=cfg.max_concurrency,
-                    auth_modes=auth_modes,
-                    skill=arm.skill,
-                    skill_name=cfg.skill_name,
-                    keep_sandbox=args.keep_sandboxes,
-                    stderr=StderrFilter(),
-                    on_start=progress.on_start,
-                    on_done=progress.on_done,
-                    env_passthrough=cfg.env_passthrough,
-                    prices=prices,
-                )
-            )
-            collected.extend(outcomes)
-            _print_run_summary(outcomes, time.monotonic() - started, label=arm.name if len(running) > 1 else "")
-            _print_skill_loading(outcomes, arm, cfg.skill_name)
+        collected = _execute_arms(
+            arms,
+            cfg=cfg,
+            target=target,
+            runs_root=args.runs,
+            auth_modes=auth_modes,
+            prices=prices,
+            keep_sandboxes=args.keep_sandboxes,
+            progress=progress,
+        )
     except BenchmarkInvalidError as err:
         print(f"\nerror: {err}", file=sys.stderr)
-        print(
-            "Fix or replenish that credential, then rerun the same command; invalid and "
-            "cancelled cells remain pending.",
-            file=sys.stderr,
-        )
+        _invalid_bench_note()
         return 2
 
     if len(running) > 1:
         _print_run_summary(collected, progress.elapsed, label=f"all {len(running)} arms")
     print(f"runs written to {args.runs.resolve()}")
-    return 0
-
-
-def _cmd_draft(args: argparse.Namespace) -> int:
-    cfg = load_config(args.config)
-    if args.model:
-        cfg = replace(cfg, meta_model=args.model)
-
-    existing = available_versions(args.skills)
-    if existing and not args.force:
-        print(
-            f"skills already exist ({', '.join(existing)}) — drafting would add "
-            f"another version. Pass --force to draft anyway, or use `acumen improve` "
-            f"to build on {existing[-1]}.",
-            file=sys.stderr,
-        )
-        return 2
-
-    provider = provider_for_model(cfg.meta_model)
-    check_agent_cli(provider)
-    auth_mode = resolve_auth_mode(args.auth, provider=provider)
-    _print_auth(auth_mode, provider)
-    _warn_codex_accounting(provider)
-    print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
-    target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
-    print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
-    print(f"drafting with {cfg.meta_model} (this reads the package source) ...", flush=True)
-
-    log = LiveLog.open(args.log_dir, "draft", stream=args.stream)
-    print(f"log → {log.jsonl_path}", flush=True)
-    with log:
-        result = asyncio.run(
-            draft_skill(
-                cfg=cfg,
-                prices=_agent_prices(cfg, model=cfg.meta_model),
-                target=target,
-                skills_root=args.skills,
-                auth_mode=auth_mode,
-                max_turns=args.max_turns,
-                max_usd=args.max_usd,
-                feedback=args.feedback,
-                log=log,
-            )
-        )
-    skill = result.skill
-    files = sorted(p.relative_to(skill.directory).as_posix() for p in skill.directory.rglob("*") if p.is_file())
-    print(f"\nwrote {skill.directory}")
-    print(f"  name:        {skill.name}")
-    print(f"  description: {skill.description}")
-    print(f"  hash:        {skill.hash}")
-    print(f"  files:       {', '.join(files)}")
-    print(f"  cost:        {_fmt_cost(result.cost_usd)} over {result.turns} turns")
-    _print_log_result(log)
-    print(f"\nnext: acumen bench --skill {skill.version}")
     return 0
 
 
@@ -536,18 +545,31 @@ def _cmd_improve(args: argparse.Namespace) -> int:
     if args.model:
         cfg = replace(cfg, meta_model=args.model)
 
-    versions = available_versions(args.skills)
-    if not versions:
+    # Parent is an explicit --from, else the latest version, else None (create the first skill
+    # from the noskill wiki). improve_skill resolves and validates the parent itself.
+    parent = args.from_version or latest_version(args.skills)
+    parent_skill = None if parent is None else load_skill(args.skills, parent, expect_name=cfg.skill_name)
+    # Fail before the costly target prep if there is nothing to learn from: the improver needs the
+    # parent arm's train runs (and the wiki built from them).
+    parent_arm = arm_name(parent)
+    if not collect_arm_runs(args.runs, parent_arm, tasks, split="train"):
+        hint = (
+            "acumen bench --no-skill --split train"
+            if parent is None
+            else f"acumen bench --skill {parent} --split train"
+        )
         print(
-            f"no skill versions under {args.skills} — run `acumen draft` first, then bench it",
+            f"no train-split runs found for {parent_arm} under {args.runs / parent_arm / 'train'} — "
+            f"run `{hint}` and `acumen wiki` first",
             file=sys.stderr,
         )
         return 2
-    parent = args.from_version or latest_version(args.skills)
-    # Immutability guard: the improved version is always the next unused directory,
-    # so an existing version is never in the write path. Say the parent plainly up front.
-    skill = load_skill(args.skills, parent, expect_name=cfg.skill_name)
-    print(f"improving {skill.version} ({skill.name}, {skill.hash[:19]}…) with {cfg.meta_model}")
+    if parent_skill is None:
+        print(f"no skill versions under {args.skills} — creating the first skill from the wiki with {cfg.meta_model}")
+    else:
+        print(
+            f"improving {parent_skill.version} ({parent_skill.name}, {parent_skill.hash[:19]}…) with {cfg.meta_model}"
+        )
 
     provider = provider_for_model(cfg.meta_model)
     check_agent_cli(provider)
@@ -568,6 +590,7 @@ def _cmd_improve(args: argparse.Namespace) -> int:
                 target=target,
                 skills_root=args.skills,
                 runs_root=args.runs,
+                wiki_root=args.wiki,
                 tasks=tasks,
                 auth_mode=auth_mode,
                 parent_version=parent,
@@ -579,20 +602,251 @@ def _cmd_improve(args: argparse.Namespace) -> int:
         )
     new = result.skill
     files = sorted(p.relative_to(new.directory).as_posix() for p in new.directory.rglob("*") if p.is_file())
-    print(f"\nwrote {new.directory}  (parent {result.parent})")
+    parent_label = result.parent or "noskill"
+    print(f"\nwrote {new.directory}  (parent {parent_label})")
     print(f"  name:        {new.name}")
     print(f"  description: {new.description}")
     print(f"  hash:        {new.hash}")
     print(f"  files:       {', '.join(files)}")
     print(f"  evidence:    {result.n_train_runs} train runs ({result.n_train_failures} failing)")
     print(f"  cost:        {_fmt_cost(result.cost_usd)} over {result.turns} turns")
-    if new.hash == skill.hash:
+    if parent_skill is not None and new.hash == parent_skill.hash:
         print(
             "warning: the new version is byte-identical to its parent — the improver changed nothing",
             file=sys.stderr,
         )
     _print_log_result(log)
     print(f"\nnext: acumen bench --skill {new.version} && acumen report")
+    return 0
+
+
+def _wiki_version(args: argparse.Namespace) -> str:
+    """Resolve the version label a wiki update records, from ``--skill``/``--no-skill``/default."""
+    if args.skill is not None:
+        return args.skill if args.skill.startswith("v") else f"v{args.skill}"
+    if args.no_skill:
+        return arm_name(None)
+    return latest_version(args.skills) or arm_name(None)
+
+
+def _print_wiki_task(result) -> None:
+    """Print one task's wiki-update outcome as it lands, with any brevity warnings."""
+    print(f"  wiki [{result.version}] {result.task_id}: {_fmt_cost(result.cost_usd)} over {result.turns} turns")
+    for warning in result.warnings:
+        print(f"    warning: {warning}", file=sys.stderr)
+
+
+def _run_wiki(
+    *,
+    cfg: Config,
+    tasks: Sequence[Task],
+    target,
+    version: str,
+    runs_root: Path,
+    wiki_root: Path,
+    skills_root: Path,
+    prices: PriceTable,
+    auth_mode: AuthMode,
+    log_dir: Path,
+    stream: bool,
+):
+    """Update the wiki for one arm and print a per-task tally; returns the task results."""
+    print(f"updating wiki for [{version}] with {cfg.meta_model} (one agent per task) ...", flush=True)
+    results = asyncio.run(
+        update_wiki(
+            cfg=cfg,
+            target=target,
+            runs_root=runs_root,
+            wiki_root=wiki_root,
+            skills_root=skills_root,
+            tasks=tasks,
+            version=version,
+            prices=prices,
+            auth_mode=auth_mode,
+            max_concurrency=cfg.max_concurrency,
+            log_dir=log_dir,
+            stream=stream,
+            on_task_done=_print_wiki_task,
+        )
+    )
+    if not results:
+        print(f"  wiki already had [{version}] for every task — nothing to do")
+    else:
+        total = sum(r.cost_usd or 0.0 for r in results)
+        print(f"wiki: updated {len(results)} task(s) for [{version}]  ({_fmt_cost(total)})")
+    return results
+
+
+def _cmd_wiki(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    tasks = load_tasks(args.tasks)
+    if args.max_concurrency:
+        cfg = replace(cfg, max_concurrency=args.max_concurrency)
+    if args.model:
+        cfg = replace(cfg, meta_model=args.model)
+
+    version = _wiki_version(args)
+    if version != arm_name(None):
+        # Validate a named skill version exists before the costly target prep.
+        load_skill(args.skills, version, expect_name=cfg.skill_name)
+
+    provider = provider_for_model(cfg.meta_model)
+    check_agent_cli(provider)
+    auth_mode = resolve_auth_mode(args.auth, provider=provider)
+    _print_auth(auth_mode, provider)
+    _warn_codex_accounting(provider)
+    print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
+    target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
+    print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
+
+    _run_wiki(
+        cfg=cfg,
+        tasks=tasks,
+        target=target,
+        version=version,
+        runs_root=args.runs,
+        wiki_root=args.wiki,
+        skills_root=args.skills,
+        prices=_agent_prices(cfg, model=cfg.meta_model),
+        auth_mode=auth_mode,
+        log_dir=args.log_dir,
+        stream=args.stream,
+    )
+    print(f"\nwiki written to {args.wiki.resolve()}")
+    return 0
+
+
+def _cmd_epoch(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    tasks = load_tasks(args.tasks)
+    if args.max_concurrency:
+        cfg = replace(cfg, max_concurrency=args.max_concurrency)
+    if args.replicates:
+        cfg = replace(cfg, n_replicates=args.replicates)
+    if args.model:
+        cfg = replace(cfg, meta_model=args.model)
+
+    runs_root = args.runs
+
+    def valid_complete(version: str) -> bool:
+        planned = build_matrix(cfg, tasks, skill=version, splits=["valid"])
+        return not pending(planned, runs_root, resume=True)
+
+    plan = resolve_epoch(args.skills, valid_complete=valid_complete)
+    parent_label = plan.parent_version or arm_name(None)
+    wiki_version = parent_label
+    tail = " (resuming)" if plan.resumed else ""
+    print(f"epoch: learning from [{parent_label}] → producing {plan.new_version}{tail}")
+
+    # Auth for every provider the epoch touches: the benchmark models and the meta model.
+    auth_modes = _resolve_bench_auth(set(cfg.models) | {cfg.meta_model}, args.auth)
+    meta_auth = auth_modes[provider_for_model(cfg.meta_model)]
+    # Benchmark runs freeze their cost, so a pass must establish rates before it spends anything.
+    try:
+        prices = _bench_prices(cfg)
+    except PriceFeedError as err:
+        print(f"error: {err}", file=sys.stderr)
+        print("Retry when the pricing pages are reachable, or pin rates in config.yaml.", file=sys.stderr)
+        return 2
+    _warn_unpriced(set(cfg.models) | {cfg.meta_model}, prices)
+    print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
+    target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
+    print(f"target ready: {target.fingerprint} @ {target.commit[:8]} (venv {target.venv_dir})", flush=True)
+
+    # Step 1 — bench the parent arm on the training signal. The first epoch also benches the
+    # noskill baseline on valid, so the report has an in-epoch baseline to compare against.
+    if plan.first:
+        train_specs: list[tuple[str | None, Sequence[Split]]] = [(None, ["train", "valid"])]
+    else:
+        train_specs = [(plan.parent_version, ["train"])]
+    print(f"\n[1/4] benchmarking [{parent_label}] on the training signal ...", flush=True)
+    arms = _build_arms(train_specs, cfg=cfg, tasks=tasks, runs_root=runs_root, skills_root=args.skills)
+    _print_plan(arms)
+    try:
+        _execute_arms(
+            arms,
+            cfg=cfg,
+            target=target,
+            runs_root=runs_root,
+            auth_modes=auth_modes,
+            prices=prices,
+            keep_sandboxes=False,
+        )
+    except BenchmarkInvalidError as err:
+        print(f"\nerror: {err}", file=sys.stderr)
+        _invalid_bench_note()
+        return 2
+
+    # Step 2 — distil that arm into the wiki (idempotent: recorded arms are skipped).
+    print(f"\n[2/4] updating the wiki for [{wiki_version}] ...", flush=True)
+    _run_wiki(
+        cfg=cfg,
+        tasks=tasks,
+        target=target,
+        version=wiki_version,
+        runs_root=runs_root,
+        wiki_root=args.wiki,
+        skills_root=args.skills,
+        prices=prices,
+        auth_mode=meta_auth,
+        log_dir=args.log_dir,
+        stream=args.stream,
+    )
+
+    # Step 3 — create or improve the skill (skipped when the version already exists: a resumed
+    # epoch that crashed after improve).
+    if skill_dir(args.skills, plan.new_version).exists():
+        print(f"\n[3/4] {plan.new_version} already exists — skipping improve (resumed epoch)")
+    else:
+        verb = "creating" if plan.first else "improving"
+        print(f"\n[3/4] {verb} the skill → {plan.new_version} with {cfg.meta_model} ...", flush=True)
+        log = LiveLog.open(args.log_dir, "improve", stream=args.stream)
+        print(f"log → {log.jsonl_path}", flush=True)
+        with log:
+            result = asyncio.run(
+                improve_skill(
+                    cfg=cfg,
+                    prices=prices,
+                    target=target,
+                    skills_root=args.skills,
+                    runs_root=runs_root,
+                    wiki_root=args.wiki,
+                    tasks=tasks,
+                    auth_mode=meta_auth,
+                    parent_version=plan.parent_version,
+                    feedback=args.feedback,
+                    log=log,
+                )
+            )
+        new = result.skill
+        print(f"wrote {new.directory}  (parent {result.parent or 'noskill'})")
+        print(f"  description: {new.description}")
+        print(f"  cost:        {_fmt_cost(result.cost_usd)} over {result.turns} turns")
+        _print_log_result(log)
+
+    # Step 4 — bench the new version on the held-out valid signal (completes it if unfinished).
+    print(f"\n[4/4] benchmarking {plan.new_version} on the held-out valid signal ...", flush=True)
+    valid_arms = _build_arms(
+        [(plan.new_version, ["valid"])], cfg=cfg, tasks=tasks, runs_root=runs_root, skills_root=args.skills
+    )
+    _print_plan(valid_arms)
+    try:
+        _execute_arms(
+            valid_arms,
+            cfg=cfg,
+            target=target,
+            runs_root=runs_root,
+            auth_modes=auth_modes,
+            prices=prices,
+            keep_sandboxes=False,
+        )
+    except BenchmarkInvalidError as err:
+        print(f"\nerror: {err}", file=sys.stderr)
+        _invalid_bench_note()
+        return 2
+
+    print(f"\nepoch complete: {plan.new_version} produced and benched on valid.")
+    print("next: `acumen report` to see it, or `acumen epoch` again for another round")
     return 0
 
 
@@ -668,7 +922,7 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
             "and split, so it was not kept",
             file=sys.stderr,
         )
-    print("\nnext: review the tasks, then `acumen check`, `acumen draft` and `acumen bench`")
+    print("\nnext: review the tasks, then `acumen check`, then `acumen epoch`")
     return 0
 
 
@@ -1082,7 +1336,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
     written = scaffold(args.directory, force=args.force)
     for path in written:
         print(f"wrote {path}")
-    print("\nnext: edit config.yaml (repo) and tasks.yaml, then `acumen draft`")
+    print("\nnext: edit config.yaml (repo) and tasks.yaml, then `acumen epoch`")
     return 0
 
 
@@ -1167,25 +1421,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_bench_args(bench)
     bench.set_defaults(func=_cmd_bench)
 
-    draft = sub.add_parser("draft", help="draft a skill from the target package's source")
-    draft.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
-    draft.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
-    draft.add_argument("--model", help="override config meta_model")
-    draft.add_argument("--max-turns", type=int, help="cap turns for the drafting agent (default: unbounded)")
-    draft.add_argument("--max-usd", type=float, help="cap spend for the drafting agent (default: unbounded)")
-    draft.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
-    draft.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
-    draft.add_argument("--force", action="store_true", help="draft another version even if some already exist")
-    _add_auth_arg(draft)
-    _add_feedback_arg(draft, extra=" (e.g. package context, what the skill should emphasise)")
-    _add_log_args(draft)
-    draft.set_defaults(func=_cmd_draft)
-
-    improve = sub.add_parser("improve", help="improve the current skill into a new version from its train results")
+    improve = sub.add_parser(
+        "improve",
+        help="create or improve the skill from the knowledge wiki",
+        description="Read the knowledge wiki (per-task observations/hypotheses distilled from train "
+        "runs) and the filtered package source, then create the first skill (when none exist) or "
+        "improve the latest into the next version. The held-out valid split is never reachable.",
+    )
     improve.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
     improve.add_argument("--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml")
     improve.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
     improve.add_argument("--runs", type=Path, default=Path("runs"), help="root of the run tree")
+    improve.add_argument("--wiki", type=Path, default=Path("wiki"), help="root of the knowledge wiki")
     improve.add_argument("--from", dest="from_version", metavar="VERSION", help="version to improve (default: latest)")
     improve.add_argument("--model", help="override config meta_model")
     improve.add_argument("--max-turns", type=int, help="cap turns for the improving agent (default: unbounded)")
@@ -1195,10 +1442,56 @@ def build_parser() -> argparse.ArgumentParser:
     _add_auth_arg(improve)
     _add_feedback_arg(
         improve,
-        extra=" (e.g. what to fix or emphasise; do NOT paste test-split answers — that defeats the held-out split)",
+        extra=" (e.g. what to fix or emphasise; do NOT paste valid-split answers — that defeats the held-out split)",
     )
     _add_log_args(improve)
     improve.set_defaults(func=_cmd_improve)
+
+    wiki = sub.add_parser(
+        "wiki",
+        help="distil an arm's train runs into the knowledge wiki (one agent per task)",
+        description="For each task, read that arm's train-split runs across models and replicates "
+        "and append a terse [version][model] block to wiki/<task>/observations.md and hypothesis.md. "
+        "Cumulative and idempotent: an arm already recorded for a task is skipped.",
+    )
+    wiki.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
+    wiki.add_argument("--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml")
+    wiki.add_argument("--runs", type=Path, default=Path("runs"), help="root of the run tree")
+    wiki.add_argument("--wiki", type=Path, default=Path("wiki"), help="root of the knowledge wiki")
+    wiki.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
+    wiki_arm = wiki.add_mutually_exclusive_group()
+    wiki_arm.add_argument("--no-skill", action="store_true", help="record the baseline (noskill) arm")
+    wiki_arm.add_argument("--skill", metavar="VERSION", help="record one skill version, e.g. v1 (default: latest)")
+    wiki.add_argument("--model", help="override config meta_model")
+    wiki.add_argument("--max-concurrency", type=int, help="override config max_concurrency")
+    wiki.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
+    wiki.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
+    _add_auth_arg(wiki)
+    _add_log_args(wiki)
+    wiki.set_defaults(func=_cmd_wiki)
+
+    epoch = sub.add_parser(
+        "epoch",
+        help="run one training epoch: bench train, update wiki, improve, bench valid",
+        description="One training epoch end to end: bench the current arm on the training signal, "
+        "distil it into the wiki, create/improve the skill, then bench the new version on the "
+        "held-out valid signal. Fully resumable — re-run to continue a crashed epoch or start the "
+        "next one.",
+    )
+    epoch.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
+    epoch.add_argument("--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml")
+    epoch.add_argument("--runs", type=Path, default=Path("runs"), help="root of the run tree")
+    epoch.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
+    epoch.add_argument("--wiki", type=Path, default=Path("wiki"), help="root of the knowledge wiki")
+    epoch.add_argument("--model", help="override config meta_model")
+    epoch.add_argument("--max-concurrency", type=int, help="override config max_concurrency")
+    epoch.add_argument("--replicates", type=int, help="override config n_replicates")
+    epoch.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
+    epoch.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
+    _add_auth_arg(epoch)
+    _add_feedback_arg(epoch, extra=" (passed to the improver; do NOT paste valid-split answers)")
+    _add_log_args(epoch)
+    epoch.set_defaults(func=_cmd_epoch)
 
     tasks_cmd = sub.add_parser("tasks", help="autonomously generate a tasks.yaml from the target package")
     tasks_cmd.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
@@ -1325,8 +1618,8 @@ def main(argv: list[str] | None = None) -> int:
         AgentError,
         PriceFeedError,
         SkillError,
-        DraftError,
         ImproveError,
+        WikiError,
         TaskGenError,
         ReviewError,
         ShipError,

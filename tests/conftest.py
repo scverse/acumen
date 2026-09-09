@@ -31,7 +31,7 @@ tasks:
     train:
       prompt: Do the training analysis and report the single symbol.
       answer: TRAIN_ANSWER
-    test:
+    valid:
       prompt: Do the same analysis on the held-out input.
       answer: TEST_ANSWER
 """
@@ -146,6 +146,6 @@ def make_result():
 def runs_root(project: Path) -> Path:
     """A run tree with one complete baseline run per split."""
     root = project / "runs"
-    for split in ("train", "test"):
+    for split in ("train", "valid"):
         write_result(root, RunKey(arm="noskill", split=split, model=MODEL, task_id="example_task", rep=1))
     return root

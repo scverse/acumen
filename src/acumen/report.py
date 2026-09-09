@@ -8,7 +8,7 @@ few group-bys. Figures are matplotlib rendered to PNG and inlined as base64 data
 The report is regenerated (overwritten) at each skill version — it always reflects every
 run currently on disk across every arm.
 
-The visualisations show **test-split** performance — the held-out measure of whether a
+The visualisations show **valid-split** performance — the held-out measure of whether a
 skill helps. The full per-run table below them still lists both splits, so train runs
 remain inspectable.
 """
@@ -91,9 +91,9 @@ _ALL_MODELS = "\x00all-models"  # sentinel model id; not a value any real id can
 _ALL_MODELS_LABEL = "all models"
 _ALL_MODELS_COLOR = "#9b968d"
 
-# Train vs test is a *texture*, not a colour — so it never competes with the model hue.
-_SPLIT_ORDER = ("train", "test")
-_SPLIT_HATCH = {"train": "////", "test": ""}
+# Train vs valid is a *texture*, not a colour — so it never competes with the model hue.
+_SPLIT_ORDER = ("train", "valid")
+_SPLIT_HATCH = {"train": "////", "valid": ""}
 
 #: rcParams applied around every figure via :func:`matplotlib.pyplot.rc_context`, so the
 #: report's styling never leaks into a caller's global matplotlib state.
@@ -118,8 +118,8 @@ _RC = {
 }
 
 #: The split every figure reports on. Train runs feed the improver; the report measures
-#: held-out (test) performance.
-_REPORTED_SPLIT = "test"
+#: held-out (valid) performance.
+_REPORTED_SPLIT = "valid"
 
 
 #: Brand assets bundled with the package (see ``src/acumen/assets``). Inlined as ``data:``
@@ -327,7 +327,7 @@ def _loaded_flags(df: pd.DataFrame) -> pd.Series:
 def arm_metrics(df: pd.DataFrame) -> pd.DataFrame:
     """Per-arm success rate and resource totals for the runs in ``df``.
 
-    The caller filters ``df`` first — to the test split, and optionally to one task. Each
+    The caller filters ``df`` first — to the valid split, and optionally to one task. Each
     row is one arm, in report order.
 
     The resource columns here are **totals** — the budget view, "what did this arm cost to
@@ -613,7 +613,7 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, st
         Results to plot — the full frame, or one task's slice.
     split_hue
         ``True`` for the per-task view (train + test as texture); ``False`` for the
-        overview (the reported test split only).
+        overview (the reported valid split only).
     colors
         Bar colour per model id, as returned by :func:`resolve_palette`. It may cover more
         models than ``df`` holds — one map resolved over the whole report is reused for
@@ -860,7 +860,7 @@ def tradeoff_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None
     Parameters
     ----------
     df
-        Results from :func:`load_results`. Only the reported (test) split is plotted.
+        Results from :func:`load_results`. Only the reported (valid) split is plotted.
     colors
         Mark colour per model id, as returned by :func:`resolve_palette`; models missing from it
         fall back to their tier default, and ``None`` uses the defaults throughout.
@@ -1124,13 +1124,13 @@ def _cluster_totals(df: pd.DataFrame, arms: Sequence[str]) -> tuple[np.ndarray, 
     These are the sufficient statistics for the bootstrap: both metrics are ratios of sums, so a
     resample never has to touch an individual run again.
     """
-    test = df[df["split"] == _REPORTED_SPLIT]
-    clusters = sorted(test[_CLUSTER_COLUMN].unique())
+    reported = df[df["split"] == _REPORTED_SPLIT]
+    clusters = sorted(reported[_CLUSTER_COLUMN].unique())
     shape = (len(clusters), len(arms))
     cost, successes, runs = np.zeros(shape), np.zeros(shape), np.zeros(shape)
     for ci, cluster in enumerate(clusters):
         for ai, arm in enumerate(arms):
-            rows = test[(test[_CLUSTER_COLUMN] == cluster) & (test["arm"] == arm)]
+            rows = reported[(reported[_CLUSTER_COLUMN] == cluster) & (reported["arm"] == arm)]
             run_cost = rows["cost_usd"]
             cost[ci, ai] = run_cost.sum() if run_cost.notna().all() else math.nan
             successes[ci, ai] = rows["success"].sum()
@@ -1244,7 +1244,7 @@ def skill_tests(df: pd.DataFrame, *, resamples: int = _BOOTSTRAP_RESAMPLES, seed
     Parameters
     ----------
     df
-        Results from :func:`load_results`. Only the reported (test) split is used.
+        Results from :func:`load_results`. Only the reported (valid) split is used.
     resamples, seed
         Bootstrap size and its seed. The default seed is fixed so a rebuilt report reproduces
         its own p-values exactly.
@@ -1324,7 +1324,7 @@ def _fmt_p(p: float) -> str:
 #: and the *lowest* cost, and a reader scanning the bold cells for the winner should not have to
 #: keep track of which column runs which way. The first few describe an arm on its own; the rest
 #: compare it with the baseline.
-_TEST_COLUMNS = (
+_VALID_COLUMNS = (
     ("Success rate", "rate", True, lambda v: f"{v:.1%}"),
     ("Cost / run", "cost", False, lambda v: f"${v:.3f}"),
     ("On frontier", "frontier", True, lambda v: f"{v:.1%}"),
@@ -1368,7 +1368,7 @@ def _tests_table_html(tests: SkillTests) -> str:
         )
 
     by_arm = {row.challenger: row for row in tests.comparisons.itertuples()}
-    compared = [field for _title, field, _highest, _fmt in _TEST_COLUMNS[_ARM_COLUMNS:]]
+    compared = [field for _title, field, _highest, _fmt in _VALID_COLUMNS[_ARM_COLUMNS:]]
     records = []
     for row in tests.arms.itertuples():
         match = by_arm.get(row.arm)
@@ -1380,21 +1380,21 @@ def _tests_table_html(tests: SkillTests) -> str:
         )
     best = [
         _best_cells([record[field] for record in records], highest=highest)
-        for _title, field, highest, _fmt in _TEST_COLUMNS
+        for _title, field, highest, _fmt in _VALID_COLUMNS
     ]
 
     body = []
     for index, (arm, record) in enumerate(zip(tests.arms["arm"], records, strict=True)):
         cells = [f"<td>{_skill_label(arm)}</td>"]
-        for column, (_title, field, _highest, fmt) in enumerate(_TEST_COLUMNS):
+        for column, (_title, field, _highest, fmt) in enumerate(_VALID_COLUMNS):
             value = record[field]
             text = "&mdash;" if value is None else fmt(value)
             cells.append(f"<td><strong>{text}</strong></td>" if index in best[column] else f"<td>{text}</td>")
         body.append(f"<tr>{''.join(cells)}</tr>")
 
-    own = "".join(f'<th rowspan="2">{title}</th>' for title, *_ in _TEST_COLUMNS[:_ARM_COLUMNS])
-    versus = "".join(f"<th>{title}</th>" for title, *_ in _TEST_COLUMNS[_ARM_COLUMNS:])
-    span = len(_TEST_COLUMNS) - _ARM_COLUMNS
+    own = "".join(f'<th rowspan="2">{title}</th>' for title, *_ in _VALID_COLUMNS[:_ARM_COLUMNS])
+    versus = "".join(f"<th>{title}</th>" for title, *_ in _VALID_COLUMNS[_ARM_COLUMNS:])
+    span = len(_VALID_COLUMNS) - _ARM_COLUMNS
     return f"""<div class="table-center"><table class="tests">
 <thead>
 <tr><th rowspan="2">Skill</th>{own}<th colspan="{span}">Compared with {_skill_label(tests.baseline)}</th></tr>
@@ -1437,12 +1437,12 @@ def loaded_only_rates(df: pd.DataFrame) -> pd.DataFrame:
     distance between them *is* the dilution the non-loading runs cause. ``rate`` is ``NaN``
     where nothing loaded, and ``baseline`` is ``NaN`` where that model has no baseline runs.
     """
-    test = df[df["split"] == _REPORTED_SPLIT]
-    arms = [arm for arm in _arms_in_order(test) if arm != NOSKILL_ARM]
-    base = test[test["arm"] == NOSKILL_ARM]
+    reported = df[df["split"] == _REPORTED_SPLIT]
+    arms = [arm for arm in _arms_in_order(reported) if arm != NOSKILL_ARM]
+    base = reported[reported["arm"] == NOSKILL_ARM]
     records: list[dict[str, object]] = []
     for arm in arms:
-        subset = test[test["arm"] == arm]
+        subset = reported[reported["arm"] == arm]
         contributing = {
             model for model in subset["model"].unique() if _loaded_flags(subset[subset["model"] == model]).any()
         }
@@ -2197,7 +2197,7 @@ def render_report(
 {toc}
 <main>
 <h1>acumen benchmark report</h1>
-<div class="meta">Generated {generated} &middot; {len(df)} runs &middot; test split shown
+<div class="meta">Generated {generated} &middot; {len(df)} runs &middot; valid split shown
  &middot; arms: {html.escape(arms)} &middot; tasks: {html.escape(tasks)}</div>
 {notes}
 <section id="overview">

@@ -6,7 +6,7 @@ reads the package **source** (it has to understand the API to design a real pipe
 no benchmark agent, it also **runs code in the venv**: every ground-truth answer is obtained by
 executing the pipeline and reading the real output, never by copying doc output.
 
-There is no test-split guard here (unlike the improver) — no runs exist yet, so there is nothing
+There is no valid-split guard here (unlike the improver) — no runs exist yet, so there is nothing
 to leak. Isolation is otherwise the same as the other meta-agents: scrubbed env, throwaway
 ``HOME`` and ``CLAUDE_CONFIG_DIR``.
 
@@ -15,7 +15,7 @@ agent-instruction files (``SKILL.md``, ``.agents/skills/``, ``.claude/skills/``,
 ``CLAUDE.md``, ``AGENTS.md``,
 ``.cursor/``, Copilot instructions). If the generator read them, it would mine the tasks the
 author already anticipated and phrase them the way the skill does — defeating the point of an
-independent benchmark. So, as with the test-split guard, this is enforced two ways: the agent
+independent benchmark. So, as with the valid-split guard, this is enforced two ways: the agent
 reads a **filtered copy** of the source with those artifacts stripped out
 (:func:`acumen.scrub.build_filtered_source`), and a ``PreToolUse`` hook denies any tool call that
 resolves to one of them — or to the original unfiltered tree — wherever the agent points it
@@ -29,7 +29,7 @@ happens only after the agent's ``tasks.yaml`` validates through :func:`acumen.ta
 so a rejected generation leaves no scripts behind and ``acumen tasks`` can never emit a
 ``tasks.yaml`` the rest of the pipeline would reject.
 
-These scripts hold the ground truth for the **held-out test split**, so no agent may ever read
+These scripts hold the ground truth for the **held-out valid split**, so no agent may ever read
 them. That holds because ``bench``, ``draft`` and ``improve`` confine their agents to explicit
 read roots (:mod:`acumen.guard`) that never include the project directory — a property to
 preserve when changing any of them.
@@ -96,7 +96,7 @@ def _task_to_dict(task: Task) -> dict[str, object]:
     if not task.needs_script:
         entry["needs_script"] = False
     entry["train"] = {"prompt": task.train.prompt, "answer": task.train.answer}
-    entry["test"] = {"prompt": task.test.prompt, "answer": task.test.answer}
+    entry["valid"] = {"prompt": task.valid.prompt, "answer": task.valid.answer}
     if task.max_turns is not None:
         entry["max_turns"] = task.max_turns
     if task.max_usd is not None:

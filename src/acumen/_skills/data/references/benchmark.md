@@ -3,7 +3,7 @@
 ## `acumen bench`
 
 ```bash
-acumen bench [--no-skill | --skill v1] [--split train|test]... [--task ID]...
+acumen bench [--no-skill | --skill v1] [--split train|valid]... [--task ID]...
              [--replicates N] [--max-concurrency N] [--dry-run] [--no-resume]
              [--keep-sandboxes] [--refresh-target]
              [--auth auto|session|api]
@@ -87,7 +87,7 @@ exits 2 if the pages cannot be read. Each run records `price_source` (`config` o
 attributable and one report can mix them; the report flags arms priced on different dates, whose
 cost gap includes the price change rather than only the skill's effect.
 
-`draft`, `improve`, `tasks`, and `ship` also fetch, but degrade to unpriced rather than failing:
+`improve`, `wiki`, `tasks`, and `ship` also fetch, but degrade to unpriced rather than failing:
 their cost line is progress reporting. Note that Codex's `max_usd` is derived from these rates,
 so an unpriced Codex run has no enforceable budget cap — bound it with `max_turns`.
 
@@ -145,7 +145,7 @@ acumen report [--runs runs] [--tasks tasks.yaml] [--skills skills] [--out report
 - Writes `report.html` **and a sidecar `report.csv`** next to it, overwriting both; the
   report always reflects every run currently on disk across every arm.
 - Reads only `result.json` files — never transcripts. Fails if `runs/` holds none.
-- **The figures show the TEST split** (the held-out measure). The per-run table below them
+- **The figures show the VALID split** (the held-out measure). The per-run table below them
   lists both splits.
 - Sections: Overview (success rate, tokens, cost, time per arm, bars coloured by model),
   Per-task breakdown, Runs table (links to each `transcript.html`), and — when `--skills`
@@ -157,6 +157,6 @@ acumen report [--runs runs] [--tasks tasks.yaml] [--skills skills] [--out report
 Run `acumen report` after every bench — it is how a version is judged, and the only view
 that compares arms and splits side by side. Then take the results to the user: say what
 improved, what did not, and what you would do next (`improve` and re-bench, more tasks,
-`ship`, or stop). Train improving while test does not is overfitting — that gap is exactly
+`ship`, or stop). Train improving while valid does not is overfitting — that gap is exactly
 what the split exists to expose — but the call on when to stop and what to ship is the
 user's.

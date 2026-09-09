@@ -21,12 +21,12 @@ Only `repo` is required; delete a line to take its default.
 | `pip_packages` | `[]` | Packages the target declares nowhere, installed alongside it. PEP 508 specifiers allowed (`numpy<2`). |
 | `python` | `"3.12"` | Interpreter for the target's venv (quote it — `3.10` unquoted is a float). |
 | `env_passthrough` | `[]` | Extra env var names agents may keep. The agent env is a clean allowlist (auth/proxy/TLS only); **everything else from your shell is blanked**. A target needing `OMP_NUM_THREADS`, `R_HOME`, a service key, etc. must name it here. |
-| `models` | `[claude-opus-5]` | Benchmark models. Claude (`claude*`) and Codex (`gpt-*`, `o1`/`o3`/`o4`, `codex-*`) models may be mixed. Duplicates rejected. `models[0]` is the default for the four `*_model` keys below. |
+| `models` | `[claude-opus-5]` | Benchmark models. Claude (`claude*`) and Codex (`gpt-*`, `o1`/`o3`/`o4`, `codex-*`) models may be mixed. Duplicates rejected. `models[0]` is the default for `meta_model`. |
 | `n_replicates` | `3` | Runs per (model, task, split) cell. |
 | `max_concurrency` | `4` | Simultaneous benchmark agents. |
 | `max_turns` | `40` | **Benchmark agents only.** |
 | `max_usd` | `3.0` | **Benchmark agents only.** |
-| `draft_model` / `improve_model` / `tasks_model` / `ship_model` | `models[0]` | Meta-agent models; overridable per command with `--model`. |
+| `meta_model` | `models[0]` | Model for the meta-agents (`improve`, `wiki`, `tasks`, `ship`, `check` review); overridable per command with `--model`. |
 | `skill_name` | repo basename, slugified + lowercased | Must equal the `name:` in the skill's frontmatter. |
 | `prices` | built-in table | Per-model token rates (USD per million): `{model: {input, output, cached_input?, cache_write?, cache_write_5m?, cache_write_1h?}}`. Overrides or extends acumen's table — needed for a model it doesn't ship a rate for, a gateway, or negotiated rates. See `acumen prices`. |
 
@@ -54,7 +54,7 @@ tasks:
       prompt: >-
         One paragraph: the goal, the input, and exactly what to report.
       answer: ONE_TOKEN
-    test:
+    valid:
       prompt: >-
         The same analysis on a different input / target.
       answer: ANOTHER_TOKEN
@@ -64,7 +64,7 @@ tasks:
     # model: claude-sonnet-5
 ```
 
-Both `train` and `test` are required, each with non-empty `prompt` and `answer`. Both
+Both `train` and `valid` are required, each with non-empty `prompt` and `answer`. Both
 splits always run in a pass; only train results ever reach `improve`.
 
 ### Writing a task that measures anything
@@ -77,7 +77,7 @@ splits always run in a pass; only train results ever reach `improve`.
 - **State the goal, not the recipe.** No numbered steps, no function/argument names, no
   description of the data's shape or columns. What is being measured is whether the agent
   can find the "how" itself; a prompt that spells out the calls measures nothing.
-- Train and test must be **the same analysis on different inputs**, with different correct
+- Train and valid must be **the same analysis on different inputs**, with different correct
   answers — otherwise a skill can pass by memorizing one answer.
 - A good task is one the target package solves and the **no-skill baseline gets wrong** —
   a task the baseline already passes leaves no room to show a gain. The `--no-skill` arm is

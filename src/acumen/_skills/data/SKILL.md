@@ -1,6 +1,6 @@
 ---
 name: acumen
-description: Use for any question or task involving the Python package `acumen` (its CLI or its API) — setting up a benchmark project against a target package, writing or generating benchmark tasks, drafting/improving/hand-editing an agent Skill, running and interpreting skill-vs-baseline benchmark passes, shipping a skill into the target package, diagnosing a run, and choosing what to do next in that loop — open it before answering or running anything, because acumen's defaults, guardrails and correct next step are not guessable from the command names.
+description: Use for any question or task involving the Python package `acumen` (its CLI or its API) — setting up a benchmark project against a target package, writing or generating benchmark tasks, running training epochs that create/improve an agent Skill from a knowledge wiki, running and interpreting skill-vs-baseline benchmark passes, shipping a skill into the target package, diagnosing a run, and choosing what to do next in that loop — open it before answering or running anything, because acumen's defaults, guardrails and correct next step are not guessable from the command names.
 ---
 
 # acumen
@@ -13,14 +13,19 @@ run from the project dir and default to `config.yaml`, `tasks.yaml`, `skills/`, 
 ```bash
 acumen init                # scaffold config.yaml + tasks.yaml (placeholders the user must fill)
 acumen tasks               # optional: mine the package for tasks, run them for ground truth
-acumen bench --no-skill    # baseline arm  (bare `acumen bench` runs every arm there is)
-acumen draft               # agent reads the package source -> skills/v1/
-acumen bench --skill v1
-acumen improve             # agent reads v1's TRAIN runs -> skills/v2/
-acumen bench --skill v2
+acumen epoch               # one training epoch: bench train -> wiki -> create/improve skill -> bench valid
+acumen epoch               # again: learns from the last version, produces the next
 acumen report              # report.html + report.csv over every arm on disk
 acumen ship --skill v2     # wire a `<dist>-install-skills` script into the target package
 ```
+
+`acumen epoch` is the loop. One invocation is one training epoch: it benchmarks the current
+arm on the **train** split, distils each task's runs into a per-task **wiki**
+(`wiki/<task>/observations.md` + `hypothesis.md`, accumulating one `[version][model]` block per
+epoch from `noskill` on up), then creates the first skill (or improves the latest) from that
+wiki, and benchmarks the new version on the held-out **valid** split. It is fully resumable — a
+crashed epoch continues where it stopped; a completed one starts the next. The granular commands
+still exist (`acumen bench`, `acumen wiki`, `acumen improve`) for running a single stage.
 
 That is the shape of the loop, not a script to execute unattended, and not a fixed order:
 several stages have more than one correct next move, and some stages call for talking to
@@ -41,11 +46,10 @@ a command.
 | Just happened | What to propose next |
 |---|---|
 | `acumen init` | Both files are placeholders (`repo: OWNER/REPO`, `REPLACE_ME` answers). Ask the user for what only they can supply — the target repo/path, ref, models, budgets — and fill in `config.yaml` with their answers. Do not guess a target or run the next command. |
-| `config.yaml` filled | Offer both ways to get tasks: `acumen tasks` to generate them, or writing `tasks.yaml` by hand. Review generated tasks with the user before benching. |
-| config + tasks ready | `acumen bench --no-skill` and `acumen draft` are **both** correct next steps — they are independent, and you need the baseline arm and a skill arm before any comparison means anything. Offer both. |
-| a skill version exists | `acumen bench --skill vN`, or bare `acumen bench` to cover the baseline and every version at once (resume means only the unbenched cells cost anything). |
-| any `bench` finished | `acumen report` — the per-arm, per-split numbers come from the report; do not judge a version by eyeballing runs or by one arm's pass count. |
-| `report` written | Discuss the results with the user and propose next steps: `improve` + re-bench if it has not beaten the baseline or the previous version, `ship` once a version has proven out, or stop. The user decides. |
+| `config.yaml` filled | Offer both ways to get tasks: `acumen tasks` to generate them, or writing `tasks.yaml` by hand. Review generated tasks with the user before an epoch. |
+| config + tasks ready | `acumen epoch` runs the whole first round (benches the noskill baseline on train+valid, builds the wiki, creates `skills/v1/`, benches it on valid). Propose it, and confirm the budget first — one epoch spends on many benchmark cells plus the meta-agents. |
+| an epoch finished | `acumen report` — the per-arm, per-split numbers come from the report; do not judge a version by eyeballing runs. Then discuss with the user whether to run another `acumen epoch`, `ship`, or stop. |
+| `report` written | Discuss the results with the user and propose next steps: another `acumen epoch` if the latest version has not beaten the baseline or the previous version, `ship` once a version has proven out, or stop. The user decides. |
 | user has a skill dir from elsewhere | Copy it into `skills/v1/` (next unused version) inside the acumen project — versions are only ever read from `skills/`; there is no import command and no external path flag. |
 
 ## Route by goal
@@ -55,9 +59,10 @@ a command.
 | Start a project for package X | `acumen init`, then fill `config.yaml` with the user | `references/setup.md` |
 | Get benchmark tasks without writing them | `acumen tasks [--force] [--feedback "…"]` | `references/setup.md` |
 | Write tasks by hand | edit `tasks.yaml` | `references/setup.md` |
-| Get a first skill | `acumen draft [--feedback "…"]` | `references/authoring.md` |
-| Measure whether the skill helps | `acumen bench --no-skill` and `acumen bench --skill vN` | `references/benchmark.md` |
-| Make the skill better | `acumen improve [--from vN]` then bench the new version | `references/authoring.md` |
+| Run one training round (the loop) | `acumen epoch [--feedback "…"]` | `references/authoring.md` |
+| Create or improve the skill only | `acumen improve [--from vN]` (reads the wiki) | `references/authoring.md` |
+| Distil an arm's train runs into the wiki | `acumen wiki [--no-skill | --skill vN]` | `references/authoring.md` |
+| Measure a single arm | `acumen bench --no-skill` / `acumen bench --skill vN` | `references/benchmark.md` |
 | See results / decide when to stop | `acumen report` | `references/benchmark.md` |
 | Hand-edit a skill version | copy `skills/vN` → `skills/v(N+1)`, edit, bench it | `references/authoring.md` |
 | Give package users the skill | `acumen ship --skill vN` | `references/ship.md` |
@@ -102,19 +107,20 @@ a command.
    that is 108. Check with `acumen bench --dry-run` (it plans and exits, spending nothing,
    over the same arms the real run would) and agree the size with the user before spending.
    Trim with `models:`, `n_replicates: 1`, `--task ID`, `--split`, or by naming one arm.
-3. **`max_turns`/`max_usd` in `config.yaml` cap benchmark agents only.** `draft`,
-   `improve`, `tasks`, and `ship` are **unbounded** unless you pass `--max-turns`/`--max-usd`.
-4. **Skill versions are immutable.** `draft` refuses (exit 2) if any `skills/vN` exists;
-   `improve` always writes the next unused directory. Never edit a benched version in
-   place — its hash is recorded in every `result.json`.
+3. **`max_turns`/`max_usd` in `config.yaml` cap benchmark agents only.** The meta-agents
+   (`improve`, `wiki`, `tasks`, `ship`) are **unbounded** unless you pass `--max-turns`/`--max-usd`.
+4. **Skill versions are immutable.** `improve` (and `epoch`) always writes the next unused
+   directory; a resumed epoch skips `improve` when its version already exists. Never edit a
+   benched version in place — its hash is recorded in every `result.json`.
 5. **`SKILL.md` frontmatter `name` must equal `config.skill_name`**, which defaults to the
    repo's last path component, slugified and lowercased (`.../My_Pkg` → `my_pkg`). A
    mismatch makes `bench`/`improve`/`ship` fail on load. `description` must be non-empty.
-6. **`improve` needs benched train evidence for its parent.** Run
-   `acumen bench --skill vN` before `acumen improve`, or it errors with nothing to read.
-7. **Never leak the test split.** `improve` is structurally and hook-blocked from
-   `runs/*/test/`; don't defeat that by pasting test answers into `--feedback`. A widening
-   train/test gap in the report is the overfitting signal you are watching for.
+6. **`improve` needs benched train evidence.** `acumen epoch` benches the parent arm on train
+   first, so it is self-sufficient; standalone `acumen improve` errors if the parent arm has no
+   train runs — bench it (and run `acumen wiki`) first.
+7. **Never leak the valid split.** `improve`/`wiki` are structurally and hook-blocked from
+   `runs/*/valid/`; don't defeat that by pasting valid answers into `--feedback`. A widening
+   train/valid gap in the report is the overfitting signal you are watching for.
 8. **Task prompts must not name the target package** — the harness already tells the agent
    which package to use and that it is installed.
 9. **Resume is automatic**: a valid run is "complete" when its `result.json` exists and is

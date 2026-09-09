@@ -19,12 +19,12 @@ def feedback_block(feedback: str | None) -> str:
     ``<maintainer_feedback>`` delimiters and placed (by the templates) *after* the hard rules,
     with explicit wording that it is guidance and does NOT override anything above it. That
     subordination is deliberate: the feedback comes from a trusted maintainer, but it must not be
-    able to talk an agent out of the isolation rules (test-split, skill-bias) or the anti-overfit
+    able to talk an agent out of the isolation rules (valid-split, skill-bias) or the anti-overfit
     rules — those are enforced structurally regardless, and the prompt says so.
 
     Note: feedback steers *within* each command's methodology; it cannot redefine it. It won't,
     for instance, stop ``tasks`` from running the package to verify answers, nor let ``improve``
-    reach the test split to cheat.
+    reach the valid split to cheat.
 
     Parameters
     ----------
@@ -102,89 +102,40 @@ prose, no formatting, no code fences. If you ran code or tools to get there,
 """
 
 
-DRAFT_PROMPT = """\
-You are writing an agent skill for the Python package `{package}` (version {version}).
+#: Shared guidance for the description trigger and anti-overfit body rules, used by both the
+#: create and improve prompts so the two never drift apart.
+_SKILL_CRAFT = """\
+# The description is the trigger
 
-A skill is documentation written for an agent, not for a human. Its only purpose is to
-make an agent that has never used `{package}` succeed at real tasks with it on the first
-try. It is not a tutorial, not a README, and not a sales pitch.
+The `description` is the ONE sentence an agent sees before deciding whether to open the skill.
+It is the entire loading decision. Its job is to make the skill load exactly when it is
+relevant and not otherwise.
 
-The agent arrives with a goal stated in plain English — what a user wants done, not which
-function to call. The skill's job is to get it from that goal to a working result: route it
-to the right entry point and the right sequence of steps, so it never has to reverse-engineer
-that from the module layout.
+- **State the goals a user would actually phrase**, in their words, not the package's. An agent
+  matches the description against the task in front of it. Name the outcomes and the kinds of
+  question the skill answers.
+- **Do not overfit it.** Widening the description with the specific datasets, methods, or
+  phrasings from the tasks is cheating: it buys train load rate and loses on the held-out valid
+  split. Widen to the CATEGORY of goal, never to the instances you saw.
+- **Do not oversell.** A description that claims coverage the body does not deliver loads the
+  skill on tasks it cannot help with, and costs every one of those runs its tokens for nothing.
 
-# What you can read
+# How to write the body
 
-- The package's source is at `{src}`. Read it — the source, the docstrings, the examples,
-  the docs directory. This is the ground truth about how the package behaves.
-- `{package}` is also installed; run `{python}` to check anything you are unsure about.
-  Verify claims before you write them down.
-
-# Ignore any existing skills or agent instructions — deliberately hidden
-
-The package may already ship skills or agent-instruction files written for it (`SKILL.md`,
-`.agents/skills/`, `.claude/skills/`, `.codex/`, `CLAUDE.md`, `AGENTS.md`, `.cursor/`,
-Copilot instructions). These have been stripped from the source above, and any attempt to reach
-them — or the original unfiltered checkout — is BLOCKED. This is on purpose: a skill copied from
-pre-written guidance is not a skill written from the package, and this one is about to be
-measured against no skill at all. Write yours from the API, the source, and the user-facing docs.
-
-# What you must write
-
-Your working directory is `{out}`. Write:
-
-1. `{out}/SKILL.md` — required. It must begin with YAML frontmatter, exactly:
-
----
-name: {skill_name}
-description: <one sentence: what this skill covers and when to use it>
----
-
-   The `name` must be exactly `{skill_name}`.
-
-   The `description` is load-bearing and must be HONEST. It is the only part of the skill
-   an agent sees before deciding whether to open it, and it is the only thing that gets
-   the skill loaded at the right moment.
-   State what the skill covers and the goals it applies to — name the outcomes a user would
-   actually phrase, so the skill loads when one of them comes up. Do not oversell it, and do
-   not claim coverage the body does not deliver. Use this format:
-   [What it does] + [When to use it: the goals/triggers it fires on] + [Key capabilities]
-
-2. `{out}/references/*.md` — optional. Use these for detail that only some tasks need.
-
-# How to write it
-
-- **Organize around goals, not modules.** Work out what people actually use `{package}` to
-  accomplish — read its examples, tutorials, and docs, not just its API — and structure the
-  skill so a stated goal maps to the right entry point and the right sequence of steps. Do not
-  just mirror the package's module layout.
-- **Write what is not guessable.** An agent already knows Python and can read a
-  traceback. Spend your words on what it would get WRONG by guessing: non-obvious
-  defaults, required preprocessing, the function that looks right but isn't, where
-  results are written, argument shapes and orientation, footguns the API invites, right order
-  of steps to follow.
-- **Generalize within each goal.** Organize around categories of goal, but keep the guidance
-  under each one general enough to cover any task in that category. Don't enumerate one-off
-  recipes — that's the failure mode on the other side of module-mirroring.
-- **Progressive disclosure.** `SKILL.md` should be short and route to `references/` for
-  depth. An agent pays for every token of it on every task, including the tasks where it
-  is irrelevant. If `SKILL.md` is long, you are taxing every run.
-- **Be concrete.** A correct short code example beats a paragraph of prose. Show the real
-  call, with the arguments that matter.
-- **Prefer removing text over adding it.** Anything that merely restates the obvious is
-  worse than nothing: it costs tokens and buries the parts that matter.
-- **No hedging.** Say what to do.
-
-# Verify before you finish
-
-Do not write claims you have not checked. If you assert a default value, a return type,
-or where an output lands, confirm it in the source or by running `{python}`. A skill that
-confidently states something false is worse than no skill at all — it will send an agent
-in the wrong direction with full confidence.
-{feedback}
-When you are done, `{out}/SKILL.md` must exist and start with the frontmatter above.
-"""
+- **Organize around goals, not modules.** Structure the skill so a stated goal maps to the right
+  entry point and the right sequence of steps — do not just mirror the module layout.
+- **Write what is not guessable.** The agent already knows Python and can read a traceback. Spend
+  words on what it would get WRONG by guessing: non-obvious defaults, required preprocessing, the
+  function that looks right but isn't, where results land, argument shapes, the right order of steps.
+- **Generalise — never overfit.** NEVER name a specific dataset, parameter value, column, expected
+  answer, or task in the skill. It must help on tasks you have not seen; enumerating the cases you
+  saw is cheating and fails the valid split.
+- **Progressive disclosure.** Keep `SKILL.md` short and route depth to `references/*.md`. An agent
+  pays for every token of `SKILL.md` on every task, including the ones where it is irrelevant.
+- **Prefer removing text over adding it.** A correct short code example beats a paragraph. If a
+  passage changed no outcome, cut it.
+- **Verify before you write.** Do not assert a default, a return type, or where an output lands
+  without confirming it in the installed package or the docs. No hedging — say what to do."""
 
 
 IMPROVE_PROMPT = """\
@@ -197,92 +148,165 @@ You are producing version {new_version} — an improvement of version {parent_ve
 
 # What you can read
 
-- `{skill_dir}` — the current skill ({parent_version}). This directory has been pre-filled
-  with a copy of it. EDIT THESE FILES IN PLACE; what they contain when you finish becomes
-  version {new_version}.
-- `{train_dir}` — evidence from benchmarking the current skill on the TRAIN split. Read
-  `{train_dir}/SUMMARY.md` first. For each run you will find the task prompt, the expected
-  answer, the answer the agent actually gave, whether it passed, WHETHER THE AGENT LOADED THE
-  SKILL AT ALL, which model ran it, the `script.py` it wrote, and its full transcript. This is
-  your only signal about what the skill gets right and what it gets wrong.
-- `{package}` is installed; run `{python}` (also `python` on your PATH) to verify any
-  claim about the API before you write it down. Do not install or upgrade packages.
+- `{skill_dir}` — the current skill ({parent_version}). This directory has been pre-filled with a
+  copy of it. EDIT THESE FILES IN PLACE; what they contain when you finish becomes {new_version}.
+- `{wiki_dir}` — the KNOWLEDGE WIKI: one directory per task, each with `observations.md` (what
+  agents did across models and replicates, how often the skill loaded, and whether loading led to
+  success) and `hypothesis.md` (why it did or did not work). Entries are tagged `[version][model]`
+  and accumulate across versions — `noskill` is the baseline, then `v1`, `v2`, … READ THIS FIRST.
+  It is the distilled signal of what the skill gets right and wrong; the trend across versions
+  tells you what past changes did.
+- `{transcripts_dir}` — the raw TRAIN-split transcripts behind the wiki, for the parent skill.
+  Drill in here only when the wiki is not specific enough to act on.
+- `{src}` — the package source (filtered: any skill or agent-guidance files a package ships have
+  been stripped and are BLOCKED — write from the API, not from someone else's skill). `{package}`
+  is installed; run `{python}` to verify a claim before writing it. Do not install packages.
 - You have web access if the published docs help.
 
 # What you are NOT allowed to see
 
-You are optimising against a TRAIN split. A separate, held-out TEST split is what measures
-whether your changes actually generalise rather than memorising these particular tasks. You
-must not see the test split, and any tool call that reaches test results will be BLOCKED.
-Do not attempt it — reaching test data would invalidate the whole benchmark.
-
-# What you must write
-
-1. Edit the skill in place under `{skill_dir}`. When you finish, `{skill_dir}/SKILL.md`
-   must still begin with YAML frontmatter whose `name` is exactly `{skill_name}` and whose
-   `description` is an honest one-sentence statement of what the skill covers and when to
-   use it. The `description` is the ONLY thing that decides whether the skill loads — see
-   below.
-
-2. `{rationale_path}` — one short paragraph stating WHAT you changed and WHY, grounded in
-   the train evidence. Write it here, OUTSIDE the skill directory. Do not put the rationale
-   inside `{skill_dir}`.
+You are optimising against the TRAIN split. A separate, held-out VALID split measures whether your
+changes generalise rather than memorise these tasks. Any tool call that reaches valid results is
+BLOCKED. Do not attempt it — reaching valid data would invalidate the whole benchmark.
 
 # Two different failures, two different fixes
 
-Every run records whether the agent LOADED the skill and whether it SUCCEEDED. Separate them
-before you change anything — they look identical in a list of failures and have opposite fixes.
+The wiki records whether the agent LOADED the skill and whether it SUCCEEDED. Separate them before
+changing anything — they look identical in a list of failures and have opposite fixes.
 
-1. **The skill never loaded.** The agent never read a word of the body, so nothing in the body
-   caused this and nothing you write in the body can fix it. The only lever is the
-   `description`. Editing the body in response to these runs is wasted work.
-2. **The skill loaded and the run still failed.** Now the body is on trial: it steered the
-   agent wrong, or it was silent where it should have spoken. Fix the body, using the cause
-   you can see in that run's transcript — not one you imagine.
-3. **The skill loaded and the run passed.** Evidence the body works. Do not rewrite it for
-   style.
+1. **The skill never loaded.** The agent never read the body, so nothing in the body caused this
+   and nothing you write in the body can fix it. The only lever is the `description`.
+2. **The skill loaded and the run still failed.** Now the body is on trial. Fix it, using the
+   cause the wiki (or a transcript) actually shows — not one you imagine.
+3. **The skill loaded and the run passed.** Evidence the body works. Do not rewrite it for style.
 
-A skill that is never loaded scores exactly like no skill at all, however good its body is. If
-the load rate in `SUMMARY.md` is low, that is the biggest available win — and the only thing
-you can do about it is the `description`.
+A skill that is never loaded scores exactly like no skill at all. If the wiki shows load rates low
+across the board, that is the biggest available win — and the only lever is the `description`. If
+one model loads reliably and another almost never does, that gap is mostly the model's behaviour;
+do not contort the sentence chasing it.
 
-# The description is the trigger
+{craft}
 
-The `description` is the ONE sentence an agent sees before deciding whether to open the skill.
-It is the entire loading decision. Its job is to make the skill load exactly when it is
-relevant and not otherwise.
+# What you must write
 
-- **Read the load rates per model.** They are in `SUMMARY.md`, broken down by model. If one
-  model loads the skill reliably and another almost never does, that gap is mostly the model's
-  behaviour, not your wording — do not contort the sentence chasing it. Act on a rate that is
-  low across the board.
-- **State the goals a user would actually phrase**, in their words, not the package's. An
-  agent matches the description against the task in front of it. Name the outcomes and the
-  kinds of question the skill answers.
-- **Do not overfit it to the train tasks.** Widening the description with the specific
-  datasets, methods, or phrasings you just read in the train runs is the same cheating as
-  putting them in the body: it buys train load rate and loses on the test split. Widen to
-  the CATEGORY of goal, never to the instances you saw.
-- **Do not oversell.** A description that claims coverage the body does not deliver loads the
-  skill on tasks it cannot help with, and costs every one of those runs its tokens for nothing.
-
-# How to improve the body
-
-- **Fix what the evidence shows is broken.** Work from the runs where the skill loaded and
-  the agent still failed. Address the cause visible in the transcript, not one you imagine.
-- **Generalise — never overfit.** NEVER name a specific dataset, parameter value, column,
-  expected answer, or task from the train runs in the skill. The skill must help on tasks
-  you have not seen. Guidance that enumerates these particular cases is cheating and will
-  fail the test split.
-- **Prefer removing text over adding it.** A shorter skill that an agent reads and follows
-  beats a longer one it skims. Every token is paid on every task, including the ones where
-  the skill is irrelevant. If a passage did not change any outcome, cut it.
-- **Verify before you write.** Do not assert a default, a return type, or where an output
-  lands without confirming it in the installed package or the docs.
-- **No hedging.** Say what to do.
+1. Edit the skill in place under `{skill_dir}`. When you finish, `{skill_dir}/SKILL.md` must still
+   begin with YAML frontmatter whose `name` is exactly `{skill_name}`.
+2. `{rationale_path}` — one short paragraph stating WHAT you changed and WHY, grounded in the wiki.
+   Write it OUTSIDE the skill directory; do not put it inside `{skill_dir}`.
 {feedback}
 When you are done, `{skill_dir}/SKILL.md` exists and starts with the frontmatter above, and
 `{rationale_path}` contains your rationale.
+"""
+
+
+CREATE_PROMPT = """\
+You are writing the FIRST agent skill (version {new_version}) for the Python package `{package}`
+(version {version}).
+
+A skill is documentation written for an agent, not a human. Its only purpose is to make an agent
+that has never used `{package}` succeed at real tasks with it on the first try. It is not a
+tutorial, not a README, not a sales pitch. The agent arrives with a goal in plain English; the
+skill routes it to the right entry point and sequence of steps.
+
+# What you can read
+
+- `{wiki_dir}` — the KNOWLEDGE WIKI: one directory per task, each with `observations.md` (what
+  agents did WITHOUT any skill — the `noskill` baseline — across models and replicates, and how
+  often they got it right) and `hypothesis.md` (why they succeeded or failed). READ THIS FIRST: it
+  tells you exactly where an unaided agent goes wrong, which is precisely what your skill must fix.
+- `{transcripts_dir}` — the raw TRAIN-split transcripts behind the wiki. Drill in when the wiki is
+  not specific enough.
+- `{src}` — the package source (filtered: any skill or agent-guidance files a package ships have
+  been stripped and are BLOCKED — write from the API, the source, and the user-facing docs, not
+  from someone else's skill). `{package}` is installed; run `{python}` to verify claims. Do not
+  install packages.
+- You have web access if the published docs help.
+
+# What you are NOT allowed to see
+
+The wiki and transcripts are from the TRAIN split only. A held-out VALID split measures whether
+your skill generalises. Any tool call that reaches valid results is BLOCKED — do not attempt it.
+
+# What you must write
+
+Your staging directory is `{skill_dir}`. Write:
+
+1. `{skill_dir}/SKILL.md` — required. It must begin with YAML frontmatter, exactly:
+
+---
+name: {skill_name}
+description: <one sentence: what this skill covers and when to use it>
+---
+
+   The `name` must be exactly `{skill_name}`. The `description` is load-bearing and must be HONEST —
+   it is the only thing an agent sees before deciding whether to open the skill.
+
+2. `{skill_dir}/references/*.md` — optional, for detail only some tasks need.
+
+3. `{rationale_path}` — one short paragraph on what the skill covers and why, grounded in the
+   baseline wiki. Write it OUTSIDE `{skill_dir}`.
+
+{craft}
+{feedback}
+When you are done, `{skill_dir}/SKILL.md` exists and starts with the frontmatter above, and
+`{rationale_path}` contains your rationale.
+"""
+
+
+WIKI_PROMPT = """\
+You are a benchmark analyst keeping a running knowledge wiki about how well an agent skill for the
+Python package `{package}` helps on ONE task. Your job this round: read what happened when the
+`[{version}]` arm was benchmarked on this task across several models and replicates, and record it
+BRIEFLY into two files.
+
+`[{version}]` is the skill version under review. `noskill` means no skill was installed (the
+baseline). {skill_note}
+
+# What you are given
+
+- `{evidence_dir}/INDEX.md` — every run of `[{version}]` on task `{task_id}`, one line each: pass or
+  fail, whether the skill LOADED, the model, the expected answer, and the answer given.
+- `{evidence_dir}/<model>__rep_<n>/` — that run's `transcript.html` (what the agent actually did),
+  its `answer.md`, and its `script.py`. Open a few to understand the pattern; you do NOT need to
+  read every one.
+- The package source is at `{src}` and it is installed — run `{python}` if a fact helps you explain
+  an outcome. Optional; do not go down a rabbit hole.
+{skill_body_note}
+# What you must write — APPEND, do not rewrite
+
+Two files already exist and may contain entries from earlier arms. LEAVE those untouched and ADD
+your new entries at the end. `noskill` is the first arm; later arms are `v1`, `v2`, …
+
+1. `{observations_path}` — add ONE line per model, in EXACTLY this format:
+
+   - [{version}][<model>]: <what the agents did, the % of runs the skill loaded, and — when it
+     loaded — whether it worked>
+
+   Say the general idea, not a play-by-play. For `noskill`, "loaded" does not apply — just say what
+   the agents did and how often they got it right.
+
+2. `{hypothesis_path}` — add ONE line per model, in EXACTLY this format:
+
+   - [{version}][<model>]: <why it did or did not work — one or two short sentences>
+
+# BE BRIEF — this is the whole point
+
+This wiki is read in full by the skill improver every round and grows forever. A verbose wiki is
+WORSE than a short one. Hard rules:
+
+- One to two lines per entry. No transcript quotes, no step-by-step, no per-run breakdown, no
+  restating the task. Compress across replicates into the pattern.
+- The hypothesis is one or two short sentences. No essays, no hedging.
+
+GOOD observation:
+  - [{version}][claude-opus-5]: Loaded 3/3; agents used the right entry point and passed every run.
+GOOD hypothesis:
+  - [{version}][claude-opus-5]: The skill named the correct function and output location, which is
+    the step agents otherwise guess wrong.
+BAD (too verbose): a paragraph recounting each replicate's tool calls and reasoning.
+
+When you are done, `{observations_path}` and `{hypothesis_path}` each contain your new
+`[{version}]` line(s) appended after whatever was already there — and nothing else changed.
 """
 
 
@@ -351,9 +375,9 @@ Illustration (style only — invent tasks that fit the actual package):
 - GOOD (a lazy goal): "Using the pbmc3k data, find which transcription factor is most active in
   the monocytes. Give only the factor's symbol."
 
-# Train and test variants
+# Train and valid variants
 
-Give each task a train and a test variant of the SAME goal, differing only in the input or the
+Give each task a train and a valid variant of the SAME goal, differing only in the input or the
 target it asks about (a different cell type, group, condition, or dataset). Two instances of one
 analysis with two different correct answers — so a skill cannot pass by memorising one answer.
 
@@ -369,7 +393,7 @@ one answer stands — never by adding back instructions.
 
 The script you run to obtain an answer is NOT scratch. Save one per split to
 `{scripts_dir}/<id>-<split>.py`, using the SAME `id` you gave the task in `{out}` — so the task
-`bulk` needs `{scripts_dir}/bulk-train.py` and `{scripts_dir}/bulk-test.py`. These are what
+`bulk` needs `{scripts_dir}/bulk-train.py` and `{scripts_dir}/bulk-valid.py`. These are what
 `acumen check` reruns later to confirm the answer still holds, so each one must:
 
 - Be SELF-CONTAINED and runnable from ANY empty working directory: `<python> <script>` with no
@@ -399,12 +423,12 @@ tasks:
       prompt: |
         <one-paragraph goal for the train variant>
       answer: "<the exact answer string the real train run produced>"
-    test:
+    valid:
       prompt: |
-        <one-paragraph goal for the test variant>
-      answer: "<the exact answer string the real test run produced>"
+        <one-paragraph goal for the valid variant>
+      answer: "<the exact answer string the real valid run produced>"
 
-`id` must be unique across all tasks. Both `train` and `test` are required, each with a
+`id` must be unique across all tasks. Both `train` and `valid` are required, each with a
 non-empty `prompt` and a non-empty `answer`. Add `needs_script: false` at the task level (a
 sibling of `id`) only for a task that needs no code to answer; it defaults to true and is then
 omitted. Do not add other keys unless you deliberately want a per-task override (`max_turns`,
@@ -415,7 +439,7 @@ omitted. Do not add other keys unless you deliberately want a per-task override 
 - Every `answer` is the exact content of the `answer.md` written by the script you ran in the
   venv — not a guess, not lifted from docs.
 - Every task with `needs_script` unset has BOTH `{scripts_dir}/<id>-train.py` and
-  `{scripts_dir}/<id>-test.py`, each verified by running it in an empty directory.
+  `{scripts_dir}/<id>-valid.py`, each verified by running it in an empty directory.
 - Every prompt is ONE paragraph: a goal in plain English, with no steps, no code, no package
   name, no version, no data description — only the goal and a precise statement of the output.
 - You wrote at least one task per tutorial, and covered all of them.
@@ -463,7 +487,7 @@ returns or which sign convention it uses. That is the limit.
 
 # What is NOT a mismatch
 
-- **Train and test differ on purpose.** They are two instances of one analysis with two different
+- **Train and valid differ on purpose.** They are two instances of one analysis with two different
   answers, deliberately asking about different groups, conditions, datasets, or directions. A
   difference between the two splits is the design, not a defect.
 - **A terse prompt naming no function, parameter, or output field.** Working out HOW is exactly
@@ -488,7 +512,7 @@ Write `{out}` as JSON with exactly this shape, with ONE entry for every task spl
 
 {{"reviews": [
   {{"task": "<task id>", "split": "train", "verdict": "ok"}},
-  {{"task": "<task id>", "split": "test", "verdict": "mismatch",
+  {{"task": "<task id>", "split": "valid", "verdict": "mismatch",
    "issue": "prompt says ascending; script and answer are descending",
    "fix": "say descending in the prompt, or reverse the answer"}}
 ]}}
@@ -828,120 +852,143 @@ PR; leave the changes in the working tree for the user to review with `git diff`
 edits if it is not a git repo)."""
 
 
-def draft_prompt(
+def improve_prompt(
     *,
     package: str,
     version: str,
     src: Path,
     python: Path,
-    out: Path,
+    skill_dir: Path,
+    wiki_dir: Path,
+    transcripts_dir: Path,
+    rationale_path: Path,
     skill_name: str,
+    new_version: str,
+    parent_version: str | None = None,
     feedback: str | None = None,
 ) -> str:
-    """Build the prompt for the drafting agent.
+    """Build the prompt for the improving agent, in create or improve mode.
 
-    Unlike a benchmark agent, the drafter gets read access to the target's source —
-    it is writing documentation about the package, so it needs to see it. What it gets is the
-    *filtered* copy: guidance the target already ships is stripped, so the skill it writes is
-    written from the package rather than from someone else's skill for it.
+    The improver works from the knowledge wiki (distilled per-task notes tagged
+    ``[version][model]``) plus the filtered package source. When ``parent_version`` is ``None`` it
+    is the FIRST skill and this is *create* mode — the wiki holds only the ``noskill`` baseline and
+    the staging dir is empty. Otherwise it is *improve* mode — the staging dir is pre-filled with
+    the parent skill to edit in place.
+
+    Both modes read only TRAIN-split evidence; the held-out valid split is unreachable, enforced
+    structurally and by a guard hook, not by this prompt. The source is the *filtered* copy, so a
+    skill the package itself ships cannot bias the optimization.
 
     Parameters
     ----------
-    package
-        The target package name.
-    version
-        The installed version, so the skill describes what is actually installed.
+    package, version
+        The target package name and installed version.
     src
-        The (filtered) package checkout, readable by this agent only.
+        The filtered package checkout (bundled skills/agent-guidance stripped).
     python
         The interpreter with the package installed, for verifying claims.
-    out
-        The staging directory the agent writes the skill into.
+    skill_dir
+        The staging directory. In improve mode it is pre-filled with the parent skill; in create
+        mode it is empty and the agent writes ``SKILL.md`` from scratch.
+    wiki_dir
+        The staged knowledge wiki the agent reads first.
+    transcripts_dir
+        Staged train-split transcripts, for drill-down beyond the wiki.
+    rationale_path
+        Where the agent writes its rationale — outside ``skill_dir``.
     skill_name
-        The name the frontmatter must declare — ``config.skill_name``.
+        The name the frontmatter must carry — ``config.skill_name``.
+    new_version
+        The version being produced, e.g. ``v1`` or ``v2``.
+    parent_version
+        The version being improved, or ``None`` for the first (create) skill.
     feedback
         Optional maintainer guidance, subordinated below the hard rules. ``None`` leaves the
         prompt byte-identical to a run without the flag.
 
     Returns
     -------
-    The draft prompt.
+    The improve or create prompt.
     """
-    return DRAFT_PROMPT.format(
+    common = {
+        "package": package,
+        "version": version,
+        "src": src,
+        "python": python,
+        "skill_dir": skill_dir,
+        "wiki_dir": wiki_dir,
+        "transcripts_dir": transcripts_dir,
+        "rationale_path": rationale_path,
+        "skill_name": skill_name,
+        "new_version": new_version,
+        "craft": _SKILL_CRAFT,
+        "feedback": feedback_block(feedback),
+    }
+    if parent_version is None:
+        return CREATE_PROMPT.format(**common)
+    return IMPROVE_PROMPT.format(parent_version=parent_version, **common)
+
+
+def wiki_prompt(
+    *,
+    package: str,
+    version: str,
+    src: Path,
+    python: Path,
+    task_id: str,
+    evidence_dir: Path,
+    observations_path: Path,
+    hypothesis_path: Path,
+    skill_dir: Path | None = None,
+) -> str:
+    """Build the prompt for one wiki agent (one task, one arm).
+
+    The agent reads staged copies of that arm's train-split runs and appends a terse
+    ``[version][model]`` block to the task's ``observations.md`` and ``hypothesis.md``. Brevity is
+    enforced by the prompt: the wiki is read whole by the improver every epoch and grows forever.
+
+    Parameters
+    ----------
+    package
+        The target package name, for orientation.
+    version
+        The arm label recorded in each entry: ``"noskill"`` or ``"v1"``/``"v2"``…
+    src
+        The filtered package checkout, for grounding an explanation. Never the raw checkout.
+    python
+        The interpreter with the package installed.
+    task_id
+        The task being summarised.
+    evidence_dir
+        The staged run evidence (``INDEX.md`` + per-run directories).
+    observations_path, hypothesis_path
+        The two files to append to, pre-seeded with any earlier arms' entries.
+    skill_dir
+        The arm's skill content directory, or ``None`` for ``noskill``.
+
+    Returns
+    -------
+    The wiki prompt.
+    """
+    if skill_dir is None:
+        skill_note = "This round is `noskill`, so there is no skill body — just record how the agents did unaided."
+        skill_body_note = ""
+    else:
+        skill_note = (
+            f"The skill body under review is at `{skill_dir}`; read it so your hypothesis can cite what it said."
+        )
+        skill_body_note = f"- `{skill_dir}` — the `[{version}]` skill body the runs above were given.\n"
+    return WIKI_PROMPT.format(
         package=package,
         version=version,
         src=src,
         python=python,
-        out=out,
-        skill_name=skill_name,
-        feedback=feedback_block(feedback),
-    )
-
-
-def improve_prompt(
-    *,
-    package: str,
-    version: str,
-    python: Path,
-    skill_dir: Path,
-    train_dir: Path,
-    rationale_path: Path,
-    skill_name: str,
-    parent_version: str,
-    new_version: str,
-    feedback: str | None = None,
-) -> str:
-    """Build the prompt for the improving agent.
-
-    Unlike the drafter, the improver never sees the package source — it works from the
-    current skill and the *train-split* evidence of how that skill performed. The test split
-    is unreachable, enforced structurally, not by this prompt.
-
-    The prompt separates the two outcomes the evidence records: whether the agent loaded the
-    skill (governed only by the ``description``) and whether it then succeeded (governed by the
-    body). Conflating them makes the improver rewrite body prose in response to runs where the
-    body was never read.
-
-    Parameters
-    ----------
-    package
-        The target package name.
-    version
-        The installed package version, so any verification runs against what is installed.
-    python
-        The interpreter with the package installed, for checking claims.
-    skill_dir
-        The staging directory, pre-filled with a copy of the parent skill, that the agent
-        edits in place to produce the new version.
-    train_dir
-        The directory of train-split evidence the agent reads (``SUMMARY.md`` + per-run
-        material).
-    rationale_path
-        Where the agent writes its rationale — outside ``skill_dir`` so it never becomes
-        skill content.
-    skill_name
-        The name the frontmatter must keep — ``config.skill_name``.
-    parent_version, new_version
-        The version being improved and the version being produced, e.g. ``v1`` -> ``v2``.
-    feedback
-        Optional maintainer guidance, subordinated below the hard rules. ``None`` leaves the
-        prompt byte-identical to a run without the flag.
-
-    Returns
-    -------
-    The improve prompt.
-    """
-    return IMPROVE_PROMPT.format(
-        package=package,
-        version=version,
-        python=python,
-        skill_dir=skill_dir,
-        train_dir=train_dir,
-        rationale_path=rationale_path,
-        skill_name=skill_name,
-        parent_version=parent_version,
-        new_version=new_version,
-        feedback=feedback_block(feedback),
+        task_id=task_id,
+        evidence_dir=evidence_dir,
+        observations_path=observations_path,
+        hypothesis_path=hypothesis_path,
+        skill_note=skill_note,
+        skill_body_note=skill_body_note,
     )
 
 

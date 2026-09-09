@@ -75,19 +75,34 @@ is_complete(d)  # a non-empty result.json is what "done" means
 
 ## The meta-agents
 
-`draft_skill`, `improve_skill`, `generate_tasks`, `ship_skill` are all coroutines taking
-keyword-only args (`cfg=`, `target=`, plus their own roots) and returning a result dataclass
-(`DraftResult`, `ImproveResult`, `TaskGenResult`, `ShipResult`) carrying the new `Skill`,
-`cost_usd`, `turns`, and log paths. `max_turns`/`max_usd` default to `None` = **unbounded**.
-Pass a `LiveLog` as `log=` for the JSONL feed:
+`improve_skill`, `update_wiki`, `generate_tasks`, `ship_skill` are all coroutines taking
+keyword-only args (`cfg=`, `target=`, plus their own roots) and returning a result
+(`ImproveResult`, a list of `TaskWikiResult`, `TaskGenResult`, `ShipResult`) carrying the new
+`Skill`/notes, `cost_usd`, `turns`, and log paths. `improve_skill` **creates** the first skill when
+`parent_version=None` (reading the `noskill` wiki) and improves otherwise. `max_turns`/`max_usd`
+default to `None` = **unbounded**. Pass a `LiveLog` as `log=` for the JSONL feed:
 
 ```python
-from acumen import LiveLog, draft_skill
+from acumen import LiveLog, improve_skill
 
-log = LiveLog.open(Path("logs"), "draft", stream=False)
+log = LiveLog.open(Path("logs"), "improve", stream=False)
 with log:
-    result = asyncio.run(draft_skill(cfg=cfg, target=target, skills_root=Path("skills"), auth_mode="session", log=log))
+    result = asyncio.run(
+        improve_skill(
+            cfg=cfg,
+            target=target,
+            skills_root=Path("skills"),
+            runs_root=Path("runs"),
+            wiki_root=Path("wiki"),
+            tasks=tasks,
+            auth_mode="session",
+            log=log,
+        )
+    )
 ```
+
+`resolve_epoch(skills_root, valid_complete=…)` returns the `EpochPlan` (parent, new version, and
+whether it is the first/a resumed epoch) that `acumen epoch` uses to drive the whole loop.
 
 ## Aggregating results
 
