@@ -64,6 +64,20 @@ def test_parser_requires_a_command() -> None:
         build_parser().parse_args([])
 
 
+def test_fit_parser_defaults_and_overrides() -> None:
+    """`fit` defaults to patience 2 / max-epochs 10; `--epochs` is an explicit fixed count."""
+    parser = build_parser()
+
+    args = parser.parse_args(["fit"])
+    assert args.func.__name__ == "_cmd_fit"
+    assert args.patience == 2 and args.max_epochs == 10 and args.epochs is None
+    assert args.out == Path("training.csv")
+
+    args = parser.parse_args(["fit", "--epochs", "3", "--patience", "1", "--max-epochs", "5", "--out", "curve.csv"])
+    assert args.epochs == 3 and args.patience == 1 and args.max_epochs == 5
+    assert args.out == Path("curve.csv")
+
+
 def test_progress_prints_unavailable_cost_without_casting_null(capsys: pytest.CaptureFixture[str], model: str) -> None:
     progress = _Progress(1)
     progress.running = 1

@@ -102,6 +102,14 @@ from acumen.taskgen import (
     harvest_scripts,
 )
 from acumen.tasks import Task, TaskError, TaskSplit, load_tasks, parse_tasks
+from acumen.training import (
+    EpochRow,
+    best_version,
+    build_training_rows,
+    epochs_since_best,
+    patience_exhausted,
+    write_training_csv,
+)
 from acumen.trajectory import Trajectory, render_trajectory
 from acumen.transcript import (
     build_trajectory,
@@ -120,6 +128,12 @@ from acumen.wiki import (
 )
 
 __all__ = [
+    "EpochRow",
+    "build_training_rows",
+    "write_training_csv",
+    "patience_exhausted",
+    "best_version",
+    "epochs_since_best",
     "EpochPlan",
     "resolve_epoch",
     "find_valid_access",

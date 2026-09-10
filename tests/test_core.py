@@ -138,6 +138,13 @@ from acumen.ship import _ship_env
 from acumen.skills import SkillError, load_skill, read_meta, skill_hash, write_meta
 from acumen.taskgen import dump_tasks, harvest_scripts
 from acumen.tasks import Task, TaskError, TaskSplit, load_tasks, parse_tasks
+from acumen.training import (
+    best_version,
+    build_training_rows,
+    epochs_since_best,
+    patience_exhausted,
+    write_training_csv,
+)
 from acumen.trajectory import (
     Metrics,
     Observation,
@@ -4659,3 +4666,74 @@ def test_meta_model_defaults_to_the_first_benchmark_model() -> None:
 
     named = parse_config({"repo": "/tmp/target-demo", "meta_model": "claude-haiku-4-5-20251001"})
     assert named.meta_model == "claude-haiku-4-5-20251001"
+
+
+# --- training curve (acumen fit) --------------------------------------------------------
+
+
+def test_epochs_since_best_and_patience_use_strict_best_so_far() -> None:
+    """Improvement is strict > best-so-far; ties/worse count as no-improvement."""
+    assert epochs_since_best([0.79]) == 0
+    assert epochs_since_best([0.79, 0.70]) == 1
+    assert epochs_since_best([0.79, 0.70, 0.75]) == 2  # best is still v1
+    # A later tie does not reset the best (must strictly beat it).
+    assert epochs_since_best([0.8, 0.8]) == 1
+
+    assert patience_exhausted([0.79], 2) is False
+    assert patience_exhausted([0.79, 0.70], 2) is False
+    assert patience_exhausted([0.79, 0.70, 0.75], 2) is True
+    # v1-best -> v2-worse -> v3-worse-than-v1 stops at patience 2 (the user's example).
+    assert patience_exhausted([0.79, 0.70, 0.75], 1) is True
+
+
+def test_build_training_rows_maps_arms_and_computes_means(tmp_path: Path, make_result) -> None:
+    """Epoch N's train arm is v(N-1)/noskill; its valid arm is vN. Means are per-model and overall."""
+    runs = tmp_path / "runs"
+    cfg = parse_config({"repo": "https://example.com/pkg", "models": ["m1", "m2"]})
+
+    def run(arm: str, split: str, model: str, ok: bool) -> None:
+        make_result(runs, RunKey(arm=arm, split=split, model=model, task_id="t", rep=1), success=ok, cost_usd=0.10)
+
+    # noskill: train m1 pass / m2 fail (-> v1's train = 0.5); valid is the baseline, unused by v1.
+    run("noskill", "train", "m1", True)
+    run("noskill", "train", "m2", False)
+    run("noskill", "valid", "m1", True)
+    run("noskill", "valid", "m2", True)
+    # v1: valid both pass (-> v1 valid = 1.0); train both pass (-> v2's train = 1.0).
+    run("skill_v1", "valid", "m1", True)
+    run("skill_v1", "valid", "m2", True)
+    run("skill_v1", "train", "m1", True)
+    run("skill_v1", "train", "m2", True)
+    # v2: valid m1 fail / m2 pass (-> v2 valid = 0.5).
+    run("skill_v2", "valid", "m1", False)
+    run("skill_v2", "valid", "m2", True)
+
+    rows = build_training_rows(runs, cfg)
+    assert [(r.epoch, r.version, r.parent) for r in rows] == [(1, "v1", "noskill"), (2, "v2", "v1")]
+
+    v1, v2 = rows
+    assert v1.train_success == 0.5 and v1.valid_success == 1.0
+    assert v1.train_success_by_model == {"m1": 1.0, "m2": 0.0}
+    assert v2.train_success == 1.0 and v2.valid_success == 0.5
+    assert v2.valid_success_by_model == {"m1": 0.0, "m2": 1.0}
+    # Cost is a mean per run, and every run here was priced.
+    assert v1.valid_cost == pytest.approx(0.10)
+
+    assert best_version(rows) == "v1"
+
+
+def test_write_training_csv_roundtrips_header_and_per_model_columns(tmp_path: Path, make_result) -> None:
+    runs = tmp_path / "runs"
+    cfg = parse_config({"repo": "https://example.com/pkg", "models": ["m1", "m2"]})
+    make_result(runs, RunKey(arm="noskill", split="train", model="m1", task_id="t", rep=1), success=True)
+    make_result(runs, RunKey(arm="skill_v1", split="valid", model="m1", task_id="t", rep=1), success=True)
+
+    out = tmp_path / "training.csv"
+    write_training_csv(build_training_rows(runs, cfg), out)
+    lines = out.read_text().splitlines()
+    header = lines[0].split(",")
+    assert header[:3] == ["epoch", "version", "parent"]
+    for model in ("m1", "m2"):
+        for prefix in ("train_success", "valid_success", "train_cost", "valid_cost"):
+            assert f"{prefix}__{model}" in header
+    assert lines[1].startswith("1,v1,noskill,")

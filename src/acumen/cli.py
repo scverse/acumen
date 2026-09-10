@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import sys
 import tempfile
 import time
@@ -30,7 +31,7 @@ from acumen.check import (
 )
 from acumen.config import Config, ConfigError, load_config
 from acumen.env import DEFAULT_CACHE_ROOT, AuthMode, EnvError, prepare_target, resolve_auth_mode
-from acumen.epoch import resolve_epoch
+from acumen.epoch import EpochPlan, resolve_epoch
 from acumen.grade import INVALID_REASONS
 from acumen.improve import ImproveError, improve_skill
 from acumen.logs import LiveLog
@@ -54,6 +55,14 @@ from acumen.ship import ShipError, ship_skill
 from acumen.skills import Skill, SkillError, available_versions, latest_version, load_skill, skill_dir
 from acumen.taskgen import TaskGenError, generate_tasks
 from acumen.tasks import Task, TaskError, load_tasks
+from acumen.training import (
+    EpochRow,
+    best_version,
+    build_training_rows,
+    epochs_since_best,
+    patience_exhausted,
+    write_training_csv,
+)
 from acumen.wiki import WikiError, collect_arm_runs, update_wiki
 
 
@@ -284,6 +293,38 @@ def _fmt_tokens(value: int) -> str:
 def _fmt_cost(value: float | None) -> str:
     """Format a known cost without presenting unavailable pricing as free."""
     return f"${value:.2f}" if value is not None else "cost n/a"
+
+
+def _fmt_rate(value: float | None) -> str:
+    """Format a 0..1 success rate as a percentage, or ``n/a`` when unknown."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "n/a"
+    return f"{value:.0%}"
+
+
+def _epoch_bar(
+    done: int,
+    total: int,
+    row: EpochRow | None,
+    *,
+    best: str | None,
+    patience: int,
+    since_best: int,
+    fixed: bool,
+) -> str:
+    """A tqdm-style one-liner summarising an epoch: bar, version, train/valid success, patience."""
+    width = 14
+    filled = round(width * done / total) if total else width
+    bar = "█" * filled + "░" * (width - filled)
+    version = row.version if row is not None else "?"
+    train = _fmt_rate(row.train_success) if row is not None else "n/a"
+    valid = _fmt_rate(row.valid_success) if row is not None else "n/a"
+    parts = [f"Epoch {done}/{total} |{bar}| {version}", f"train {train}", f"valid {valid}"]
+    if row is not None and not (isinstance(row.valid_cost, float) and math.isnan(row.valid_cost)):
+        parts.append(f"${row.valid_cost:.2f}/run")
+    if not fixed and best is not None:
+        parts.append(f"(best {best}, patience {min(since_best, patience)}/{patience})")
+    return "  ".join(parts)
 
 
 @dataclass(frozen=True)
@@ -716,16 +757,43 @@ def _cmd_wiki(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_epoch(args: argparse.Namespace) -> int:
-    cfg = load_config(args.config)
-    tasks = load_tasks(args.tasks)
-    if args.max_concurrency:
-        cfg = replace(cfg, max_concurrency=args.max_concurrency)
-    if args.replicates:
-        cfg = replace(cfg, n_replicates=args.replicates)
-    if args.model:
-        cfg = replace(cfg, meta_model=args.model)
+def _prepare_pass(cfg: Config, args: argparse.Namespace):
+    """Resolve auth, freeze prices, and build the target once for a pass that spends on benches.
 
+    Shared by ``epoch`` and ``fit`` so a multi-epoch run prepares the target and rates once rather
+    than per epoch. Raises :class:`PriceFeedError` if rates cannot be established (benchmark cost is
+    frozen into every result, so a pass must not run without them).
+    """
+    auth_modes = _resolve_bench_auth(set(cfg.models) | {cfg.meta_model}, args.auth)
+    meta_auth = auth_modes[provider_for_model(cfg.meta_model)]
+    prices = _bench_prices(cfg)
+    _warn_unpriced(set(cfg.models) | {cfg.meta_model}, prices)
+    print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
+    target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
+    print(f"target ready: {target.fingerprint} @ {target.commit[:8]} (venv {target.venv_dir})", flush=True)
+    return auth_modes, meta_auth, prices, target
+
+
+def _run_one_epoch(
+    args: argparse.Namespace,
+    *,
+    cfg: Config,
+    tasks: list[Task],
+    target,
+    prices: PriceTable,
+    auth_modes: dict[AgentProvider, AuthMode],
+    meta_auth: AuthMode,
+) -> EpochPlan:
+    """Run one training epoch on an already-prepared pass, returning the resolved plan.
+
+    The four steps: bench the parent arm on train (the first epoch also benches the noskill
+    baseline on valid), distil that arm into the wiki, create or improve the skill (skipped when
+    the version already exists — a resumed epoch), then bench the new version on valid.
+
+    Auth, prices, and the target are passed in, not re-derived, so ``fit`` runs many epochs against
+    one prepared target. Raises :class:`BenchmarkInvalidError` if a harness failure decides a bench;
+    the caller reports it.
+    """
     runs_root = args.runs
 
     def valid_complete(version: str) -> bool:
@@ -734,24 +802,8 @@ def _cmd_epoch(args: argparse.Namespace) -> int:
 
     plan = resolve_epoch(args.skills, valid_complete=valid_complete)
     parent_label = plan.parent_version or arm_name(None)
-    wiki_version = parent_label
     tail = " (resuming)" if plan.resumed else ""
     print(f"epoch: learning from [{parent_label}] → producing {plan.new_version}{tail}")
-
-    # Auth for every provider the epoch touches: the benchmark models and the meta model.
-    auth_modes = _resolve_bench_auth(set(cfg.models) | {cfg.meta_model}, args.auth)
-    meta_auth = auth_modes[provider_for_model(cfg.meta_model)]
-    # Benchmark runs freeze their cost, so a pass must establish rates before it spends anything.
-    try:
-        prices = _bench_prices(cfg)
-    except PriceFeedError as err:
-        print(f"error: {err}", file=sys.stderr)
-        print("Retry when the pricing pages are reachable, or pin rates in config.yaml.", file=sys.stderr)
-        return 2
-    _warn_unpriced(set(cfg.models) | {cfg.meta_model}, prices)
-    print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
-    target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
-    print(f"target ready: {target.fingerprint} @ {target.commit[:8]} (venv {target.venv_dir})", flush=True)
 
     # Step 1 — bench the parent arm on the training signal. The first epoch also benches the
     # noskill baseline on valid, so the report has an in-epoch baseline to compare against.
@@ -762,28 +814,17 @@ def _cmd_epoch(args: argparse.Namespace) -> int:
     print(f"\n[1/4] benchmarking [{parent_label}] on the training signal ...", flush=True)
     arms = _build_arms(train_specs, cfg=cfg, tasks=tasks, runs_root=runs_root, skills_root=args.skills)
     _print_plan(arms)
-    try:
-        _execute_arms(
-            arms,
-            cfg=cfg,
-            target=target,
-            runs_root=runs_root,
-            auth_modes=auth_modes,
-            prices=prices,
-            keep_sandboxes=False,
-        )
-    except BenchmarkInvalidError as err:
-        print(f"\nerror: {err}", file=sys.stderr)
-        _invalid_bench_note()
-        return 2
+    _execute_arms(
+        arms, cfg=cfg, target=target, runs_root=runs_root, auth_modes=auth_modes, prices=prices, keep_sandboxes=False
+    )
 
     # Step 2 — distil that arm into the wiki (idempotent: recorded arms are skipped).
-    print(f"\n[2/4] updating the wiki for [{wiki_version}] ...", flush=True)
+    print(f"\n[2/4] updating the wiki for [{parent_label}] ...", flush=True)
     _run_wiki(
         cfg=cfg,
         tasks=tasks,
         target=target,
-        version=wiki_version,
+        version=parent_label,
         runs_root=runs_root,
         wiki_root=args.wiki,
         skills_root=args.skills,
@@ -830,15 +871,38 @@ def _cmd_epoch(args: argparse.Namespace) -> int:
         [(plan.new_version, ["valid"])], cfg=cfg, tasks=tasks, runs_root=runs_root, skills_root=args.skills
     )
     _print_plan(valid_arms)
+    _execute_arms(
+        valid_arms,
+        cfg=cfg,
+        target=target,
+        runs_root=runs_root,
+        auth_modes=auth_modes,
+        prices=prices,
+        keep_sandboxes=False,
+    )
+    return plan
+
+
+def _cmd_epoch(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    tasks = load_tasks(args.tasks)
+    if args.max_concurrency:
+        cfg = replace(cfg, max_concurrency=args.max_concurrency)
+    if args.replicates:
+        cfg = replace(cfg, n_replicates=args.replicates)
+    if args.model:
+        cfg = replace(cfg, meta_model=args.model)
+
     try:
-        _execute_arms(
-            valid_arms,
-            cfg=cfg,
-            target=target,
-            runs_root=runs_root,
-            auth_modes=auth_modes,
-            prices=prices,
-            keep_sandboxes=False,
+        auth_modes, meta_auth, prices, target = _prepare_pass(cfg, args)
+    except PriceFeedError as err:
+        print(f"error: {err}", file=sys.stderr)
+        print("Retry when the pricing pages are reachable, or pin rates in config.yaml.", file=sys.stderr)
+        return 2
+
+    try:
+        plan = _run_one_epoch(
+            args, cfg=cfg, tasks=tasks, target=target, prices=prices, auth_modes=auth_modes, meta_auth=meta_auth
         )
     except BenchmarkInvalidError as err:
         print(f"\nerror: {err}", file=sys.stderr)
@@ -847,6 +911,70 @@ def _cmd_epoch(args: argparse.Namespace) -> int:
 
     print(f"\nepoch complete: {plan.new_version} produced and benched on valid.")
     print("next: `acumen report` to see it, or `acumen epoch` again for another round")
+    return 0
+
+
+def _cmd_fit(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    tasks = load_tasks(args.tasks)
+    if args.max_concurrency:
+        cfg = replace(cfg, max_concurrency=args.max_concurrency)
+    if args.replicates:
+        cfg = replace(cfg, n_replicates=args.replicates)
+    if args.model:
+        cfg = replace(cfg, meta_model=args.model)
+
+    fixed = args.epochs is not None
+    limit = args.epochs if fixed else args.max_epochs
+    if limit < 1:
+        print("error: nothing to run — --epochs/--max-epochs must be >= 1", file=sys.stderr)
+        return 2
+    if fixed:
+        print(f"fit: running exactly {limit} epoch(s) (early stopping disabled)")
+    else:
+        print(f"fit: up to {limit} epoch(s), early stopping with patience {args.patience}")
+
+    try:
+        auth_modes, meta_auth, prices, target = _prepare_pass(cfg, args)
+    except PriceFeedError as err:
+        print(f"error: {err}", file=sys.stderr)
+        print("Retry when the pricing pages are reachable, or pin rates in config.yaml.", file=sys.stderr)
+        return 2
+
+    for done in range(limit):
+        print(f"\n{'═' * 78}\nEPOCH {done + 1}/{limit}\n{'═' * 78}", flush=True)
+        try:
+            plan = _run_one_epoch(
+                args, cfg=cfg, tasks=tasks, target=target, prices=prices, auth_modes=auth_modes, meta_auth=meta_auth
+            )
+        except BenchmarkInvalidError as err:
+            print(f"\nerror: {err}", file=sys.stderr)
+            _invalid_bench_note()
+            return 2
+
+        # Rebuild the whole training curve from runs/ each epoch, so the CSV is always consistent
+        # with what exists and a resumed fit produces the same table.
+        rows = build_training_rows(args.runs, cfg, tasks)
+        write_training_csv(rows, args.out)
+        current = next((row for row in rows if row.version == plan.new_version), None)
+        valids = [row.valid_success for row in rows]
+        best = best_version(rows)
+        since = epochs_since_best(valids)
+        print(_epoch_bar(done + 1, limit, current, best=best, patience=args.patience, since_best=since, fixed=fixed))
+
+        if not fixed and patience_exhausted(valids, args.patience):
+            print(f"\nearly stop: validation mean success did not improve in {args.patience} epoch(s).")
+            break
+
+    rows = build_training_rows(args.runs, cfg, tasks)
+    best = best_version(rows)
+    if best is not None:
+        best_row = next(row for row in rows if row.version == best)
+        print(f"\nfit complete: best version {best} (valid {_fmt_rate(best_row.valid_success)}).")
+    else:
+        print("\nfit complete.")
+    print(f"training curve → {args.out.resolve()}")
+    print("next: `acumen report` for the full breakdown")
     return 0
 
 
@@ -1492,6 +1620,39 @@ def build_parser() -> argparse.ArgumentParser:
     _add_feedback_arg(epoch, extra=" (passed to the improver; do NOT paste valid-split answers)")
     _add_log_args(epoch)
     epoch.set_defaults(func=_cmd_epoch)
+
+    fit = sub.add_parser(
+        "fit",
+        help="run many training epochs with early stopping (like training a model)",
+        description="Run `acumen epoch` back to back until validation stops improving (patience) or "
+        "a hard cap is hit, writing a per-epoch training curve to training.csv and a progress line "
+        "each epoch. Fully resumable — re-run to continue.",
+    )
+    fit.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
+    fit.add_argument("--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml")
+    fit.add_argument("--runs", type=Path, default=Path("runs"), help="root of the run tree")
+    fit.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
+    fit.add_argument("--wiki", type=Path, default=Path("wiki"), help="root of the knowledge wiki")
+    fit.add_argument("--out", type=Path, default=Path("training.csv"), help="training-curve CSV to write")
+    fit.add_argument(
+        "--patience", type=int, default=2, help="stop after this many epochs with no validation gain (default: 2)"
+    )
+    fit.add_argument("--max-epochs", type=int, default=10, help="hard cap on epochs (default: 10)")
+    fit.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="run exactly this many epochs (disables early stopping and ignores --max-epochs)",
+    )
+    fit.add_argument("--model", help="override config meta_model")
+    fit.add_argument("--max-concurrency", type=int, help="override config max_concurrency")
+    fit.add_argument("--replicates", type=int, help="override config n_replicates")
+    fit.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
+    fit.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
+    _add_auth_arg(fit)
+    _add_feedback_arg(fit, extra=" (passed to the improver; do NOT paste valid-split answers)")
+    _add_log_args(fit)
+    fit.set_defaults(func=_cmd_fit)
 
     tasks_cmd = sub.add_parser("tasks", help="autonomously generate a tasks.yaml from the target package")
     tasks_cmd.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
