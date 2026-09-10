@@ -186,6 +186,25 @@ def _metrics_from(usage: dict[str, Any] | None) -> Metrics | None:
     return None if metrics.is_empty() else metrics
 
 
+def _claude_metrics(usage: dict[str, Any] | None) -> Metrics | None:
+    """Footer metrics for a Claude run from its authoritative usage (``ResultMessage.usage``).
+
+    This is the one usage figure the whole run is billed on, and it is what ``result.json`` records.
+    It must NOT be reconstructed by summing the session file's per-message usage: each Claude turn
+    re-sends the whole conversation, so every turn's ``usage`` already counts the cached prefix, and
+    summing them across turns overcounts (the same context, billed once, added once per turn). The
+    numbers are normalized so the footer matches ``result.json``: ``input`` is the total input
+    (fresh + cache read + cache write), ``cached`` is the cache-read count, output as reported.
+    """
+    if not usage:
+        return None
+    from acumen.prices import normalize_usage
+
+    norm = normalize_usage(usage, provider="claude")
+    metrics = Metrics(input_tokens=norm.input, output_tokens=norm.output, cached_tokens=norm.cache_read)
+    return None if metrics.is_empty() else metrics
+
+
 # ── Codex mapper ─────────────────────────────────────────────────────────────────────────
 
 
@@ -285,12 +304,19 @@ def _codex_step(item: dict[str, Any], index: int, *, incomplete: bool) -> _StepB
 # ── Claude Code mapper ─────────────────────────────────────────────────────────────────────
 
 
-def from_claude_records(records: list[dict[str, Any]], *, prompt: str = "") -> Trajectory:
+def from_claude_records(
+    records: list[dict[str, Any]], *, prompt: str = "", usage: dict[str, Any] | None = None
+) -> Trajectory:
     """Map Claude's SDK-native session records (already parsed) into a :class:`Trajectory`.
 
     Assistant messages become agent steps (text, thinking as reasoning, ``tool_use`` blocks as
     tool calls); a user message's ``tool_result`` blocks become observations attached to the step
     that issued the matching call. The run's first plain-string user message is the prompt.
+
+    ``usage`` is the run's authoritative ``ResultMessage.usage``; when given, the footer reports it
+    (matching ``result.json``). It is only reconstructed by summing the session file's per-message
+    usage — which overcounts, since each turn re-counts the cached context — when no authoritative
+    usage is available (e.g. rendering a bare transcript file with no result to hand).
     """
     session = ""
     model = ""
@@ -308,12 +334,12 @@ def from_claude_records(records: list[dict[str, Any]], *, prompt: str = "") -> T
         content = message.get("content")
         if rtype == "assistant":
             model = model or str(message.get("model") or "")
-            usage = message.get("usage")
-            if isinstance(usage, dict):
+            msg_usage = message.get("usage")
+            if isinstance(msg_usage, dict):
                 saw_usage = True
-                usage_totals["input_tokens"] += int(usage.get("input_tokens") or 0)
-                usage_totals["output_tokens"] += int(usage.get("output_tokens") or 0)
-                usage_totals["cached_tokens"] += int(usage.get("cache_read_input_tokens") or 0)
+                usage_totals["input_tokens"] += int(msg_usage.get("input_tokens") or 0)
+                usage_totals["output_tokens"] += int(msg_usage.get("output_tokens") or 0)
+                usage_totals["cached_tokens"] += int(msg_usage.get("cache_read_input_tokens") or 0)
             builder = _StepBuilder(index=len(steps) + 1, source="agent")
             for block in content if isinstance(content, list) else []:
                 _apply_assistant_block(block, builder, by_call)
@@ -329,7 +355,7 @@ def from_claude_records(records: list[dict[str, Any]], *, prompt: str = "") -> T
             detail = record.get("subtype") or record.get("result") or record.get("error")
             errors.append(str(detail or "run reported an error"))
 
-    metrics = _metrics_from(usage_totals) if saw_usage else None
+    metrics = _claude_metrics(usage) if usage else (_metrics_from(usage_totals) if saw_usage else None)
     return Trajectory(
         harness="claude-code",
         session_id=session,
@@ -398,8 +424,12 @@ def _result_text(content: Any) -> str:
     return "" if content is None else str(content)
 
 
-def from_claude_transcript(jsonl: Path, *, prompt: str = "") -> Trajectory | None:
-    """Read a Claude SDK-native session file and map it. ``None`` if the file cannot be read."""
+def from_claude_transcript(jsonl: Path, *, prompt: str = "", usage: dict[str, Any] | None = None) -> Trajectory | None:
+    """Read a Claude SDK-native session file and map it. ``None`` if the file cannot be read.
+
+    ``usage`` is the run's authoritative ``ResultMessage.usage`` for the footer (see
+    :func:`from_claude_records`).
+    """
     try:
         lines = jsonl.read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -412,7 +442,7 @@ def from_claude_transcript(jsonl: Path, *, prompt: str = "") -> Trajectory | Non
             continue
         if isinstance(record, dict):
             records.append(record)
-    return from_claude_records(records, prompt=prompt)
+    return from_claude_records(records, prompt=prompt, usage=usage)
 
 
 # ── The one renderer ─────────────────────────────────────────────────────────────────────

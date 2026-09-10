@@ -1826,6 +1826,39 @@ def test_from_claude_records_maps_messages_and_attaches_observations() -> None:
     assert traj.usage == Metrics(input_tokens=10, output_tokens=3, cached_tokens=2)
 
 
+def test_from_claude_records_uses_authoritative_usage_not_the_per_message_sum() -> None:
+    """The footer must report the run's billed usage, not a sum of per-turn usage.
+
+    Each Claude turn re-sends the whole conversation, so every turn's ``usage`` already counts the
+    cached prefix; summing across turns overcounts. When the caller passes the authoritative
+    ``ResultMessage.usage``, the footer reports that (normalized: input is the total, cached is the
+    cache-read count) rather than the JSONL sum. Two assistant turns also guard against the
+    parameter being shadowed by the loop's per-message variable.
+    """
+    turn = {
+        "type": "assistant",
+        "message": {
+            "model": "claude-opus-5",
+            "usage": {"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 1000},
+            "content": [{"type": "text", "text": "step"}],
+        },
+    }
+    records = [turn, turn]
+
+    # No authoritative usage -> the per-message sum (the historical, overcounting fallback).
+    assert from_claude_records(records).usage == Metrics(input_tokens=200, output_tokens=100, cached_tokens=2000)
+
+    # Authoritative usage -> reported as-is (normalized): input = fresh + read + write.
+    authoritative = {
+        "input_tokens": 5,
+        "cache_read_input_tokens": 1000,
+        "cache_creation_input_tokens": 200,
+        "output_tokens": 60,
+    }
+    traj = from_claude_records(records, usage=authoritative)
+    assert traj.usage == Metrics(input_tokens=1205, output_tokens=60, cached_tokens=1000)
+
+
 def test_render_trajectory_and_json_roundtrip(tmp_path: Path) -> None:
     """One renderer serves any trajectory, and to_dict/write_trajectory_json produce the artifact."""
     traj = Trajectory(
