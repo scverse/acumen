@@ -28,12 +28,6 @@ alone is a complete install:
 | Codex only | `pip install acumen` | the `codex` CLI on `PATH`, plus a Codex login or key |
 | both | `pip install acumen[all]` | both of the above |
 
-To install the acumen skill (guidance for using acumen itself) into your agent:
-
-```bash
-acumen-install-skills --agent claude   # or codex, agents, claude-science; or --dest <dir>
-```
-
 ## Quickstart
 
 ```bash
