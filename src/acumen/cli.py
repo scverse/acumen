@@ -1165,7 +1165,7 @@ def _cmd_fit(args: argparse.Namespace) -> int:
 
         # Rebuild the whole training curve from runs/ each epoch, so the CSV is always consistent
         # with what exists and a resumed fit produces the same table.
-        rows = build_training_rows(args.runs, cfg, tasks)
+        rows = build_training_rows(args.runs, cfg)
         write_training_csv(rows, args.out)
         current = next((row for row in rows if row.version == plan.new_version), None)
         valids = [row.valid_success for row in rows]
@@ -1177,7 +1177,7 @@ def _cmd_fit(args: argparse.Namespace) -> int:
             print(f"\nearly stop: validation mean success did not improve in {args.patience} epoch(s).")
             break
 
-    rows = build_training_rows(args.runs, cfg, tasks)
+    rows = build_training_rows(args.runs, cfg)
     best = best_version(rows)
     if best is not None:
         best_row = next(row for row in rows if row.version == best)

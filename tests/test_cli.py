@@ -213,6 +213,56 @@ def test_phase_bar_surfaces_provider_exhaustion(capsys: pytest.CaptureFixture[st
     assert "usage limit reached" in capsys.readouterr().err
 
 
+def test_cmd_fit_calls_build_training_rows_with_two_args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: `_cmd_fit` must call `build_training_rows(runs, cfg)` — the 3-arg call it shipped
+    with throws only after a full epoch runs, so the suite never caught it. Stand in a two-arg
+    `build_training_rows` (mirroring the real signature) and no-op the epoch/prep so the post-epoch
+    path runs end to end."""
+    import types
+
+    import acumen.cli as cli
+
+    assert main(["init", "--dir", str(tmp_path)]) == 0
+
+    monkeypatch.setattr(cli, "_prepare_pass", lambda cfg, args: ({}, "session", None, None))
+    monkeypatch.setattr(
+        cli,
+        "_run_one_epoch",
+        lambda *a, **k: types.SimpleNamespace(new_version="v1", first=True, resumed=False, parent_version=None),
+    )
+    calls: list[tuple] = []
+
+    def fake_rows(runs_root: Path, cfg: object) -> list:  # two positional args, like the real one
+        calls.append((runs_root, cfg))
+        return []
+
+    monkeypatch.setattr(cli, "build_training_rows", fake_rows)
+    monkeypatch.setattr(cli, "write_training_csv", lambda rows, out: Path(out).write_text("version\n"))
+
+    rc = main(
+        [
+            "fit",
+            "--epochs",
+            "1",
+            "--config",
+            str(tmp_path / "config.yaml"),
+            "--tasks",
+            str(tmp_path / "tasks.yaml"),
+            "--runs",
+            str(tmp_path / "runs"),
+            "--skills",
+            str(tmp_path / "skills"),
+            "--wiki",
+            str(tmp_path / "wiki"),
+            "--out",
+            str(tmp_path / "training.csv"),
+        ]
+    )
+    assert rc == 0
+    assert calls, "build_training_rows was never called"
+    assert (tmp_path / "training.csv").is_file()
+
+
 def test_init_writes_files_the_loaders_accept(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     assert main(["init", "--dir", str(tmp_path)]) == 0
 
