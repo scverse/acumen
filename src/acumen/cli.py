@@ -423,8 +423,8 @@ class _PhaseBar:
         parts = [f"{self.label:>14} {pct:>3}%|{_progress_bar(self.done, self.total)}| {self.done}/{self.total}"]
         parts.append(f"[{_fmt_secs(self._elapsed)}]")
         if self.track_success:
-            parts.append(f"success {_fmt_rate(self.passed / self.done if self.done else None)}")
-        parts.append(_fmt_cost(self.cost))
+            parts.append(f"success {_fmt_rate(self.passed / self.done if self.done else None)} (mean)")
+        parts.append(f"{_fmt_cost(self.cost)} total")
         return "  ".join(parts)
 
     def _surface_error(self, outcome: RunOutcome) -> None:
