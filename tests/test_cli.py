@@ -263,6 +263,44 @@ def test_cmd_fit_calls_build_training_rows_with_two_args(tmp_path: Path, monkeyp
     assert (tmp_path / "training.csv").is_file()
 
 
+def test_codex_trace_regex_matches_tracing_but_not_sandbox_errors() -> None:
+    from acumen.agents import _CODEX_TRACE_RE
+
+    assert _CODEX_TRACE_RE.match(
+        "2026-09-11T18:47:29.074013Z ERROR codex_core::session: failed to record rollout items: thread x not found"
+    )
+    assert _CODEX_TRACE_RE.match("2026-09-11T19:03:53.787568Z ERROR codex_app_server::bespoke_event_handling: boom")
+    assert _CODEX_TRACE_RE.match("2026-09-11T18:54:06.188252Z ERROR codex_core::tools::router: error=exec_command")
+    assert not _CODEX_TRACE_RE.match("bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted")
+    assert not _CODEX_TRACE_RE.match("a plain tool warning with no codex prefix")
+
+
+def test_drain_stderr_hides_codex_tracing_but_keeps_it_for_sandbox_detection() -> None:
+    """Codex tracing is dropped from the console but stays in the sink; bwrap errors still show."""
+    import asyncio
+
+    from acumen.agents import _drain_stderr
+
+    async def drive() -> tuple[list[str], list[str]]:
+        reader = asyncio.StreamReader()
+        for chunk in (
+            b"2026-09-11T18:47:29.074013Z ERROR codex_core::session: failed to record rollout items: thread x\n",
+            b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted\n",
+            b"Reading additional input from stdin...\n",
+        ):
+            reader.feed_data(chunk)
+        reader.feed_eof()
+        shown: list[str] = []
+        sink: list[str] = []
+        await _drain_stderr(reader, shown.append, sink)
+        return shown, sink
+
+    shown, sink = asyncio.run(drive())
+    assert shown == ["bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"]
+    assert any("failed to record rollout items" in line for line in sink)  # kept for _sandbox_failure
+    assert not any("Reading additional input" in line for line in sink)  # stdin notice dropped entirely
+
+
 def test_init_writes_files_the_loaders_accept(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     assert main(["init", "--dir", str(tmp_path)]) == 0
 

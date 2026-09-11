@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import re
 import shlex
 import shutil
 import signal
@@ -972,6 +973,15 @@ def _codex_terminal(
 # but reads as a confusing prompt to anyone watching the run, so drop it before it surfaces.
 _CODEX_STDIN_NOTICE = "Reading additional input from stdin"
 
+# Codex's own ``tracing`` logs, shaped ``<RFC3339 timestamp>Z <LEVEL> codex_<module>: <msg>``.
+# They report Codex-internal events (rollout writes after a session ends, commands the sandbox
+# denies under ``approval_policy="never"``, the model's malformed ``apply_patch`` attempts) that
+# are captured in the run transcript anyway and never signal an acumen fault — so they are noise
+# on the console, and worse they corrupt the ``\r`` progress bars. Kept in the noise sink for
+# sandbox-failure detection, but never echoed. Real bwrap/kernel sandbox errors are bare (no
+# ``codex_`` prefix), so they still print and are still detected.
+_CODEX_TRACE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+(?:ERROR|WARN|INFO|DEBUG|TRACE)\s+codex")
+
 
 async def _drain_stderr(
     stream: asyncio.StreamReader,
@@ -984,6 +994,8 @@ async def _drain_stderr(
             continue
         if sink is not None:
             sink.append(text)
+        if _CODEX_TRACE_RE.match(text):
+            continue
         if callback is not None:
             callback(text)
         else:
