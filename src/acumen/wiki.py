@@ -459,6 +459,7 @@ async def update_wiki(
     max_usd: float | None = None,
     log_dir: Path | None = None,
     stream: bool = False,
+    on_plan: Callable[[int], None] | None = None,
     on_task_done: Callable[[TaskWikiResult], None] | None = None,
 ) -> list[TaskWikiResult]:
     """Append one arm's train-split notes to the wiki, one agent per task, in parallel.
@@ -498,6 +499,11 @@ async def update_wiki(
     # The arm's skill content directory, shown to the agent so hypotheses can cite it. ``noskill``
     # has none. Resolved once here; the leaf agent only copies from it.
     skill_body_src = None if arm == noskill else _skill_dir(skills_root, version)
+
+    # Announce how many tasks will actually run (recorded ones are skipped in ``one``), so a
+    # progress bar has an accurate denominator without duplicating the skip predicate.
+    if on_plan is not None:
+        on_plan(sum(1 for task in tasks if arm not in recorded_arms(wiki_task_dir(wiki_root, task.id))))
 
     holder = Path(tempfile.mkdtemp(prefix="acumen-wiki-source-"))
     results: list[TaskWikiResult] = []

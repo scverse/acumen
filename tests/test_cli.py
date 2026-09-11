@@ -153,6 +153,66 @@ def test_progress_prints_provider_exhaustion_as_invalid(capsys: pytest.CaptureFi
     assert "usage limit reached" in captured.err
 
 
+def _run_outcome(model: str, *, success: bool, cost: float | None) -> RunOutcome:
+    return RunOutcome(
+        key=RunKey(arm="noskill", split="train", model=model, task_id="task", rep=1),
+        success=success,
+        reason="ok",
+        payload={
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "cost_usd": cost,
+            "cost_available": cost is not None,
+            "duration_s": 0.1,
+        },
+    )
+
+
+def test_progress_mode_prefers_verbose_then_bars_then_plain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--verbose wins; otherwise bars need a TTY and no --stream; else plain."""
+    from acumen.cli import _progress_mode, build_parser
+
+    def mode(argv: list[str], *, tty: bool) -> str:
+        monkeypatch.setattr("sys.stdout.isatty", lambda: tty)
+        return _progress_mode(build_parser().parse_args(argv))
+
+    assert mode(["fit", "--verbose"], tty=True) == "verbose"
+    assert mode(["fit"], tty=True) == "bars"
+    assert mode(["fit"], tty=False) == "plain"
+    assert mode(["fit", "--stream"], tty=True) == "plain"  # a scrolling transcript clashes with \r bars
+
+
+def test_phase_bar_final_line_reports_running_success_and_cost(capsys: pytest.CaptureFixture[str], model: str) -> None:
+    """The bar's completed line shows done/total, the mean success rate, and summed cost."""
+    from acumen.cli import _PhaseBar
+
+    bar = _PhaseBar("bench train", 4, "plain")
+    for success, cost in [(True, 0.10), (False, 0.20), (True, 0.30), (True, None)]:
+        bar.on_done(_run_outcome(model, success=success, cost=cost))
+    bar.finish()
+
+    line = capsys.readouterr().out.strip().splitlines()[-1]
+    assert "4/4" in line and "100%" in line
+    assert "success 75%" in line  # 3 of 4 passed
+    assert "$0.60" in line  # 0.10 + 0.20 + 0.30, the priced runs only
+
+
+def test_phase_bar_surfaces_provider_exhaustion(capsys: pytest.CaptureFixture[str], model: str) -> None:
+    """Genuine harness failures must reach stderr even though bars hide ordinary fails."""
+    from acumen.cli import _PhaseBar
+
+    bar = _PhaseBar("bench train", 1, "plain")
+    bar.on_done(
+        RunOutcome(
+            key=RunKey(arm="noskill", split="train", model=model, task_id="task", rep=1),
+            success=False,
+            reason="provider_exhausted",
+            payload={"cost_usd": None, "cost_available": False, "duration_s": 0.1, "error": "usage limit reached"},
+        )
+    )
+    assert "usage limit reached" in capsys.readouterr().err
+
+
 def test_init_writes_files_the_loaders_accept(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     assert main(["init", "--dir", str(tmp_path)]) == 0
 

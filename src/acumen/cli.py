@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
 import json
 import math
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
@@ -327,6 +330,155 @@ def _epoch_bar(
     return "  ".join(parts)
 
 
+# Progress rendering for `epoch`/`fit`. Three modes, resolved once per command:
+#   "bars"    — tqdm-style single line rewritten in place with \r (a live terminal)
+#   "plain"   — throttled fresh lines, no \r (output redirected to a file / CI)
+#   "verbose" — today's per-run scrolling logs, via _Progress (opt-in with --verbose)
+_BAR_WIDTH = 14
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _progress_mode(args: argparse.Namespace) -> str:
+    """Pick the progress style: explicit --verbose wins, else live bars on a TTY, else plain."""
+    if getattr(args, "verbose", False):
+        return "verbose"
+    if sys.stdout.isatty() and not getattr(args, "stream", False):
+        return "bars"
+    return "plain"
+
+
+def _epoch_header(mode: str, n: int, total: int) -> None:
+    """Print the marker that starts an epoch — a heavy banner in verbose, a compact line else."""
+    if mode == "verbose":
+        print(f"\n{'═' * 78}\nEPOCH {n}/{total}\n{'═' * 78}", flush=True)
+    else:
+        print(f"\nEpoch {n}/{total}", flush=True)
+
+
+def _progress_bar(done: int, total: int, width: int = _BAR_WIDTH) -> str:
+    filled = width if not total else max(0, min(width, round(width * done / total)))
+    return "█" * filled + "░" * (width - filled)
+
+
+class _PhaseBar:
+    r"""A tqdm-style bar for one bench or wiki phase of an epoch.
+
+    Exposes the ``on_start``/``on_done(RunOutcome)`` callbacks ``run_matrix`` expects (bench) and
+    ``on_wiki_task(TaskWikiResult)`` for the wiki pass. In ``bars`` mode it rewrites one line with
+    ``\r``; in ``plain`` mode it prints throttled fresh lines so redirected logs stay readable.
+    (``verbose`` keeps :class:`_Progress` and never builds this, so only those two modes reach here.)
+    """
+
+    _THROTTLE_S = 5.0
+
+    def __init__(self, label: str, total: int, mode: str, *, track_success: bool = True) -> None:
+        self.label = label
+        self.total = total
+        self.mode = mode
+        self.track_success = track_success
+        self.done = 0
+        self.passed = 0
+        self.cost = 0.0
+        self._t0 = time.monotonic()
+        self._last_print = 0.0
+        if mode == "bars":
+            print("\r" + self._line(), end="", flush=True)
+
+    @property
+    def _elapsed(self) -> float:
+        return time.monotonic() - self._t0
+
+    def set_total(self, total: int) -> None:
+        """Set the denominator once it is known (the wiki pass reports it via ``on_plan``)."""
+        self.total = total
+        if self.mode == "bars":
+            print("\r" + self._line(), end="", flush=True)
+
+    def on_start(self, item) -> None:
+        """Present so it can be handed to ``run_matrix``; the bar only renders on completion."""
+
+    def on_done(self, outcome: RunOutcome) -> None:
+        payload = outcome.payload
+        priced = payload.get("cost_available", True) and payload.get("cost_usd") is not None
+        self._surface_error(outcome)
+        self._tick(success=outcome.success, cost=float(payload["cost_usd"]) if priced else None)
+
+    def on_wiki_task(self, result) -> None:
+        self._tick(success=None, cost=result.cost_usd)
+
+    def _tick(self, *, success: bool | None, cost: float | None) -> None:
+        self.done += 1
+        if success:
+            self.passed += 1
+        if cost is not None:
+            self.cost += cost
+        if self.mode == "bars":
+            print("\r" + self._line(), end="", flush=True)
+        elif self.done < self.total and self._elapsed - self._last_print >= self._THROTTLE_S:
+            self._last_print = self._elapsed
+            print("  " + self._line(), flush=True)
+
+    def _line(self) -> str:
+        pct = round(100 * self.done / self.total) if self.total else 100
+        parts = [f"{self.label:>14} {pct:>3}%|{_progress_bar(self.done, self.total)}| {self.done}/{self.total}"]
+        parts.append(f"[{_fmt_secs(self._elapsed)}]")
+        if self.track_success:
+            parts.append(f"success {_fmt_rate(self.passed / self.done if self.done else None)}")
+        parts.append(_fmt_cost(self.cost))
+        return "  ".join(parts)
+
+    def _surface_error(self, outcome: RunOutcome) -> None:
+        """Let genuine harness failures through even in bars mode; ordinary test fails just lower the rate."""
+        detail = outcome.payload.get("error")
+        if outcome.reason == "provider_exhausted":
+            msg = f"provider usage/credit exhausted: {detail or 'no provider detail'}"
+        elif outcome.reason == "sandbox_blocked":
+            msg = f"agent sandbox refused an outbound host (harness bug): {detail or 'no sandbox detail'}"
+        else:
+            return
+        print(f"{chr(10) if self.mode == 'bars' else ''}error: {msg}", file=sys.stderr, flush=True)
+
+    def finish(self) -> None:
+        """Leave the completed bar on screen (bars) or print the final line (plain)."""
+        print(("\r" if self.mode == "bars" else "  ") + self._line(), flush=True)
+
+
+class _Spinner:
+    """An indeterminate elapsed-time spinner for the single-agent improve step (no sub-progress).
+
+    In ``bars`` mode a daemon thread rewrites the line while ``improve_skill`` blocks the main
+    thread; other modes just print a start line. Use as a context manager around the blocking call.
+    """
+
+    def __init__(self, label: str, mode: str) -> None:
+        self.label = label
+        self.mode = mode
+        self._t0 = time.monotonic()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> _Spinner:
+        if self.mode == "bars":
+            self._thread = threading.Thread(target=self._spin, daemon=True)
+            self._thread.start()
+        else:
+            print(f"  {self.label} ...", flush=True)
+        return self
+
+    def _spin(self) -> None:
+        for frame in itertools.cycle(_SPINNER_FRAMES):
+            if self._stop.is_set():
+                break
+            print(f"\r  {self.label} {frame} {_fmt_secs(time.monotonic() - self._t0)}", end="", flush=True)
+            self._stop.wait(0.1)
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+            print("\r\033[K", end="", flush=True)  # clear the spinner line for the done line
+
+
 @dataclass(frozen=True)
 class _Arm:
     """One arm of a pass: its version, its loaded skill, and its matrix."""
@@ -408,11 +560,16 @@ def _print_run_summary(outcomes: Sequence[RunOutcome], elapsed: float, *, label:
     print(f"\n{prefix}{passed}/{len(outcomes)} passed in {_fmt_secs(elapsed)}  ({cost_summary}, {breakdown})")
 
 
-def _print_skill_loading(outcomes: Sequence[RunOutcome], arm: _Arm, skill_name: str) -> None:
-    """Say whether the skill reached the agent — the comparison means nothing otherwise."""
+def _print_skill_loading(outcomes: Sequence[RunOutcome], arm: _Arm, skill_name: str, *, quiet: bool = False) -> None:
+    """Say whether the skill reached the agent — the comparison means nothing otherwise.
+
+    ``quiet`` drops the routine "loaded in N/M" line (the bars keep phase output compact) but
+    still raises the warnings, which signal a broken comparison and must never be swallowed.
+    """
     loaded = sum(1 for o in outcomes if o.payload.get("skill_loaded"))
     if arm.skill is not None:
-        print(f"skill loaded in {loaded}/{len(outcomes)} runs")
+        if not quiet:
+            print(f"skill loaded in {loaded}/{len(outcomes)} runs")
         if loaded == 0:
             print(
                 f"warning: {arm.name} never loaded the skill — that arm is not measuring the skill",
@@ -448,13 +605,16 @@ def _execute_arms(
     auth_modes: dict[AgentProvider, AuthMode],
     prices: PriceTable,
     keep_sandboxes: bool,
-    progress: _Progress | None = None,
+    progress: _Progress | _PhaseBar | None = None,
+    quiet: bool = False,
 ) -> list[RunOutcome]:
     """Run each arm's pending runs sequentially, sharing one progress counter across them.
 
     Arms run one after another: every run in a matrix shares one skill, and a sequential pass
-    keeps each arm's tally readable while the progress counter spans the whole thing. Raises
-    :class:`BenchmarkInvalidError` if a harness failure decides the pass.
+    keeps each arm's tally readable while the progress counter spans the whole thing. ``quiet``
+    (epoch/fit bar mode) suppresses the per-arm banner and tally so the phase bar is the only
+    output; harness warnings still surface. Raises :class:`BenchmarkInvalidError` if a harness
+    failure decides the pass.
     """
     running = [arm for arm in arms if arm.todo]
     todo = [item for arm in running for item in arm.todo]
@@ -463,7 +623,7 @@ def _execute_arms(
     progress = progress or _Progress(len(todo))
     collected: list[RunOutcome] = []
     for arm in running:
-        if len(running) > 1:
+        if len(running) > 1 and not quiet:
             print(f"\n=== arm {arm.name}: {len(arm.todo)} runs ===", flush=True)
         started = time.monotonic()
         outcomes = asyncio.run(
@@ -484,8 +644,9 @@ def _execute_arms(
             )
         )
         collected.extend(outcomes)
-        _print_run_summary(outcomes, time.monotonic() - started, label=arm.name if len(running) > 1 else "")
-        _print_skill_loading(outcomes, arm, cfg.skill_name)
+        if not quiet:
+            _print_run_summary(outcomes, time.monotonic() - started, label=arm.name if len(running) > 1 else "")
+        _print_skill_loading(outcomes, arm, cfg.skill_name, quiet=quiet)
     return collected
 
 
@@ -690,9 +851,17 @@ def _run_wiki(
     auth_mode: AuthMode,
     log_dir: Path,
     stream: bool,
+    mode: str = "verbose",
 ):
-    """Update the wiki for one arm and print a per-task tally; returns the task results."""
-    print(f"updating wiki for [{version}] with {cfg.meta_model} (one agent per task) ...", flush=True)
+    """Update the wiki for one arm and report progress; returns the task results.
+
+    ``mode`` (``verbose``/``bars``/``plain``) picks the reporting style — a per-task tally in
+    verbose, a single progress bar otherwise. The bar's denominator is the count of tasks the
+    pass will actually run, reported once via ``update_wiki``'s ``on_plan`` callback.
+    """
+    bar = None if mode == "verbose" else _PhaseBar("wiki", 0, mode, track_success=False)
+    if mode == "verbose":
+        print(f"updating wiki for [{version}] with {cfg.meta_model} (one agent per task) ...", flush=True)
     results = asyncio.run(
         update_wiki(
             cfg=cfg,
@@ -707,10 +876,13 @@ def _run_wiki(
             max_concurrency=cfg.max_concurrency,
             log_dir=log_dir,
             stream=stream,
-            on_task_done=_print_wiki_task,
+            on_plan=(bar.set_total if bar is not None else None),
+            on_task_done=(_print_wiki_task if bar is None else bar.on_wiki_task),
         )
     )
-    if not results:
+    if bar is not None:
+        bar.finish()
+    elif not results:
         print(f"  wiki already had [{version}] for every task — nothing to do")
     else:
         total = sum(r.cost_usd or 0.0 for r in results)
@@ -783,6 +955,7 @@ def _run_one_epoch(
     prices: PriceTable,
     auth_modes: dict[AgentProvider, AuthMode],
     meta_auth: AuthMode,
+    mode: str = "verbose",
 ) -> EpochPlan:
     """Run one training epoch on an already-prepared pass, returning the resolved plan.
 
@@ -805,21 +978,43 @@ def _run_one_epoch(
     tail = " (resuming)" if plan.resumed else ""
     print(f"epoch: learning from [{parent_label}] → producing {plan.new_version}{tail}")
 
+    def bench_phase(specs, *, label: str, verbose_banner: str) -> None:
+        """Run one bench step: a numbered banner + plan + tally in verbose, a phase bar otherwise."""
+        if mode == "verbose":
+            print(verbose_banner, flush=True)
+        bench_arms = _build_arms(specs, cfg=cfg, tasks=tasks, runs_root=runs_root, skills_root=args.skills)
+        if mode == "verbose":
+            _print_plan(bench_arms)
+        bar = None if mode == "verbose" else _PhaseBar(label, sum(len(a.todo) for a in bench_arms), mode)
+        _execute_arms(
+            bench_arms,
+            cfg=cfg,
+            target=target,
+            runs_root=runs_root,
+            auth_modes=auth_modes,
+            prices=prices,
+            keep_sandboxes=False,
+            progress=bar,
+            quiet=mode != "verbose",
+        )
+        if bar is not None:
+            bar.finish()
+
     # Step 1 — bench the parent arm on the training signal. The first epoch also benches the
     # noskill baseline on valid, so the report has an in-epoch baseline to compare against.
     if plan.first:
         train_specs: list[tuple[str | None, Sequence[Split]]] = [(None, ["train", "valid"])]
     else:
         train_specs = [(plan.parent_version, ["train"])]
-    print(f"\n[1/4] benchmarking [{parent_label}] on the training signal ...", flush=True)
-    arms = _build_arms(train_specs, cfg=cfg, tasks=tasks, runs_root=runs_root, skills_root=args.skills)
-    _print_plan(arms)
-    _execute_arms(
-        arms, cfg=cfg, target=target, runs_root=runs_root, auth_modes=auth_modes, prices=prices, keep_sandboxes=False
+    bench_phase(
+        train_specs,
+        label="bench baseline" if plan.first else "bench train",
+        verbose_banner=f"\n[1/4] benchmarking [{parent_label}] on the training signal ...",
     )
 
     # Step 2 — distil that arm into the wiki (idempotent: recorded arms are skipped).
-    print(f"\n[2/4] updating the wiki for [{parent_label}] ...", flush=True)
+    if mode == "verbose":
+        print(f"\n[2/4] updating the wiki for [{parent_label}] ...", flush=True)
     _run_wiki(
         cfg=cfg,
         tasks=tasks,
@@ -832,18 +1027,22 @@ def _run_one_epoch(
         auth_mode=meta_auth,
         log_dir=args.log_dir,
         stream=args.stream,
+        mode=mode,
     )
 
     # Step 3 — create or improve the skill (skipped when the version already exists: a resumed
     # epoch that crashed after improve).
     if skill_dir(args.skills, plan.new_version).exists():
-        print(f"\n[3/4] {plan.new_version} already exists — skipping improve (resumed epoch)")
+        resumed_msg = f"{plan.new_version} already exists — skipping improve (resumed epoch)"
+        print(f"\n[3/4] {resumed_msg}" if mode == "verbose" else f"  {resumed_msg}", flush=True)
     else:
         verb = "creating" if plan.first else "improving"
-        print(f"\n[3/4] {verb} the skill → {plan.new_version} with {cfg.meta_model} ...", flush=True)
         log = LiveLog.open(args.log_dir, "improve", stream=args.stream)
-        print(f"log → {log.jsonl_path}", flush=True)
-        with log:
+        if mode == "verbose":
+            print(f"\n[3/4] {verb} the skill → {plan.new_version} with {cfg.meta_model} ...", flush=True)
+            print(f"log → {log.jsonl_path}", flush=True)
+        spinner = nullcontext() if mode == "verbose" else _Spinner(f"inferring skill → {plan.new_version}", mode)
+        with log, spinner:
             result = asyncio.run(
                 improve_skill(
                     cfg=cfg,
@@ -860,25 +1059,22 @@ def _run_one_epoch(
                 )
             )
         new = result.skill
-        print(f"wrote {new.directory}  (parent {result.parent or 'noskill'})")
-        print(f"  description: {new.description}")
-        print(f"  cost:        {_fmt_cost(result.cost_usd)} over {result.turns} turns")
-        _print_log_result(log)
+        if mode == "verbose":
+            print(f"wrote {new.directory}  (parent {result.parent or 'noskill'})")
+            print(f"  description: {new.description}")
+            print(f"  cost:        {_fmt_cost(result.cost_usd)} over {result.turns} turns")
+            _print_log_result(log)
+        else:
+            print(
+                f"  inferring skill → {new.version} done  ({_fmt_cost(result.cost_usd)}, {result.turns} turns)",
+                flush=True,
+            )
 
     # Step 4 — bench the new version on the held-out valid signal (completes it if unfinished).
-    print(f"\n[4/4] benchmarking {plan.new_version} on the held-out valid signal ...", flush=True)
-    valid_arms = _build_arms(
-        [(plan.new_version, ["valid"])], cfg=cfg, tasks=tasks, runs_root=runs_root, skills_root=args.skills
-    )
-    _print_plan(valid_arms)
-    _execute_arms(
-        valid_arms,
-        cfg=cfg,
-        target=target,
-        runs_root=runs_root,
-        auth_modes=auth_modes,
-        prices=prices,
-        keep_sandboxes=False,
+    bench_phase(
+        [(plan.new_version, ["valid"])],
+        label="bench valid",
+        verbose_banner=f"\n[4/4] benchmarking {plan.new_version} on the held-out valid signal ...",
     )
     return plan
 
@@ -902,7 +1098,14 @@ def _cmd_epoch(args: argparse.Namespace) -> int:
 
     try:
         plan = _run_one_epoch(
-            args, cfg=cfg, tasks=tasks, target=target, prices=prices, auth_modes=auth_modes, meta_auth=meta_auth
+            args,
+            cfg=cfg,
+            tasks=tasks,
+            target=target,
+            prices=prices,
+            auth_modes=auth_modes,
+            meta_auth=meta_auth,
+            mode=_progress_mode(args),
         )
     except BenchmarkInvalidError as err:
         print(f"\nerror: {err}", file=sys.stderr)
@@ -941,11 +1144,19 @@ def _cmd_fit(args: argparse.Namespace) -> int:
         print("Retry when the pricing pages are reachable, or pin rates in config.yaml.", file=sys.stderr)
         return 2
 
+    mode = _progress_mode(args)
     for done in range(limit):
-        print(f"\n{'═' * 78}\nEPOCH {done + 1}/{limit}\n{'═' * 78}", flush=True)
+        _epoch_header(mode, done + 1, limit)
         try:
             plan = _run_one_epoch(
-                args, cfg=cfg, tasks=tasks, target=target, prices=prices, auth_modes=auth_modes, meta_auth=meta_auth
+                args,
+                cfg=cfg,
+                tasks=tasks,
+                target=target,
+                prices=prices,
+                auth_modes=auth_modes,
+                meta_auth=meta_auth,
+                mode=mode,
             )
         except BenchmarkInvalidError as err:
             print(f"\nerror: {err}", file=sys.stderr)
@@ -1616,6 +1827,7 @@ def build_parser() -> argparse.ArgumentParser:
     epoch.add_argument("--replicates", type=int, help="override config n_replicates")
     epoch.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     epoch.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
+    epoch.add_argument("--verbose", action="store_true", help="use the full scrolling logs instead of progress bars")
     _add_auth_arg(epoch)
     _add_feedback_arg(epoch, extra=" (passed to the improver; do NOT paste valid-split answers)")
     _add_log_args(epoch)
@@ -1649,6 +1861,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--replicates", type=int, help="override config n_replicates")
     fit.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     fit.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
+    fit.add_argument("--verbose", action="store_true", help="use the full scrolling logs instead of progress bars")
     _add_auth_arg(fit)
     _add_feedback_arg(fit, extra=" (passed to the improver; do NOT paste valid-split answers)")
     _add_log_args(fit)
