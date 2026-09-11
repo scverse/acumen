@@ -967,6 +967,12 @@ def _codex_terminal(
     )
 
 
+# ``codex exec`` prints this to stderr whenever its stdin is not a TTY (acumen wires it to
+# /dev/null), then reads immediate EOF and appends an empty ``<stdin>`` block. It is benign
+# but reads as a confusing prompt to anyone watching the run, so drop it before it surfaces.
+_CODEX_STDIN_NOTICE = "Reading additional input from stdin"
+
+
 async def _drain_stderr(
     stream: asyncio.StreamReader,
     callback: Callable[[str], None] | None,
@@ -974,6 +980,8 @@ async def _drain_stderr(
 ) -> None:
     while line := await stream.readline():
         text = line.decode(errors="replace").rstrip("\r\n")
+        if _CODEX_STDIN_NOTICE in text:
+            continue
         if sink is not None:
             sink.append(text)
         if callback is not None:
