@@ -314,6 +314,13 @@ async def run_matrix(
     return outcomes
 
 
+#: Budget cap for the auth-probe run. Generous on purpose: the probe is bounded by ``max_turns=5``
+#: and only confirms the credential works, but one turn carries the full ``claude_code`` system
+#: prompt, whose input cost at a premium model's rate can exceed a tight cap and fail preflight
+#: before the model replies. A trivial "reply ok" never approaches this.
+PREFLIGHT_MAX_USD = 2.0
+
+
 async def _preflight_model(
     model: str,
     *,
@@ -323,7 +330,7 @@ async def _preflight_model(
     env_passthrough: Sequence[str] | None,
 ) -> str | None:
     """Return None if the model can authenticate, else a short error string."""
-    from acumen.agents import AgentOptions, run_agent
+    from acumen.agents import AgentOptions, codex_sandbox_probe, run_agent
     from acumen.sandbox import sandbox
 
     provider = provider_for_model(model)
@@ -335,14 +342,27 @@ async def _preflight_model(
             provider=provider,
             env_passthrough=env_passthrough,
         ) as box:
+            # Codex runs every command inside its own namespace sandbox. A trivial auth probe
+            # writes no files and runs no command, so it would pass even where that sandbox
+            # cannot start — and then every real run fails with error_sandbox after paying for
+            # the tokens. Test the sandbox itself first (free, no model call); report and stop
+            # here if it cannot start.
+            if provider == "codex":
+                sandbox_error = await codex_sandbox_probe(box.env)
+                if sandbox_error is not None:
+                    return sandbox_error
             result = await run_agent(
                 "Reply with only the word: ok",
                 options=AgentOptions(
                     cwd=box.root,
                     env=box.env,
                     model=model,
+                    # Bounded by turns, not dollars: the probe only confirms the credential works,
+                    # but one turn carries the full claude_code system prompt, whose input cost at a
+                    # premium model's rate (Opus) exceeds a tight cap — so a dollar cap that low
+                    # fails preflight before the model can reply. max_turns=5 already bounds it.
                     max_turns=5,
-                    max_usd=0.10,
+                    max_usd=PREFLIGHT_MAX_USD,
                     discover_skills=False,
                     confine=False,
                 ),

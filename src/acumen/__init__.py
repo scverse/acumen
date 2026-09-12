@@ -29,7 +29,6 @@ from acumen.check import (
     summarize_checks,
 )
 from acumen.config import Config, ConfigError, load_config, parse_config
-from acumen.draft import DraftError, DraftResult, draft_skill
 from acumen.env import (
     AuthMode,
     EnvError,
@@ -41,15 +40,14 @@ from acumen.env import (
     scrubbed_env,
     session_auth_available,
 )
+from acumen.epoch import EpochPlan, resolve_epoch
 from acumen.grade import Grade, Reason, grade_answer, grade_run
 from acumen.improve import (
     ImproveError,
     ImproveResult,
-    TrainRun,
-    collect_train_runs,
-    find_test_access,
+    find_valid_access,
     improve_skill,
-    make_test_guard,
+    make_valid_guard,
 )
 from acumen.logs import LiveLog
 from acumen.paths import RunKey, Split, arm_name, is_complete, parse_run_dir, run_dir, skill_from_arm
@@ -104,6 +102,14 @@ from acumen.taskgen import (
     harvest_scripts,
 )
 from acumen.tasks import Task, TaskError, TaskSplit, load_tasks, parse_tasks
+from acumen.training import (
+    EpochRow,
+    best_version,
+    build_training_rows,
+    epochs_since_best,
+    patience_exhausted,
+    write_training_csv,
+)
 from acumen.trajectory import Trajectory, render_trajectory
 from acumen.transcript import (
     build_trajectory,
@@ -112,8 +118,32 @@ from acumen.transcript import (
     render_codex_transcript,
     render_transcript,
 )
+from acumen.wiki import (
+    RunRecord,
+    TaskWikiResult,
+    WikiError,
+    collect_arm_runs,
+    recorded_arms,
+    update_wiki,
+)
 
 __all__ = [
+    "EpochRow",
+    "build_training_rows",
+    "write_training_csv",
+    "patience_exhausted",
+    "best_version",
+    "epochs_since_best",
+    "EpochPlan",
+    "resolve_epoch",
+    "find_valid_access",
+    "make_valid_guard",
+    "RunRecord",
+    "TaskWikiResult",
+    "WikiError",
+    "collect_arm_runs",
+    "recorded_arms",
+    "update_wiki",
     "AuthMode",
     "AgentError",
     "AgentOptions",
@@ -126,8 +156,6 @@ __all__ = [
     "CheckSummary",
     "Config",
     "ConfigError",
-    "DraftError",
-    "DraftResult",
     "EnvError",
     "Grade",
     "Harvest",
@@ -160,7 +188,6 @@ __all__ = [
     "TaskGenResult",
     "TaskSplit",
     "Trajectory",
-    "TrainRun",
     "__version__",
     "api_auth_available",
     "arm_metrics",
@@ -176,11 +203,8 @@ __all__ = [
     "build_report",
     "check_task_split",
     "check_tasks",
-    "collect_train_runs",
-    "draft_skill",
     "dump_tasks",
     "find_skill_access",
-    "find_test_access",
     "generate_tasks",
     "grade_answer",
     "grade_run",
@@ -191,7 +215,6 @@ __all__ = [
     "installer_exists",
     "is_complete",
     "make_skill_guard",
-    "make_test_guard",
     "latest_version",
     "load_config",
     "locate_transcript",

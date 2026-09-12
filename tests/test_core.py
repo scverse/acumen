@@ -72,7 +72,7 @@ from acumen.env import (
 )
 from acumen.grade import INVALID_REASONS, grade_answer, grade_run
 from acumen.guard import SYSTEM_ROOTS, find_escape
-from acumen.improve import ImproveError, _write_material, collect_train_runs, load_rates
+from acumen.improve import find_valid_access
 from acumen.logs import LiveLog
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
 from acumen.pricefeed import PriceFeedError, diff_rates, fetch_table, parse_anthropic, parse_openai
@@ -88,7 +88,7 @@ from acumen.prices import (
     resolve_cost,
 )
 from acumen.procs import label_env, reap, supported, survivors
-from acumen.prompts import draft_prompt, feedback_block, improve_prompt
+from acumen.prompts import feedback_block, improve_prompt, wiki_prompt
 from acumen.report import (
     ReportError,
     _arm_marker,
@@ -138,6 +138,13 @@ from acumen.ship import _ship_env
 from acumen.skills import SkillError, load_skill, read_meta, skill_hash, write_meta
 from acumen.taskgen import dump_tasks, harvest_scripts
 from acumen.tasks import Task, TaskError, TaskSplit, load_tasks, parse_tasks
+from acumen.training import (
+    best_version,
+    build_training_rows,
+    epochs_since_best,
+    patience_exhausted,
+    write_training_csv,
+)
 from acumen.trajectory import (
     Metrics,
     Observation,
@@ -150,6 +157,7 @@ from acumen.trajectory import (
     write_trajectory_json,
 )
 from acumen.transcript import render_agent_transcript, render_codex_events, render_codex_transcript
+from acumen.wiki import WikiError, collect_arm_runs, mark_recorded, recorded_arms, stage_task_evidence
 
 # --- grading ---------------------------------------------------------------------------
 
@@ -179,10 +187,10 @@ def test_grade_run_reads_answer_md(tmp_path: Path) -> None:
 
 
 def test_run_dir_round_trips(tmp_path: Path) -> None:
-    key = RunKey(arm="skill_v2", split="test", model="claude-opus-5", task_id="tf_activity", rep=3)
+    key = RunKey(arm="skill_v2", split="valid", model="claude-opus-5", task_id="tf_activity", rep=3)
     directory = run_dir(tmp_path, key)
 
-    assert directory == tmp_path / "skill_v2/test/claude-opus-5/tf_activity/rep_3"
+    assert directory == tmp_path / "skill_v2/valid/claude-opus-5/tf_activity/rep_3"
     assert parse_run_dir(tmp_path, directory) == key
     assert key.skill == "v2"
 
@@ -315,11 +323,11 @@ def test_load_tasks(project: Path) -> None:
 
     assert task.id == "example_task"
     assert task.split("train").answer == "TRAIN_ANSWER"
-    assert task.split("test").prompt.startswith("Do the same")
+    assert task.split("valid").prompt.startswith("Do the same")
 
 
 def test_tasks_reject_duplicate_ids() -> None:
-    entry = {"id": "dup", "train": {"prompt": "p", "answer": "a"}, "test": {"prompt": "p", "answer": "a"}}
+    entry = {"id": "dup", "train": {"prompt": "p", "answer": "a"}, "valid": {"prompt": "p", "answer": "a"}}
     with pytest.raises(TaskError, match="duplicate task id"):
         parse_tasks({"tasks": [entry, dict(entry)]})
 
@@ -333,12 +341,12 @@ def test_build_matrix_and_resume(project: Path, model: str, make_result) -> None
 
     planned = build_matrix(cfg, tasks, skill="v1")
     assert len(planned) == 2  # 1 task x 2 splits x 1 model x 1 replicate
-    assert {p.key.split for p in planned} == {"train", "test"}
+    assert {p.key.split for p in planned} == {"train", "valid"}
     assert all(p.key.arm == "skill_v1" for p in planned)
 
     runs = project / "runs"
     make_result(runs, RunKey(arm="skill_v1", split="train", model=model, task_id="example_task", rep=1))
-    assert [p.key.split for p in pending(planned, runs)] == ["test"]
+    assert [p.key.split for p in pending(planned, runs)] == ["valid"]
     assert len(pending(planned, runs, resume=False)) == 2
 
 
@@ -1375,8 +1383,8 @@ def test_provider_exhaustion_result_is_diagnostic_not_complete(tmp_path: Path, m
     directory = tmp_path / "run"
     outcome = asyncio.run(
         run_once(
-            key=RunKey(arm="noskill", split="test", model="gpt-5.6-sol", task_id="task", rep=1),
-            task=Task(id="task", train=TaskSplit("prompt", "OK"), test=TaskSplit("prompt", "OK")),
+            key=RunKey(arm="noskill", split="valid", model="gpt-5.6-sol", task_id="task", rep=1),
+            task=Task(id="task", train=TaskSplit("prompt", "OK"), valid=TaskSplit("prompt", "OK")),
             target=Target(
                 source="target",
                 ref="main",
@@ -1440,8 +1448,8 @@ def _run_once_with(
     run_dir = tmp_path / "run"
     asyncio.run(
         run_once(
-            key=RunKey(arm="noskill", split="test", model=model, task_id="task", rep=1),
-            task=Task(id="task", train=TaskSplit("prompt", "SPI1"), test=TaskSplit("prompt", "SPI1")),
+            key=RunKey(arm="noskill", split="valid", model=model, task_id="task", rep=1),
+            task=Task(id="task", train=TaskSplit("prompt", "SPI1"), valid=TaskSplit("prompt", "SPI1")),
             target=Target(
                 source="target",
                 ref="main",
@@ -1543,10 +1551,10 @@ async def _no_preflight(*_args: object, **_kwargs: object) -> dict[str, str]:
 def test_run_matrix_cancels_remaining_cells_when_provider_is_exhausted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    task = Task(id="quota", train=TaskSplit("prompt", "OK"), test=TaskSplit("prompt", "OK"))
+    task = Task(id="quota", train=TaskSplit("prompt", "OK"), valid=TaskSplit("prompt", "OK"))
     planned = [
         PlannedRun(
-            key=RunKey(arm="noskill", split="test", model="gpt-5.6-sol", task_id=f"task_{index}", rep=1),
+            key=RunKey(arm="noskill", split="valid", model="gpt-5.6-sol", task_id=f"task_{index}", rep=1),
             task=task,
             model="gpt-5.6-sol",
             max_turns=1,
@@ -1590,11 +1598,11 @@ def test_run_matrix_cancels_remaining_cells_when_provider_is_exhausted(
 def test_run_matrix_continues_other_provider_after_one_is_exhausted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    task = Task(id="mixed", train=TaskSplit("prompt", "OK"), test=TaskSplit("prompt", "OK"))
+    task = Task(id="mixed", train=TaskSplit("prompt", "OK"), valid=TaskSplit("prompt", "OK"))
 
     def planned(model: str, task_id: str) -> PlannedRun:
         return PlannedRun(
-            key=RunKey(arm="noskill", split="test", model=model, task_id=task_id, rep=1),
+            key=RunKey(arm="noskill", split="valid", model=model, task_id=task_id, rep=1),
             task=task,
             model=model,
             max_turns=1,
@@ -1823,6 +1831,39 @@ def test_from_claude_records_maps_messages_and_attaches_observations() -> None:
     # The observation landed on the step that issued the matching call.
     assert step.observations[0].call_id == "call-1" and step.observations[0].content == "file body"
     assert traj.usage == Metrics(input_tokens=10, output_tokens=3, cached_tokens=2)
+
+
+def test_from_claude_records_uses_authoritative_usage_not_the_per_message_sum() -> None:
+    """The footer must report the run's billed usage, not a sum of per-turn usage.
+
+    Each Claude turn re-sends the whole conversation, so every turn's ``usage`` already counts the
+    cached prefix; summing across turns overcounts. When the caller passes the authoritative
+    ``ResultMessage.usage``, the footer reports that (normalized: input is the total, cached is the
+    cache-read count) rather than the JSONL sum. Two assistant turns also guard against the
+    parameter being shadowed by the loop's per-message variable.
+    """
+    turn = {
+        "type": "assistant",
+        "message": {
+            "model": "claude-opus-5",
+            "usage": {"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 1000},
+            "content": [{"type": "text", "text": "step"}],
+        },
+    }
+    records = [turn, turn]
+
+    # No authoritative usage -> the per-message sum (the historical, overcounting fallback).
+    assert from_claude_records(records).usage == Metrics(input_tokens=200, output_tokens=100, cached_tokens=2000)
+
+    # Authoritative usage -> reported as-is (normalized): input = fresh + read + write.
+    authoritative = {
+        "input_tokens": 5,
+        "cache_read_input_tokens": 1000,
+        "cache_creation_input_tokens": 200,
+        "output_tokens": 60,
+    }
+    traj = from_claude_records(records, usage=authoritative)
+    assert traj.usage == Metrics(input_tokens=1205, output_tokens=60, cached_tokens=1000)
 
 
 def test_render_trajectory_and_json_roundtrip(tmp_path: Path) -> None:
@@ -2167,8 +2208,8 @@ def test_benchmark_persists_unavailable_cost_as_null(tmp_path: Path, monkeypatch
     run_dir = tmp_path / "run"
     outcome = asyncio.run(
         run_once(
-            key=RunKey(arm="noskill", split="test", model="gpt-unpriced", task_id="task", rep=1),
-            task=Task(id="task", train=TaskSplit("prompt", "OK"), test=TaskSplit("prompt", "OK")),
+            key=RunKey(arm="noskill", split="valid", model="gpt-unpriced", task_id="task", rep=1),
+            task=Task(id="task", train=TaskSplit("prompt", "OK"), valid=TaskSplit("prompt", "OK")),
             target=Target(
                 source="target",
                 ref="main",
@@ -2241,8 +2282,8 @@ def test_benchmark_persists_inferred_cost_and_records_the_claude_sdk_figure(
     run_dir = tmp_path / "run"
     asyncio.run(
         run_once(
-            key=RunKey(arm="noskill", split="test", model="claude-opus-5", task_id="task", rep=1),
-            task=Task(id="task", train=TaskSplit("prompt", "OK"), test=TaskSplit("prompt", "OK")),
+            key=RunKey(arm="noskill", split="valid", model="claude-opus-5", task_id="task", rep=1),
+            task=Task(id="task", train=TaskSplit("prompt", "OK"), valid=TaskSplit("prompt", "OK")),
             target=Target(
                 source="target",
                 ref="main",
@@ -2569,12 +2610,16 @@ def test_feedback_block_absent_is_empty_and_present_is_subordinated() -> None:
         "version": "1",
         "src": Path("/s"),
         "python": Path("/py"),
-        "out": Path("/o"),
+        "skill_dir": Path("/skill"),
+        "wiki_dir": Path("/wiki"),
+        "transcripts_dir": Path("/tr"),
+        "rationale_path": Path("/r.md"),
         "skill_name": "p",
+        "new_version": "v1",
     }
-    assert draft_prompt(**base_kwargs) == draft_prompt(**base_kwargs, feedback=None)
+    assert improve_prompt(**base_kwargs) == improve_prompt(**base_kwargs, feedback=None)
 
-    steered = draft_prompt(**base_kwargs, feedback="skip the plotting API")
+    steered = improve_prompt(**base_kwargs, feedback="skip the plotting API")
     assert "skip the plotting API" in steered
     assert "does NOT override" in steered
     # Guidance sits after the how-to rules but before the closing deliverable reminder.
@@ -2604,11 +2649,11 @@ def _train_evidence(project: Path, make_result, loaded: list[bool | None]) -> li
     for i, flag in enumerate(loaded):
         key = RunKey(arm="skill_v1", split="train", model=models[i % 2], task_id="example_task", rep=i + 1)
         make_result(runs, key, success=flag is True, skill_loaded=flag)
-    return collect_train_runs(runs, "skill_v1", load_tasks(project / "tasks.yaml"))
+    return collect_arm_runs(runs, "skill_v1", load_tasks(project / "tasks.yaml"))
 
 
-def test_collect_train_runs_carries_load_status(project: Path, make_result) -> None:
-    """A run's ``skill_loaded`` must reach the improver, with undetermined kept distinct."""
+def test_collect_arm_runs_carries_load_status(project: Path, make_result) -> None:
+    """A run's ``skill_loaded`` must reach the wiki/improver, with undetermined kept distinct."""
     runs = _train_evidence(project, make_result, [True, False, None])
 
     assert sorted(r.skill_loaded is True for r in runs).count(True) == 1
@@ -2617,40 +2662,54 @@ def test_collect_train_runs_carries_load_status(project: Path, make_result) -> N
     assert [r.skill_loaded for r in runs].count(None) == 1
 
 
-def test_improver_refuses_provider_exhaustion_evidence(project: Path, make_result) -> None:
+def test_collect_arm_runs_refuses_provider_exhaustion_evidence(project: Path, make_result) -> None:
     key = RunKey(arm="skill_v1", split="train", model="gpt-5.6-sol", task_id="example_task", rep=1)
     make_result(project / "runs", key, valid=False, reason="provider_exhausted", success=False)
 
-    with pytest.raises(ImproveError, match="infrastructure-invalid benchmark result"):
-        collect_train_runs(project / "runs", "skill_v1", load_tasks(project / "tasks.yaml"))
+    with pytest.raises(WikiError, match="infrastructure-invalid benchmark result"):
+        collect_arm_runs(project / "runs", "skill_v1", load_tasks(project / "tasks.yaml"))
 
 
-def test_load_rates_split_by_model_and_count_undetermined(project: Path, make_result) -> None:
-    """Rates are per model, since the load rate varies more by model than by skill version."""
-    rates = load_rates(_train_evidence(project, make_result, [True, True, False, None]))
-
-    # model_a took reps 1 and 3 (True, False); model_b took reps 2 and 4 (True, None).
-    assert rates == {"model_a": (1, 2, 0), "model_b": (1, 2, 1)}
-
-
-def test_written_evidence_reports_load_rate_and_marks_each_run(project: Path, make_result, tmp_path: Path) -> None:
-    """The improver reads SUMMARY.md, so the load signal has to survive into the file."""
+def test_stage_task_evidence_marks_each_run(project: Path, make_result, tmp_path: Path) -> None:
+    """The wiki agent reads INDEX.md, so the load signal has to survive into the staged evidence."""
     runs = _train_evidence(project, make_result, [True, False, None])
-    train_dir = tmp_path / "train"
+    work = tmp_path / "work"
+    work.mkdir()
 
-    _write_material(train_dir, runs)
+    evidence = stage_task_evidence(work, runs, version="v1")
 
-    summary = (train_dir / "SUMMARY.md").read_text()
-    assert "Did the skill load at all?" in summary
-    assert "| `model_a` |" in summary and "| `model_b` |" in summary
-    assert "skill LOADED" in summary
-    assert "skill NOT LOADED" in summary
-    assert "skill load UNDETERMINED" in summary
+    index = (evidence / "INDEX.md").read_text()
+    assert "skill LOADED" in index
+    assert "skill NOT LOADED" in index
+    assert "skill load UNDETERMINED" in index
+    # One directory per run, so a reader who opens one isn't left guessing.
+    run_dirs = [p for p in evidence.iterdir() if p.is_dir()]
+    assert len(run_dirs) == 3
 
-    # Every per-run page states it too, so a reader who opens one run isn't left guessing.
-    pages = [p.read_text() for p in train_dir.rglob("run.md")]
-    assert len(pages) == 3
-    assert all("- Skill: skill " in page for page in pages)
+
+def test_recorded_arms_round_trip(tmp_path: Path) -> None:
+    """The ``.arms`` marker is what makes the cumulative wiki append idempotent."""
+    task_dir = tmp_path / "example_task"
+    assert recorded_arms(task_dir) == set()
+
+    mark_recorded(task_dir, "noskill")
+    mark_recorded(task_dir, "skill_v1")
+    mark_recorded(task_dir, "noskill")  # idempotent — no duplicate
+    assert recorded_arms(task_dir) == {"noskill", "skill_v1"}
+
+
+def test_find_valid_access_blocks_the_held_out_split_only(tmp_path: Path) -> None:
+    """The improver may read train evidence but never the held-out valid runs."""
+    runs = (tmp_path / "runs").resolve()
+
+    valid = runs / "skill_v1" / "valid" / "opus" / "t" / "rep_1" / "result.json"
+    train = runs / "skill_v1" / "train" / "opus" / "t" / "rep_1" / "result.json"
+
+    assert find_valid_access("Read", {"file_path": str(valid)}, runs) == str(valid)
+    assert find_valid_access("Read", {"file_path": str(train)}, runs) is None
+    # A path named only inside a shell command is caught too.
+    assert find_valid_access("Bash", {"command": f"cat {valid}"}, runs) == str(valid)
+    assert find_valid_access("Bash", {"command": "cat runs/skill_v1/train/x"}, runs) is None
 
 
 def test_improve_prompt_separates_loading_from_the_body() -> None:
@@ -2658,19 +2717,61 @@ def test_improve_prompt_separates_loading_from_the_body() -> None:
     prompt = improve_prompt(
         package="p",
         version="1",
+        src=Path("/s"),
         python=Path("/py"),
         skill_dir=Path("/skill"),
-        train_dir=Path("/train"),
+        wiki_dir=Path("/wiki"),
+        transcripts_dir=Path("/tr"),
         rationale_path=Path("/r.md"),
         skill_name="p",
-        parent_version="v1",
         new_version="v2",
+        parent_version="v1",
     )
 
     assert "The skill never loaded" in prompt
     assert "description" in prompt
-    # Raising the load rate must not become licence to name the train tasks in it.
-    assert prompt.index("Do not overfit it to the train tasks") < prompt.index("When you are done")
+    # Raising the load rate must not become licence to name the tasks in it.
+    assert prompt.index("Do not overfit it") < prompt.index("When you are done")
+
+
+def test_improve_prompt_create_mode_writes_frontmatter_from_scratch() -> None:
+    """With no parent, the improver is in create mode and must write fresh frontmatter."""
+    prompt = improve_prompt(
+        package="p",
+        version="1",
+        src=Path("/s"),
+        python=Path("/py"),
+        skill_dir=Path("/skill"),
+        wiki_dir=Path("/wiki"),
+        transcripts_dir=Path("/tr"),
+        rationale_path=Path("/r.md"),
+        skill_name="p",
+        new_version="v1",
+        parent_version=None,
+    )
+
+    assert "FIRST agent skill" in prompt
+    assert "name: p" in prompt
+    assert "noskill" in prompt
+
+
+def test_wiki_prompt_demands_brevity_and_the_entry_format() -> None:
+    """The wiki entry format and the brevity rule are load-bearing; both must be in the prompt."""
+    prompt = wiki_prompt(
+        package="p",
+        version="noskill",
+        src=Path("/s"),
+        python=Path("/py"),
+        task_id="example_task",
+        evidence_dir=Path("/ev"),
+        observations_path=Path("/o.md"),
+        hypothesis_path=Path("/h.md"),
+        skill_dir=None,
+    )
+
+    assert "[noskill][<model>]" in prompt
+    assert "BE BRIEF" in prompt
+    assert "APPEND" in prompt
 
 
 # --- auth preflight --------------------------------------------------------------------
@@ -3041,7 +3142,7 @@ def test_metrics_figure_pools_every_model_into_a_last_grey_bar(runs_root: Path, 
     model must not weigh as much as a well-sampled one.
     """
     other = "claude-opus-5"
-    key = RunKey(arm="noskill", split="test", model=other, task_id="example_task", rep=1)
+    key = RunKey(arm="noskill", split="valid", model=other, task_id="example_task", rep=1)
     make_result(runs_root, key, success=False)
     make_result(runs_root, replace(key, rep=2), success=False)
     df = load_results(runs_root)  # the fixture's one passing test run, plus two failing ones
@@ -3067,7 +3168,7 @@ def test_skill_loaded_column_counts_undetermined_runs_as_not_loaded(runs_root: P
     counts against the rate — the same reading the runs CSV takes.
     """
     for rep, loaded in ((1, True), (2, None)):
-        key = RunKey(arm="skill_v1", split="test", model=model, task_id="example_task", rep=rep)
+        key = RunKey(arm="skill_v1", split="valid", model=model, task_id="example_task", rep=rep)
         make_result(runs_root, key, skill_loaded=loaded)
     df = load_results(runs_root)
 
@@ -3106,7 +3207,7 @@ def test_load_warning_needs_most_of_the_arm_to_miss(
     so warning about them at the top of the report would cry wolf on a healthy arm.
     """
     for rep, loaded in enumerate(loads, start=1):
-        key = RunKey(arm="skill_v1", split="test", model=model, task_id="example_task", rep=rep)
+        key = RunKey(arm="skill_v1", split="valid", model=model, task_id="example_task", rep=rep)
         make_result(runs_root, key, skill_loaded=loaded)
 
     notes = _integrity_notes(load_results(runs_root))
@@ -3124,7 +3225,7 @@ def test_arms_priced_on_different_dates_are_flagged_as_not_cost_comparable(
     can separate them. The report says so rather than presenting the gap as the skill's.
     """
     for arm, as_of in (("noskill", "2026-08-04"), ("skill_v1", "2026-10-04")):
-        for split in ("train", "test"):
+        for split in ("train", "valid"):
             key = RunKey(arm=arm, split=split, model=model, task_id="example_task", rep=1)
             make_result(runs_root, key, price_rates_as_of=as_of, price_source="fetched")
 
@@ -3136,7 +3237,7 @@ def test_arms_priced_on_different_dates_are_flagged_as_not_cost_comparable(
 def test_one_pass_priced_on_one_date_is_not_flagged(runs_root: Path, model: str, make_result) -> None:
     """The note must stay quiet on the ordinary case, or it teaches people to ignore it."""
     for arm in ("noskill", "skill_v1"):
-        for split in ("train", "test"):
+        for split in ("train", "valid"):
             key = RunKey(arm=arm, split=split, model=model, task_id="example_task", rep=1)
             make_result(runs_root, key, price_rates_as_of="2026-08-04", price_source="fetched")
 
@@ -3148,11 +3249,11 @@ def test_one_pass_priced_on_one_date_is_not_flagged(runs_root: Path, model: str,
 def test_unpriced_runs_are_unknown_in_reports_not_zero_cost(
     runs_root: Path, model: str, make_result, tmp_path: Path
 ) -> None:
-    key = RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=1)
+    key = RunKey(arm="noskill", split="valid", model=model, task_id="example_task", rep=1)
     make_result(runs_root, key, cost_usd=0.0, cost_available=False)
 
     df = load_results(runs_root)
-    test = df[df["split"] == "test"]
+    test = df[df["split"] == "valid"]
     assert test["cost_usd"].isna().all()
     assert pd.isna(arm_metrics(test).loc[0, "cost"])
     assert any("cost unavailable" in note for note in _integrity_notes(df))
@@ -3179,7 +3280,7 @@ def test_reports_show_inferred_cost_and_csv_keeps_the_recorded_one(
     The provider figure stays auditable in the CSV, but nothing displayed is drawn from it:
     it covers one provider only, so a report mixing the two would compare unlike numbers.
     """
-    key = RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=1)
+    key = RunKey(arm="noskill", split="valid", model=model, task_id="example_task", rep=1)
     make_result(
         runs_root,
         key,
@@ -3191,7 +3292,7 @@ def test_reports_show_inferred_cost_and_csv_keeps_the_recorded_one(
     )
 
     df = load_results(runs_root)
-    test = df[df["split"] == "test"]
+    test = df[df["split"] == "valid"]
     assert test.iloc[0]["cost_usd"] == pytest.approx(0.20)
     assert arm_metrics(test).loc[0, "cost"] == pytest.approx(0.20)
     assert "0.200" in _runs_table_html(test, tmp_path)
@@ -3200,7 +3301,7 @@ def test_reports_show_inferred_cost_and_csv_keeps_the_recorded_one(
     out_path = tmp_path / "results.html"
     build_report(runs_root, out_path)
     exported = pd.read_csv(out_path.with_suffix(".csv"))
-    test_row = exported[exported["split"] == "test"].iloc[0]
+    test_row = exported[exported["split"] == "valid"].iloc[0]
     assert test_row["cost_usd"] == pytest.approx(0.20)
     assert test_row["inferred_cost_usd"] == pytest.approx(0.20)
     assert test_row["recorded_cost_usd"] == pytest.approx(0.90)
@@ -3209,7 +3310,7 @@ def test_reports_show_inferred_cost_and_csv_keeps_the_recorded_one(
 
 def test_modern_result_without_inferred_cost_stays_unpriced_in_report(runs_root: Path, model: str, make_result) -> None:
     """A recorded provider estimate must never substitute for missing inference."""
-    key = RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=1)
+    key = RunKey(arm="noskill", split="valid", model=model, task_id="example_task", rep=1)
     make_result(
         runs_root,
         key,
@@ -3220,7 +3321,7 @@ def test_modern_result_without_inferred_cost_stays_unpriced_in_report(runs_root:
         inferred_cost_usd=None,
     )
 
-    test = load_results(runs_root).query("split == 'test'")
+    test = load_results(runs_root).query("split == 'valid'")
     assert pd.isna(test.iloc[0]["cost_usd"])
     assert pd.isna(arm_metrics(test).loc[0, "cost"])
 
@@ -3230,7 +3331,7 @@ def test_the_unpriced_note_names_the_model_that_could_not_be_priced(
 ) -> None:
     """The fix is a ``prices:`` entry, so the warning has to say which model needs one."""
     for rep, cost in ((1, None), (2, 0.20)):
-        key = RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=rep)
+        key = RunKey(arm="noskill", split="valid", model=model, task_id="example_task", rep=rep)
         make_result(runs_root, key, cost_usd=cost, cost_available=cost is not None, inferred_cost_usd=cost)
 
     df = load_results(runs_root)
@@ -3284,7 +3385,7 @@ def test_tradeoff_pooled_mark_averages_runs_not_per_model_means(runs_root: Path,
     than one with a single run — the same trap the grid's grey bar avoids.
     """
     other = "claude-opus-5"
-    key = RunKey(arm="noskill", split="test", model=other, task_id="example_task", rep=1)
+    key = RunKey(arm="noskill", split="valid", model=other, task_id="example_task", rep=1)
     make_result(runs_root, key, success=False, cost_usd=0.30)
     make_result(runs_root, replace(key, rep=2), success=False, cost_usd=0.30)
     df = load_results(runs_root)  # the fixture's one passing $0.12 run, plus two failing $0.30 ones
@@ -3303,7 +3404,7 @@ def test_tradeoff_pooled_mark_averages_runs_not_per_model_means(runs_root: Path,
 def test_tradeoff_shape_carries_the_arm_and_colour_carries_the_model(runs_root: Path, model: str, make_result) -> None:
     """Two channels, two meanings: an ✕ against a disc for skill, hue left to the model."""
     for arm in ("skill_v1", "skill_v2"):
-        make_result(runs_root, RunKey(arm=arm, split="test", model=model, task_id="example_task", rep=1))
+        make_result(runs_root, RunKey(arm=arm, split="valid", model=model, task_id="example_task", rep=1))
     df = load_results(runs_root)
 
     figure = tradeoff_figure(df, colors=resolve_palette([model], {model: "#3b7ea1"}))
@@ -3339,7 +3440,7 @@ def test_tradeoff_arrows_walk_each_model_in_version_order_and_never_cross_models
     other = "claude-opus-5"
     costs = {(model, "skill_v1"): 0.40, (other, "noskill"): 0.60, (other, "skill_v1"): 0.90}
     for (who, arm), cost in costs.items():
-        key = RunKey(arm=arm, split="test", model=who, task_id="example_task", rep=1)
+        key = RunKey(arm=arm, split="valid", model=who, task_id="example_task", rep=1)
         make_result(runs_root, key, cost_usd=cost)
     df = load_results(runs_root)  # plus the fixture's $0.12 noskill run for `model`
 
@@ -3366,7 +3467,7 @@ def test_tradeoff_joins_versions_that_landed_on_the_same_result(runs_root: Path,
     results nobody measured.
     """
     for arm, cost in (("skill_v1", 0.1201), ("skill_v2", 0.1202)):
-        key = RunKey(arm=arm, split="test", model=model, task_id="example_task", rep=1)
+        key = RunKey(arm=arm, split="valid", model=model, task_id="example_task", rep=1)
         make_result(runs_root, key, cost_usd=cost)
     df = load_results(runs_root)  # three arms within a hundredth of a cent of the fixture's run
 
@@ -3387,7 +3488,7 @@ def test_tradeoff_arrow_reaches_the_mark_it_points_at(runs_root: Path, model: st
     matplotlib insets a filled head from the end of its own path, so an arrow given the same
     standoff at both ends stops visibly short of what it points at while its tail sits flush.
     """
-    key = RunKey(arm="skill_v1", split="test", model=model, task_id="example_task", rep=1)
+    key = RunKey(arm="skill_v1", split="valid", model=model, task_id="example_task", rep=1)
     make_result(runs_root, key, cost_usd=0.60)
     df = load_results(runs_root)  # the fixture's $0.12 baseline, then this
 
@@ -3406,7 +3507,7 @@ def test_tradeoff_arrow_reaches_the_mark_it_points_at(runs_root: Path, model: st
 def test_tradeoff_labels_no_mark_in_the_plot(runs_root: Path, model: str, make_result) -> None:
     """Order rides the arrows, so no version has to be named on the panel itself."""
     for arm, cost in (("skill_v1", 0.40), ("skill_v2", 0.80)):
-        key = RunKey(arm=arm, split="test", model=model, task_id="example_task", rep=1)
+        key = RunKey(arm=arm, split="valid", model=model, task_id="example_task", rep=1)
         make_result(runs_root, key, cost_usd=cost)
     df = load_results(runs_root)
 
@@ -3428,10 +3529,10 @@ def test_tradeoff_frontier_steps_between_the_marks_nothing_beats(runs_root: Path
     """
     other = "claude-opus-5"
     # Cheap and good, dear and bad, dear and best: only the first and last are non-dominated.
-    make_result(runs_root, RunKey(arm="skill_v1", split="test", model=other, task_id="example_task", rep=1))
+    make_result(runs_root, RunKey(arm="skill_v1", split="valid", model=other, task_id="example_task", rep=1))
     make_result(
         runs_root,
-        RunKey(arm="skill_v2", split="test", model=other, task_id="example_task", rep=1),
+        RunKey(arm="skill_v2", split="valid", model=other, task_id="example_task", rep=1),
         cost_usd=0.50,
         success=False,
     )
@@ -3463,7 +3564,7 @@ def test_tradeoff_handles_an_arm_where_nothing_succeeded(runs_root: Path, model:
     """A 0% rate is a real result, not a hole: the mark is plotted and the frontier still draws."""
     make_result(
         runs_root,
-        RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=1),
+        RunKey(arm="noskill", split="valid", model=model, task_id="example_task", rep=1),
         success=False,
     )
     df = load_results(runs_root)
@@ -3502,7 +3603,7 @@ def test_tradeoff_keeps_the_two_corner_tick_labels_apart(runs_root: Path, model:
     """
     make_result(
         runs_root,
-        RunKey(arm="skill_v1", split="test", model=model, task_id="example_task", rep=1),
+        RunKey(arm="skill_v1", split="valid", model=model, task_id="example_task", rep=1),
         success=False,
     )
     df = load_results(runs_root)
@@ -3532,7 +3633,7 @@ def test_tradeoff_keeps_the_two_corner_tick_labels_apart(runs_root: Path, model:
 
 def test_tradeoff_skill_key_is_unfilled_and_the_model_key_is_not(runs_root: Path, model: str, make_result) -> None:
     """Only one of the two keys is about colour, and the other must not look like it is."""
-    make_result(runs_root, RunKey(arm="skill_v1", split="test", model=model, task_id="example_task", rep=1))
+    make_result(runs_root, RunKey(arm="skill_v1", split="valid", model=model, task_id="example_task", rep=1))
     df = load_results(runs_root)
 
     figure = tradeoff_figure(df, colors=resolve_palette([model], {model: "#3b7ea1"}))
@@ -3598,7 +3699,7 @@ def _arena(runs_root: Path, model: str, make_result, spec: dict[str, tuple[float
     """A run tree of ``arm -> (cost per run, one success flag per task)``, one rep each."""
     for arm, (cost, outcomes) in spec.items():
         for task, ok in zip(_TASKS, outcomes, strict=True):
-            key = RunKey(arm=arm, split="test", model=model, task_id=task, rep=1)
+            key = RunKey(arm=arm, split="valid", model=model, task_id=task, rep=1)
             make_result(runs_root, key, cost_usd=cost, success=ok)
     return load_results(runs_root)
 
@@ -3754,7 +3855,7 @@ def test_skill_tests_declines_to_test_too_few_tasks(runs_root: Path, model: str,
     The fixture tree has a single task, which is exactly the case that must not silently produce
     confident-looking numbers.
     """
-    make_result(runs_root, RunKey(arm="skill_v1", split="test", model=model, task_id="example_task", rep=1))
+    make_result(runs_root, RunKey(arm="skill_v1", split="valid", model=model, task_id="example_task", rep=1))
     df = load_results(runs_root)
 
     tests = skill_tests(df)
@@ -3807,7 +3908,7 @@ def test_runs_table_sorts_formatted_numbers_by_their_value(
     """
     make_result(
         runs_root,
-        RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=2),
+        RunKey(arm="noskill", split="valid", model=model, task_id="example_task", rep=2),
         turns=9,
         input_tokens=1_200_000,
         output_tokens=34_567,
@@ -3838,7 +3939,7 @@ def test_runs_table_ranks_a_skill_that_failed_to_load_above_one_that_loaded() ->
     assert ranks == sorted(ranks, reverse=True)
 
 
-def _run(arm: str, model: str, success: bool, loaded: object, split: str = "test") -> dict:
+def _run(arm: str, model: str, success: bool, loaded: object, split: str = "valid") -> dict:
     return {"arm": arm, "model": model, "split": split, "success": success, "skill_loaded": loaded}
 
 
@@ -3998,11 +4099,11 @@ def _fake_venv(tmp_path: Path) -> Path:
     return venv
 
 
-def _task(task_id: str, train: str = "TRAIN", test: str = "TEST", **kwargs) -> Task:
+def _task(task_id: str, train: str = "TRAIN", valid: str = "VALID", **kwargs) -> Task:
     return Task(
         id=task_id,
         train=TaskSplit(prompt="do the thing", answer=train),
-        test=TaskSplit(prompt="do the other thing", answer=test),
+        valid=TaskSplit(prompt="do the other thing", answer=valid),
         **kwargs,
     )
 
@@ -4010,17 +4111,17 @@ def _task(task_id: str, train: str = "TRAIN", test: str = "TEST", **kwargs) -> T
 #: One reproducer per failure mode the check has to tell apart, keyed by its filename.
 _REPRODUCERS = {
     "good-train.py": 'from pathlib import Path\nprint("noise on stdout")\nPath("answer.md").write_text("TRAIN")\n',
-    "good-test.py": 'from pathlib import Path\nPath("answer.md").write_text("TEST")\n',
+    "good-valid.py": 'from pathlib import Path\nPath("answer.md").write_text("VALID")\n',
     "shaky-train.py": 'from pathlib import Path\nPath("answer.md").write_text("SOMETHING ELSE")\n',
-    "shaky-test.py": 'from pathlib import Path\nPath("answer.md").write_text("**TEST**")\n',
+    "shaky-valid.py": 'from pathlib import Path\nPath("answer.md").write_text("**VALID**")\n',
     "broken-train.py": 'import sys\nprint("no module named scanpy", file=sys.stderr)\nraise SystemExit(3)\n',
-    "broken-test.py": "pass\n",  # runs clean, writes nothing
+    "broken-valid.py": "pass\n",  # runs clean, writes nothing
     "slow-train.py": "import time\n\ntime.sleep(30)\n",
 }
 
 
 def test_needs_script_defaults_to_true_and_must_be_a_bool() -> None:
-    entry = {"id": "t", "train": {"prompt": "p", "answer": "a"}, "test": {"prompt": "p", "answer": "b"}}
+    entry = {"id": "t", "train": {"prompt": "p", "answer": "a"}, "valid": {"prompt": "p", "answer": "b"}}
 
     (task,) = parse_tasks({"tasks": [entry]})
     assert task.needs_script is True
@@ -4070,15 +4171,15 @@ def test_check_tells_every_failure_mode_apart(tmp_path: Path) -> None:
 
     assert {(r.task_id, r.split): r.status for r in results} == {
         ("good", "train"): "ok",
-        ("good", "test"): "ok",
+        ("good", "valid"): "ok",
         ("shaky", "train"): "wrong_answer",
-        ("shaky", "test"): "format_error",  # right content, formatting the exact match rejects
+        ("shaky", "valid"): "format_error",  # right content, formatting the exact match rejects
         ("broken", "train"): "error",
-        ("broken", "test"): "no_answer",
+        ("broken", "valid"): "no_answer",
         ("slow", "train"): "timeout",
-        ("slow", "test"): "missing",
+        ("slow", "valid"): "missing",
         ("prose", "train"): "skipped",
-        ("prose", "test"): "skipped",
+        ("prose", "valid"): "skipped",
     }
     wrong = next(r for r in results if (r.task_id, r.split) == ("shaky", "train"))
     assert (wrong.answer, wrong.expected) == ("SOMETHING ELSE", "TRAIN")
@@ -4115,7 +4216,7 @@ def test_check_runs_each_reproducer_in_its_own_empty_directory(tmp_path: Path) -
     """Two scripts writing answer.md must not read each other's, and neither may litter."""
     scripts = tmp_path / "tasks"
     scripts.mkdir()
-    for split, answer in (("train", "TRAIN"), ("test", "TEST")):
+    for split, answer in (("train", "TRAIN"), ("valid", "VALID")):
         (scripts / f"solo-{split}.py").write_text(
             "from pathlib import Path\n"
             "assert not list(Path.cwd().iterdir()), f'not an empty directory: {list(Path.cwd().iterdir())}'\n"
@@ -4140,7 +4241,7 @@ def test_summarize_checks_scores_only_the_tasks_that_need_a_script(tmp_path: Pat
     scripts = tmp_path / "tasks"
     scripts.mkdir()
     (scripts / "good-train.py").write_text(_REPRODUCERS["good-train.py"])
-    (scripts / "good-test.py").write_text(_REPRODUCERS["good-test.py"])
+    (scripts / "good-valid.py").write_text(_REPRODUCERS["good-valid.py"])
     (scripts / "shaky-train.py").write_text(_REPRODUCERS["shaky-train.py"])
     tasks = [_task("good"), _task("shaky"), _task("prose", needs_script=False)]
 
@@ -4172,7 +4273,7 @@ def test_orphan_scripts_flags_a_reproducer_no_task_claims(tmp_path: Path) -> Non
     """A renamed task id leaves a script that looks like coverage but is never run."""
     scripts = tmp_path / "tasks"
     scripts.mkdir()
-    for name in ("kept-train.py", "kept-test.py", "renamed_away-train.py", "notes.txt"):
+    for name in ("kept-train.py", "kept-valid.py", "renamed_away-train.py", "notes.txt"):
         (scripts / name).write_text("pass\n")
 
     assert orphan_scripts([_task("kept")], scripts) == [scripts / "renamed_away-train.py"]
@@ -4212,17 +4313,17 @@ def test_harvest_keeps_only_the_reproducers_the_tasks_declare(tmp_path: Path) ->
     """What the generator leaves behind is not automatically ground truth worth keeping."""
     staged = tmp_path / "staged"
     staged.mkdir()
-    for name in ("code-train.py", "code-test.py", "prose-train.py", "leftover.py"):
+    for name in ("code-train.py", "code-valid.py", "prose-train.py", "leftover.py"):
         (staged / name).write_text("pass\n")
     scripts_root = tmp_path / "project" / "tasks"
     tasks = [_task("code"), _task("prose", needs_script=False), _task("nocode")]
 
     harvest = harvest_scripts(tasks, staged, scripts_root)
 
-    assert sorted(p.name for p in harvest.scripts) == ["code-test.py", "code-train.py"]
-    assert sorted(p.name for p in scripts_root.iterdir()) == ["code-test.py", "code-train.py"]
+    assert sorted(p.name for p in harvest.scripts) == ["code-train.py", "code-valid.py"]
+    assert sorted(p.name for p in scripts_root.iterdir()) == ["code-train.py", "code-valid.py"]
     # A split that expected a script and got none is a reported gap, not a silent pass.
-    assert harvest.missing == (("nocode", "train"), ("nocode", "test"))
+    assert harvest.missing == (("nocode", "train"), ("nocode", "valid"))
     # Neither a script for a prose task nor a file matching no task is kept.
     assert harvest.unexpected == ("leftover.py", "prose-train.py")
 
@@ -4238,7 +4339,7 @@ def test_harvest_leaves_no_directory_behind_when_there_is_nothing_to_keep(tmp_pa
     harvest = harvest_scripts([_task("code")], tmp_path / "staged-that-never-existed", scripts_root)
 
     assert harvest.scripts == ()
-    assert harvest.missing == (("code", "train"), ("code", "test"))
+    assert harvest.missing == (("code", "train"), ("code", "valid"))
     assert not scripts_root.exists()
 
 
@@ -4247,7 +4348,7 @@ def test_harvest_leaves_no_directory_behind_when_there_is_nothing_to_keep(tmp_pa
 
 def _result(task_id: str, split: str, status: str = "ok", **kwargs) -> CheckResult:
     """A CheckResult as `check_task_split` builds them: `expected` is always the recorded answer."""
-    default = "TRAIN" if split == "train" else "TEST"
+    default = "TRAIN" if split == "train" else "VALID"
     return CheckResult(
         task_id=task_id,
         split=split,
@@ -4263,13 +4364,13 @@ def _result(task_id: str, split: str, status: str = "ok", **kwargs) -> CheckResu
 
 
 def test_parse_reviews_maps_verdicts_onto_the_rows_that_were_reviewed() -> None:
-    rows = [_result("bulk", "train"), _result("bulk", "test")]
+    rows = [_result("bulk", "train"), _result("bulk", "valid")]
     raw = {
         "reviews": [
             {"task": "bulk", "split": "train", "verdict": "ok"},
             {
                 "task": "bulk",
-                "split": "test",
+                "split": "valid",
                 "verdict": "mismatch",
                 "issue": "prompt says ascending; script and answer are descending",
                 "fix": "say descending in the prompt",
@@ -4281,7 +4382,7 @@ def test_parse_reviews_maps_verdicts_onto_the_rows_that_were_reviewed() -> None:
 
     assert [(v.task_id, v.split, v.status) for v in verdicts] == [
         ("bulk", "train", "ok"),
-        ("bulk", "test", "mismatch"),
+        ("bulk", "valid", "mismatch"),
     ]
     assert verdicts[1].issue.startswith("prompt says ascending")
     assert verdicts[1].fix == "say descending in the prompt"
@@ -4316,12 +4417,12 @@ def test_parse_reviews_degrades_instead_of_discarding_a_good_deterministic_run()
     So every way the agent can be sloppy has to survive as a warning plus an `unreviewed` row,
     never as an exception that throws away half an hour of reproducer runs.
     """
-    rows = [_result("bulk", "train"), _result("bulk", "test"), _result("scell", "train")]
+    rows = [_result("bulk", "train"), _result("bulk", "valid"), _result("scell", "train")]
     raw = {
         "reviews": [
             {"task": "bulk", "split": "train", "verdict": "mismatch"},  # flagged, no reason
-            {"task": "bulk", "split": "test", "verdict": "ok"},
-            {"task": "bulk", "split": "test", "verdict": "mismatch"},  # duplicate
+            {"task": "bulk", "split": "valid", "verdict": "ok"},
+            {"task": "bulk", "split": "valid", "verdict": "mismatch"},  # duplicate
             {"task": "ghost", "split": "train", "verdict": "ok"},  # not under review
             {"task": "scell", "split": "train", "verdict": "probably fine"},  # not a verdict
             "not a mapping at all",
@@ -4371,17 +4472,17 @@ def test_review_packet_copies_everything_and_points_nowhere_near_the_project(tmp
     scripts.mkdir(parents=True)
     (scripts / "bulk-train.py").write_text("# the real reproducer\nprint('hi')\n")
     (project / "tasks.yaml").write_text("tasks: []\n")
-    tasks = [_task("bulk", train="FOXD1", test="FOXO1"), _task("prose", needs_script=False)]
+    tasks = [_task("bulk", train="FOXD1", valid="FOXO1"), _task("prose", needs_script=False)]
     results = [
         _result("bulk", "train", script=scripts / "bulk-train.py", answer="FOXD1", expected="FOXD1"),
-        _result("bulk", "test", "wrong_answer", answer="SOMETHING", expected="FOXO1"),
+        _result("bulk", "valid", "wrong_answer", answer="SOMETHING", expected="FOXO1"),
         _result("prose", "train", "skipped", answer=None, expected="BSD"),
     ]
     packet = tmp_path / "work" / "review"
 
     written = write_packet(packet, tasks, results)
 
-    assert [(r.task_id, r.split) for r in written] == [("bulk", "train"), ("bulk", "test"), ("prose", "train")]
+    assert [(r.task_id, r.split) for r in written] == [("bulk", "train"), ("bulk", "valid"), ("prose", "train")]
     digest = (packet / PACKET_DIGEST).read_text()
     # Every split's prompt, recorded answer and outcome are in the digest.
     assert "## bulk / train" in digest and "## prose / train" in digest
@@ -4472,7 +4573,7 @@ def test_review_tasks_hands_the_agent_a_packet_and_reads_its_verdicts(
                         {"task": "bulk", "split": "train", "verdict": "ok"},
                         {
                             "task": "bulk",
-                            "split": "test",
+                            "split": "valid",
                             "verdict": "mismatch",
                             "issue": "prompt says ascending; script is descending",
                             "fix": "say descending",
@@ -4487,7 +4588,7 @@ def test_review_tasks_hands_the_agent_a_packet_and_reads_its_verdicts(
     monkeypatch.setattr("acumen.review.build_agent_env", lambda **_kwargs: {})
     target = _review_target(tmp_path)
     tasks = [_task("bulk")]
-    results = [_result("bulk", "train"), _result("bulk", "test")]
+    results = [_result("bulk", "train"), _result("bulk", "valid")]
 
     review = asyncio.run(
         review_tasks(
@@ -4500,7 +4601,7 @@ def test_review_tasks_hands_the_agent_a_packet_and_reads_its_verdicts(
     )
 
     assert review.status_for("bulk", "train") == "ok"
-    assert review.status_for("bulk", "test") == "mismatch"
+    assert review.status_for("bulk", "valid") == "mismatch"
     assert [v.task_id for v in review.flagged] == ["bulk"]
     # The agent's own $0.25 is recorded but not reported: the review is priced from the table,
     # like every other run, so one basis covers both providers.
@@ -4565,3 +4666,74 @@ def test_meta_model_defaults_to_the_first_benchmark_model() -> None:
 
     named = parse_config({"repo": "/tmp/target-demo", "meta_model": "claude-haiku-4-5-20251001"})
     assert named.meta_model == "claude-haiku-4-5-20251001"
+
+
+# --- training curve (acumen fit) --------------------------------------------------------
+
+
+def test_epochs_since_best_and_patience_use_strict_best_so_far() -> None:
+    """Improvement is strict > best-so-far; ties/worse count as no-improvement."""
+    assert epochs_since_best([0.79]) == 0
+    assert epochs_since_best([0.79, 0.70]) == 1
+    assert epochs_since_best([0.79, 0.70, 0.75]) == 2  # best is still v1
+    # A later tie does not reset the best (must strictly beat it).
+    assert epochs_since_best([0.8, 0.8]) == 1
+
+    assert patience_exhausted([0.79], 2) is False
+    assert patience_exhausted([0.79, 0.70], 2) is False
+    assert patience_exhausted([0.79, 0.70, 0.75], 2) is True
+    # v1-best -> v2-worse -> v3-worse-than-v1 stops at patience 2 (the user's example).
+    assert patience_exhausted([0.79, 0.70, 0.75], 1) is True
+
+
+def test_build_training_rows_maps_arms_and_computes_means(tmp_path: Path, make_result) -> None:
+    """Epoch N's train arm is v(N-1)/noskill; its valid arm is vN. Means are per-model and overall."""
+    runs = tmp_path / "runs"
+    cfg = parse_config({"repo": "https://example.com/pkg", "models": ["m1", "m2"]})
+
+    def run(arm: str, split: str, model: str, ok: bool) -> None:
+        make_result(runs, RunKey(arm=arm, split=split, model=model, task_id="t", rep=1), success=ok, cost_usd=0.10)
+
+    # noskill: train m1 pass / m2 fail (-> v1's train = 0.5); valid is the baseline, unused by v1.
+    run("noskill", "train", "m1", True)
+    run("noskill", "train", "m2", False)
+    run("noskill", "valid", "m1", True)
+    run("noskill", "valid", "m2", True)
+    # v1: valid both pass (-> v1 valid = 1.0); train both pass (-> v2's train = 1.0).
+    run("skill_v1", "valid", "m1", True)
+    run("skill_v1", "valid", "m2", True)
+    run("skill_v1", "train", "m1", True)
+    run("skill_v1", "train", "m2", True)
+    # v2: valid m1 fail / m2 pass (-> v2 valid = 0.5).
+    run("skill_v2", "valid", "m1", False)
+    run("skill_v2", "valid", "m2", True)
+
+    rows = build_training_rows(runs, cfg)
+    assert [(r.epoch, r.version, r.parent) for r in rows] == [(1, "v1", "noskill"), (2, "v2", "v1")]
+
+    v1, v2 = rows
+    assert v1.train_success == 0.5 and v1.valid_success == 1.0
+    assert v1.train_success_by_model == {"m1": 1.0, "m2": 0.0}
+    assert v2.train_success == 1.0 and v2.valid_success == 0.5
+    assert v2.valid_success_by_model == {"m1": 0.0, "m2": 1.0}
+    # Cost is a mean per run, and every run here was priced.
+    assert v1.valid_cost == pytest.approx(0.10)
+
+    assert best_version(rows) == "v1"
+
+
+def test_write_training_csv_roundtrips_header_and_per_model_columns(tmp_path: Path, make_result) -> None:
+    runs = tmp_path / "runs"
+    cfg = parse_config({"repo": "https://example.com/pkg", "models": ["m1", "m2"]})
+    make_result(runs, RunKey(arm="noskill", split="train", model="m1", task_id="t", rep=1), success=True)
+    make_result(runs, RunKey(arm="skill_v1", split="valid", model="m1", task_id="t", rep=1), success=True)
+
+    out = tmp_path / "training.csv"
+    write_training_csv(build_training_rows(runs, cfg), out)
+    lines = out.read_text().splitlines()
+    header = lines[0].split(",")
+    assert header[:3] == ["epoch", "version", "parent"]
+    for model in ("m1", "m2"):
+        for prefix in ("train_success", "valid_success", "train_cost", "valid_cost"):
+            assert f"{prefix}__{model}" in header
+    assert lines[1].startswith("1,v1,noskill,")

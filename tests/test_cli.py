@@ -64,12 +64,26 @@ def test_parser_requires_a_command() -> None:
         build_parser().parse_args([])
 
 
+def test_fit_parser_defaults_and_overrides() -> None:
+    """`fit` defaults to patience 2 / max-epochs 10; `--epochs` is an explicit fixed count."""
+    parser = build_parser()
+
+    args = parser.parse_args(["fit"])
+    assert args.func.__name__ == "_cmd_fit"
+    assert args.patience == 2 and args.max_epochs == 10 and args.epochs is None
+    assert args.out == Path("training.csv")
+
+    args = parser.parse_args(["fit", "--epochs", "3", "--patience", "1", "--max-epochs", "5", "--out", "curve.csv"])
+    assert args.epochs == 3 and args.patience == 1 and args.max_epochs == 5
+    assert args.out == Path("curve.csv")
+
+
 def test_progress_prints_unavailable_cost_without_casting_null(capsys: pytest.CaptureFixture[str], model: str) -> None:
     progress = _Progress(1)
     progress.running = 1
     progress.on_done(
         RunOutcome(
-            key=RunKey(arm="noskill", split="test", model=model, task_id="task", rep=1),
+            key=RunKey(arm="noskill", split="valid", model=model, task_id="task", rep=1),
             success=True,
             reason="ok",
             payload={
@@ -92,7 +106,7 @@ def test_console_costs_are_the_figure_the_report_plots(capsys: pytest.CaptureFix
     so a console reading that figure would tally a pass at one number and report it at another.
     """
     outcome = RunOutcome(
-        key=RunKey(arm="noskill", split="test", model=model, task_id="task", rep=1),
+        key=RunKey(arm="noskill", split="valid", model=model, task_id="task", rep=1),
         success=True,
         reason="ok",
         payload={
@@ -120,7 +134,7 @@ def test_progress_prints_provider_exhaustion_as_invalid(capsys: pytest.CaptureFi
     progress.running = 1
     progress.on_done(
         RunOutcome(
-            key=RunKey(arm="noskill", split="test", model=model, task_id="task", rep=1),
+            key=RunKey(arm="noskill", split="valid", model=model, task_id="task", rep=1),
             success=False,
             reason="provider_exhausted",
             payload={
@@ -137,6 +151,154 @@ def test_progress_prints_provider_exhaustion_as_invalid(capsys: pytest.CaptureFi
     captured = capsys.readouterr()
     assert "INVALID" in captured.out and "FAIL" not in captured.out
     assert "usage limit reached" in captured.err
+
+
+def _run_outcome(model: str, *, success: bool, cost: float | None) -> RunOutcome:
+    return RunOutcome(
+        key=RunKey(arm="noskill", split="train", model=model, task_id="task", rep=1),
+        success=success,
+        reason="ok",
+        payload={
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "cost_usd": cost,
+            "cost_available": cost is not None,
+            "duration_s": 0.1,
+        },
+    )
+
+
+def test_progress_mode_prefers_verbose_then_bars_then_plain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--verbose wins; otherwise bars need a TTY and no --stream; else plain."""
+    from acumen.cli import _progress_mode, build_parser
+
+    def mode(argv: list[str], *, tty: bool) -> str:
+        monkeypatch.setattr("sys.stdout.isatty", lambda: tty)
+        return _progress_mode(build_parser().parse_args(argv))
+
+    assert mode(["fit", "--verbose"], tty=True) == "verbose"
+    assert mode(["fit"], tty=True) == "bars"
+    assert mode(["fit"], tty=False) == "plain"
+    assert mode(["fit", "--stream"], tty=True) == "plain"  # a scrolling transcript clashes with \r bars
+
+
+def test_phase_bar_final_line_reports_running_success_and_cost(capsys: pytest.CaptureFixture[str], model: str) -> None:
+    """The bar's completed line shows done/total, the mean success rate, and summed cost."""
+    from acumen.cli import _PhaseBar
+
+    bar = _PhaseBar("bench train", 4, "plain")
+    for success, cost in [(True, 0.10), (False, 0.20), (True, 0.30), (True, None)]:
+        bar.on_done(_run_outcome(model, success=success, cost=cost))
+    bar.finish()
+
+    line = capsys.readouterr().out.strip().splitlines()[-1]
+    assert "4/4" in line and "100%" in line
+    assert "success 75%" in line  # 3 of 4 passed
+    assert "$0.60" in line  # 0.10 + 0.20 + 0.30, the priced runs only
+
+
+def test_phase_bar_surfaces_provider_exhaustion(capsys: pytest.CaptureFixture[str], model: str) -> None:
+    """Genuine harness failures must reach stderr even though bars hide ordinary fails."""
+    from acumen.cli import _PhaseBar
+
+    bar = _PhaseBar("bench train", 1, "plain")
+    bar.on_done(
+        RunOutcome(
+            key=RunKey(arm="noskill", split="train", model=model, task_id="task", rep=1),
+            success=False,
+            reason="provider_exhausted",
+            payload={"cost_usd": None, "cost_available": False, "duration_s": 0.1, "error": "usage limit reached"},
+        )
+    )
+    assert "usage limit reached" in capsys.readouterr().err
+
+
+def test_cmd_fit_calls_build_training_rows_with_two_args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: `_cmd_fit` must call `build_training_rows(runs, cfg)` — the 3-arg call it shipped
+    with throws only after a full epoch runs, so the suite never caught it. Stand in a two-arg
+    `build_training_rows` (mirroring the real signature) and no-op the epoch/prep so the post-epoch
+    path runs end to end."""
+    import types
+
+    import acumen.cli as cli
+
+    assert main(["init", "--dir", str(tmp_path)]) == 0
+
+    monkeypatch.setattr(cli, "_prepare_pass", lambda cfg, args: ({}, "session", None, None))
+    monkeypatch.setattr(
+        cli,
+        "_run_one_epoch",
+        lambda *a, **k: types.SimpleNamespace(new_version="v1", first=True, resumed=False, parent_version=None),
+    )
+    calls: list[tuple] = []
+
+    def fake_rows(runs_root: Path, cfg: object) -> list:  # two positional args, like the real one
+        calls.append((runs_root, cfg))
+        return []
+
+    monkeypatch.setattr(cli, "build_training_rows", fake_rows)
+    monkeypatch.setattr(cli, "write_training_csv", lambda rows, out: Path(out).write_text("version\n"))
+
+    rc = main(
+        [
+            "fit",
+            "--epochs",
+            "1",
+            "--config",
+            str(tmp_path / "config.yaml"),
+            "--tasks",
+            str(tmp_path / "tasks.yaml"),
+            "--runs",
+            str(tmp_path / "runs"),
+            "--skills",
+            str(tmp_path / "skills"),
+            "--wiki",
+            str(tmp_path / "wiki"),
+            "--out",
+            str(tmp_path / "training.csv"),
+        ]
+    )
+    assert rc == 0
+    assert calls, "build_training_rows was never called"
+    assert (tmp_path / "training.csv").is_file()
+
+
+def test_codex_trace_regex_matches_tracing_but_not_sandbox_errors() -> None:
+    from acumen.agents import _CODEX_TRACE_RE
+
+    assert _CODEX_TRACE_RE.match(
+        "2026-09-11T18:47:29.074013Z ERROR codex_core::session: failed to record rollout items: thread x not found"
+    )
+    assert _CODEX_TRACE_RE.match("2026-09-11T19:03:53.787568Z ERROR codex_app_server::bespoke_event_handling: boom")
+    assert _CODEX_TRACE_RE.match("2026-09-11T18:54:06.188252Z ERROR codex_core::tools::router: error=exec_command")
+    assert not _CODEX_TRACE_RE.match("bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted")
+    assert not _CODEX_TRACE_RE.match("a plain tool warning with no codex prefix")
+
+
+def test_drain_stderr_hides_codex_tracing_but_keeps_it_for_sandbox_detection() -> None:
+    """Codex tracing is dropped from the console but stays in the sink; bwrap errors still show."""
+    import asyncio
+
+    from acumen.agents import _drain_stderr
+
+    async def drive() -> tuple[list[str], list[str]]:
+        reader = asyncio.StreamReader()
+        for chunk in (
+            b"2026-09-11T18:47:29.074013Z ERROR codex_core::session: failed to record rollout items: thread x\n",
+            b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted\n",
+            b"Reading additional input from stdin...\n",
+        ):
+            reader.feed_data(chunk)
+        reader.feed_eof()
+        shown: list[str] = []
+        sink: list[str] = []
+        await _drain_stderr(reader, shown.append, sink)
+        return shown, sink
+
+    shown, sink = asyncio.run(drive())
+    assert shown == ["bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"]
+    assert any("failed to record rollout items" in line for line in sink)  # kept for _sandbox_failure
+    assert not any("Reading additional input" in line for line in sink)  # stdin notice dropped entirely
 
 
 def test_init_writes_files_the_loaders_accept(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
@@ -356,7 +518,7 @@ def test_bench_runs_only_the_named_arm(
 def test_bench_exits_nonzero_and_prints_provider_exhaustion(
     project: Path, model: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, stub_prices
 ) -> None:
-    key = RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=1)
+    key = RunKey(arm="noskill", split="valid", model=model, task_id="example_task", rep=1)
     outcome = RunOutcome(
         key=key,
         success=False,
@@ -452,16 +614,12 @@ def test_report_without_runs_errors(project: Path, capsys: pytest.CaptureFixture
     assert "error:" in capsys.readouterr().err
 
 
-def test_draft_refuses_when_versions_exist(project: Path, skills_root: Path, capsys: pytest.CaptureFixture) -> None:
-    """The guard fires before the target is prepared, so no agent runs."""
-    exit_code = main(["draft", "--config", str(project / "config.yaml"), "--skills", str(skills_root)])
+def test_improve_without_any_train_runs_errors(project: Path, capsys: pytest.CaptureFixture) -> None:
+    """With no skill versions the improver creates v1 — but only from benched train evidence.
 
-    assert exit_code == 2
-    assert "skills already exist (v1)" in capsys.readouterr().err
-    assert not (skills_root / "v2").exists()
-
-
-def test_improve_without_a_skill_errors(project: Path, capsys: pytest.CaptureFixture) -> None:
+    So a project with neither versions nor a benched baseline errors, pointing at the bench to run
+    first, rather than spawning an agent with nothing to learn from.
+    """
     exit_code = main(
         [
             "improve",
@@ -473,11 +631,13 @@ def test_improve_without_a_skill_errors(project: Path, capsys: pytest.CaptureFix
             str(project / "skills"),
             "--runs",
             str(project / "runs"),
+            "--wiki",
+            str(project / "wiki"),
         ]
     )
 
     assert exit_code == 2
-    assert "no skill versions" in capsys.readouterr().err
+    assert "no train-split runs found" in capsys.readouterr().err
 
 
 def test_tasks_refuses_to_overwrite_without_force(project: Path, capsys: pytest.CaptureFixture) -> None:
@@ -744,7 +904,7 @@ def test_check_passes_when_every_answer_reproduces(
 ) -> None:
     _stub_target(project, monkeypatch)
     _write_reproducer(project, "train", "TRAIN_ANSWER")
-    _write_reproducer(project, "test", "TEST_ANSWER")
+    _write_reproducer(project, "valid", "TEST_ANSWER")
 
     assert main(check_args(project, "--no-review", "--jobs", "1")) == 0
 
@@ -824,7 +984,7 @@ def test_check_warns_about_a_reproducer_no_task_claims(
 ) -> None:
     _stub_target(project, monkeypatch)
     _write_reproducer(project, "train", "TRAIN_ANSWER")
-    _write_reproducer(project, "test", "TEST_ANSWER")
+    _write_reproducer(project, "valid", "TEST_ANSWER")
     (project / "tasks" / "renamed_away-train.py").write_text("pass\n")
 
     assert main(check_args(project, "--no-review", "--jobs", "1")) == 0
@@ -861,7 +1021,7 @@ def test_check_no_review_spawns_nothing_and_never_reaches_a_credential(
     """The deterministic phase must stay free, and usable in a loop while fixing a script."""
     _stub_target(project, monkeypatch)
     _write_reproducer(project, "train", "TRAIN_ANSWER")
-    _write_reproducer(project, "test", "TEST_ANSWER")
+    _write_reproducer(project, "valid", "TEST_ANSWER")
     monkeypatch.setattr("acumen.cli.check_agent_cli", _boom)
     monkeypatch.setattr("acumen.cli.review_tasks", _boom)
 
@@ -883,10 +1043,10 @@ def test_check_flags_a_coherent_looking_task_whose_prompt_asks_for_something_els
     """
     _stub_target(project, monkeypatch)
     _write_reproducer(project, "train", "TRAIN_ANSWER")
-    _write_reproducer(project, "test", "TEST_ANSWER")
+    _write_reproducer(project, "valid", "TEST_ANSWER")
     _stub_review(
         monkeypatch,
-        {("example_task", "test"): ("mismatch", "prompt says ascending; script and answer are descending")},
+        {("example_task", "valid"): ("mismatch", "prompt says ascending; script and answer are descending")},
     )
 
     assert main(check_args(project, "--jobs", "1")) == 1
@@ -909,7 +1069,7 @@ def test_check_reports_a_failed_review_as_an_incomplete_check(
     """A review that could not run must never read as a green check, but must not lose the runs."""
     _stub_target(project, monkeypatch)
     _write_reproducer(project, "train", "TRAIN_ANSWER")
-    _write_reproducer(project, "test", "TEST_ANSWER")
+    _write_reproducer(project, "valid", "TEST_ANSWER")
     _stub_review(monkeypatch, {})
 
     async def die(**_kwargs):
