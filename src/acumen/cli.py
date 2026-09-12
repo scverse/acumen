@@ -1042,6 +1042,7 @@ def _run_one_epoch(
             print(f"\n[3/4] {verb} the skill → {plan.new_version} with {cfg.meta_model} ...", flush=True)
             print(f"log → {log.jsonl_path}", flush=True)
         spinner = nullcontext() if mode == "verbose" else _Spinner(f"inferring skill → {plan.new_version}", mode)
+        improve_started = time.monotonic()
         with log, spinner:
             result = asyncio.run(
                 improve_skill(
@@ -1058,15 +1059,17 @@ def _run_one_epoch(
                     log=log,
                 )
             )
+        improve_elapsed = _fmt_secs(time.monotonic() - improve_started)
         new = result.skill
         if mode == "verbose":
             print(f"wrote {new.directory}  (parent {result.parent or 'noskill'})")
             print(f"  description: {new.description}")
-            print(f"  cost:        {_fmt_cost(result.cost_usd)} over {result.turns} turns")
+            print(f"  cost:        {_fmt_cost(result.cost_usd)} over {result.turns} turns in {improve_elapsed}")
             _print_log_result(log)
         else:
             print(
-                f"  inferring skill → {new.version} done  ({_fmt_cost(result.cost_usd)}, {result.turns} turns)",
+                f"  inferring skill → {new.version} done  "
+                f"({improve_elapsed}, {_fmt_cost(result.cost_usd)}, {result.turns} turns)",
                 flush=True,
             )
 
