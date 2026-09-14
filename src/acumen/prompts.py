@@ -61,7 +61,10 @@ not read by a human.
 - The target package (`{package}`) is already installed. Run Python with `{python}`,
   which is also `python` on your PATH. Do not create virtualenvs and do not install or
   upgrade packages.
-- You have web access. Use it if it helps.
+- Use only the already-installed `{package}` — it is the source of truth. Do NOT clone,
+  download, fetch, or `pip install`/`pip download` its source repository or source
+  distribution (for example from GitHub or PyPI).
+- You have web access for general reference. Use it if it helps.
 
 # What you must leave behind
 

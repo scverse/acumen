@@ -121,6 +121,13 @@ class AgentOptions:
     #: agent. The shipper sets it False: it is the one agent that runs in the operator's real
     #: environment on purpose, and it needs the git and ``gh`` credentials that live there.
     confine: bool = True
+    #: When set, install a ``PreToolUse`` source guard (:func:`acumen.scrub.make_source_guard` on
+    #: Claude, its Codex equivalent) that denies fetching the target's own repository or source
+    #: distribution. ``block_repo`` is the target's remote URL (``None`` for a local target, whose
+    #: source is not fetchable anyway); ``block_pkg`` is the installed package name. Set only for
+    #: benchmark runs; meta-agents and ``ship`` leave both ``None``.
+    block_repo: str | None = None
+    block_pkg: str | None = None
     stderr: Callable[[str], None] | None = None
     #: Prices one provider usage block in USD. Claude enforces ``max_usd`` itself against the
     #: figure it bills; Codex reports tokens and no dollar amount, so enforcing a budget there
@@ -249,21 +256,28 @@ def _claude_hooks(options: AgentOptions) -> dict[str, Any]:
     alongside containment.
     """
     hooks: dict[str, Any] = {key: list(value) for key, value in (options.claude_hooks or {}).items()}
-    if not options.confine:
-        return hooks
+    pre = list(hooks.get("PreToolUse", []))
 
-    from acumen.guard import containment_hook
+    if options.block_repo or options.block_pkg:
+        from acumen.scrub import make_source_guard
 
-    reads, _ = _access_roots(options)
-    agent_home = options.env.get("HOME")
-    guard = containment_hook(
-        reads,
-        options.deny_paths,
-        cwd=options.cwd,
-        home=Path(agent_home) if agent_home else None,
-    )
-    hooks.setdefault("PreToolUse", [])
-    hooks["PreToolUse"] = [guard, *hooks["PreToolUse"]]
+        pre.insert(0, make_source_guard(options.block_repo, options.block_pkg))
+
+    if options.confine:
+        from acumen.guard import containment_hook
+
+        reads, _ = _access_roots(options)
+        agent_home = options.env.get("HOME")
+        guard = containment_hook(
+            reads,
+            options.deny_paths,
+            cwd=options.cwd,
+            home=Path(agent_home) if agent_home else None,
+        )
+        pre.insert(0, guard)
+
+    if pre:
+        hooks["PreToolUse"] = pre
     return hooks
 
 
@@ -522,7 +536,7 @@ def _codex_command(options: AgentOptions, prompt: str) -> list[str]:
         "--model",
         options.model,
     ]
-    if options.deny_paths:
+    if options.deny_paths or options.block_repo or options.block_pkg:
         command.append("--dangerously-bypass-hook-trust")
     reads, writes = _access_roots(options)
     # The Linux command sandbox re-executes the Codex binary through bubblewrap.
@@ -533,6 +547,10 @@ def _codex_command(options: AgentOptions, prompt: str) -> list[str]:
     # evaluates the command path it is given, so allowing /usr/bin does not make
     # an invocation through the /bin -> /usr/bin symlink readable.
     reads.extend(path for path in (Path("/bin"), Path("/lib"), Path("/lib64")) if path.exists())
+    if options.block_repo or options.block_pkg:
+        # The source guard imports acumen.scrub; make the package importable inside the sandbox
+        # regardless of install layout (an editable install lives outside the venv prefix).
+        reads.append(_acumen_package_root())
     reads = list(dict.fromkeys(reads))
     command.extend(("-c", 'default_permissions="acumen"'))
     filesystem = {":root": "deny", ":minimal": "read"}
@@ -558,9 +576,26 @@ def _codex_command(options: AgentOptions, prompt: str) -> list[str]:
     return command
 
 
-def _codex_guard_source(denied: Sequence[Path]) -> str:
-    """Return a standalone Codex PreToolUse guard for absolute denied roots."""
+def _acumen_package_root() -> Path:
+    """Directory containing the importable ``acumen`` package (its parent on ``sys.path``)."""
+    import acumen
+
+    return Path(acumen.__file__).resolve().parent.parent
+
+
+def _codex_guard_source(denied: Sequence[Path], *, repo: str | None = None, pkg_name: str | None = None) -> str:
+    """Return a standalone Codex PreToolUse guard.
+
+    Denies two things, either optional: any path resolving under ``denied`` (filesystem
+    containment), and — via :func:`acumen.scrub.find_source_fetch`, imported at run time because
+    the guard executes under acumen's own interpreter — any attempt to fetch the target's own
+    source repository/distribution (``repo``/``pkg_name``). Mirrors the Claude-side
+    :func:`acumen.scrub.make_source_guard` so both providers enforce the same rule.
+    """
     roots = repr([str(path.resolve()) for path in denied])
+    repo_repr = repr(repo)
+    pkg_repr = repr(pkg_name)
+    acumen_root_repr = repr(str(_acumen_package_root()))
     return f"""\
 import json
 import shlex
@@ -568,6 +603,8 @@ import sys
 from pathlib import Path
 
 ROOTS = [Path(value) for value in {roots}]
+REPO = {repo_repr}
+PKG = {pkg_repr}
 
 
 def blocked(value, cwd):
@@ -608,30 +645,50 @@ def strings(value):
             yield from strings(item)
 
 
+def deny(reason):
+    print(json.dumps({{
+        "hookSpecificOutput": {{
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }}
+    }}))
+    raise SystemExit(0)
+
+
 payload = json.load(sys.stdin)
 cwd = Path(payload.get("cwd") or ".").resolve()
-for value in strings(payload.get("tool_input") or {{}}):
+tool_input = payload.get("tool_input") or {{}}
+for value in strings(tool_input):
     hit = blocked(value, cwd)
     if hit is not None:
-        print(json.dumps({{
-            "hookSpecificOutput": {{
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": "acumen blocks access to isolated benchmark data: " + hit,
-            }}
-        }}))
-        raise SystemExit(0)
+        deny("acumen blocks access to isolated benchmark data: " + hit)
+
+if REPO or PKG:
+    if {acumen_root_repr} not in sys.path:
+        sys.path.insert(0, {acumen_root_repr})
+    try:
+        from acumen.scrub import find_source_fetch
+    except Exception:
+        find_source_fetch = None
+    if find_source_fetch is not None:
+        hit = find_source_fetch(payload.get("tool_name", ""), tool_input, repo=REPO, pkg_name=PKG)
+        if hit is not None:
+            deny(
+                "acumen benchmarks against the installed package only; fetching the target's "
+                "source repository or distribution is not permitted: " + str(hit)
+            )
 """
 
 
 def _install_codex_guard(options: AgentOptions) -> None:
     """Install a trusted, run-local Codex guard when isolation needs a deny boundary."""
-    if not options.deny_paths:
+    if not options.deny_paths and not (options.block_repo or options.block_pkg):
         return
     codex_home = Path(options.env["CODEX_HOME"])
     script = codex_home / "acumen_guard.py"
     script.parent.mkdir(parents=True, exist_ok=True)
-    script.write_text(_codex_guard_source(options.deny_paths))
+    script.write_text(_codex_guard_source(options.deny_paths, repo=options.block_repo, pkg_name=options.block_pkg))
     hooks_dir = options.cwd / ".codex"
     hooks_dir.mkdir(parents=True, exist_ok=True)
     hooks = {

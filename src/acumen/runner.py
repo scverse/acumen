@@ -266,6 +266,8 @@ def _build_options(
     read_dirs: tuple[Path, ...] = (),
     prices: PriceTable | None = None,
     stderr: Callable[[str], None] | None = None,
+    block_repo: str | None = None,
+    block_pkg: str | None = None,
 ) -> AgentOptions:
     """Assemble the SDK options for one run.
 
@@ -294,6 +296,8 @@ def _build_options(
         discover_skills=True,
         price_usd=pricer(model, prices),
         read_dirs=read_dirs,
+        block_repo=block_repo,
+        block_pkg=block_pkg,
         stderr=stderr,
     )
 
@@ -394,6 +398,12 @@ async def run_once(
             read_dirs=(target.venv_dir,),
             prices=prices,
             stderr=stderr,
+            # Deny fetching the target's own source (git clone, gh, curl, git+ install): the
+            # installed venv is scrubbed of any shipped skill, but the upstream repo is not, so a
+            # clone would smuggle it in and contaminate the baseline. Local targets pass None —
+            # their source is not fetchable and never lands in the sandbox.
+            block_repo=target.source if target.is_remote else None,
+            block_pkg=target.pkg_name,
         )
         try:
             result = await run_agent(prompt, options=options)

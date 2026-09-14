@@ -35,6 +35,7 @@ from acumen.agents import (
     AgentError,
     AgentOptions,
     AgentResult,
+    _claude_hooks,
     _claude_path_rule,
     _claude_settings,
     _codex_command,
@@ -677,6 +678,54 @@ def test_codex_filesystem_permissions_reach_the_binary_bwrap_execs(tmp_path: Pat
     # The sandbox resolves symlinks, so compare real paths on both sides.
     target = native.resolve()
     assert any(target.is_relative_to(Path(entry).resolve()) for entry in allowed)
+
+
+def test_codex_source_guard_denies_cloning_the_target(tmp_path: Path) -> None:
+    """A benchmark run sets block_repo/block_pkg (no deny_paths); Codex still gets a PreToolUse
+    guard whose generated script denies a clone of the target and allows ordinary work."""
+    work = tmp_path / "work"
+    work.mkdir()
+    codex_home = tmp_path / "home" / ".codex"
+    options = AgentOptions(
+        cwd=work,
+        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path / "home"), "CODEX_HOME": str(codex_home)},
+        model="gpt-5.6-sol",
+        block_repo="https://github.com/owner/repo",
+        block_pkg="repo",
+    )
+
+    _install_codex_guard(options)
+
+    hooks = json.loads((work / ".codex" / "hooks.json").read_text())
+    guard_cmd = hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    script = shlex.split(guard_cmd)[-1]
+
+    def run(command: str) -> subprocess.CompletedProcess[str]:
+        payload = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(work)}
+        return subprocess.run([sys.executable, script], input=json.dumps(payload), capture_output=True, text=True)
+
+    denied = run("git clone https://github.com/owner/repo")
+    assert denied.returncode == 0
+    assert json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert run("python script.py").stdout.strip() == ""  # no output => allowed
+
+
+def test_claude_hooks_add_a_source_guard_only_when_blocking(tmp_path: Path) -> None:
+    """The source guard is one extra PreToolUse hook on top of filesystem containment, and only
+    when block_repo/block_pkg are set (meta-agents and ship leave them unset)."""
+    pytest.importorskip("claude_agent_sdk")
+    work = tmp_path / "work"
+    work.mkdir()
+    base = AgentOptions(
+        cwd=work,
+        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path / "home"), "CLAUDE_CONFIG_DIR": str(tmp_path / "cfg")},
+        model="claude-haiku-4-5",
+    )
+
+    without = _claude_hooks(base)
+    with_block = _claude_hooks(replace(base, block_repo="https://github.com/owner/repo", block_pkg="repo"))
+
+    assert len(with_block["PreToolUse"]) == len(without["PreToolUse"]) + 1
 
 
 def test_claude_options_write_run_local_settings_file(tmp_path: Path) -> None:

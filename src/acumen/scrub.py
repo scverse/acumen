@@ -285,6 +285,134 @@ def find_skill_access(tool_name: str, tool_input: dict[str, Any], original_src: 
     return None
 
 
+def _iter_strings(value: Any) -> Any:
+    """Yield every string anywhere inside a tool_input (dict/list/scalar), provider-agnostic.
+
+    Claude carries a Bash command under ``command`` and a read path under ``file_path``; Codex
+    nests the argv differently. Walking all string leaves means one matcher covers both without
+    knowing either schema.
+    """
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_strings(item)
+
+
+def _source_needles(repo: str | None) -> frozenset[str]:
+    """Lowercased substrings that identify the target's own repository.
+
+    ``owner/repo`` is the load-bearing one — every clone/fetch/archive URL and every
+    ``gh repo clone`` names it — with ``host/owner/repo`` added for extra specificity. A local
+    ``repo`` (a filesystem path, not a URL) yields nothing: its source is not fetchable over the
+    network and the sandbox never contains it, so containment already covers it.
+    """
+    if not repo:
+        return frozenset()
+    text = repo.strip().lower().rstrip("/")
+    if text.endswith(".git"):
+        text = text[:-4]
+    for prefix in ("https://", "http://", "ssh://", "git://"):
+        if text.startswith(prefix):
+            text = text[len(prefix) :]
+            break
+    text = text.replace(":", "/")  # git@github.com:owner/repo -> git@github.com/owner/repo
+    head = text.split("/", 1)[0]
+    if "@" in head:  # strip userinfo like git@
+        text = text.split("@", 1)[1]
+    parts = [part for part in text.split("/") if part]
+    needles: set[str] = set()
+    if len(parts) >= 3:
+        host, owner, name = parts[0], parts[-2], parts[-1]
+        needles.add(f"{owner}/{name}")
+        needles.add(f"{host}/{owner}/{name}")
+    return frozenset(needles)
+
+
+def _normalise_token(value: str) -> str:
+    token = value.strip().lower().rstrip("/")
+    if token.endswith(".git"):
+        token = token[:-4]
+    return token.replace(":", "/")
+
+
+_ARCHIVE_SUFFIXES = (".tar.gz", ".tgz", ".zip", ".whl")
+
+
+def find_source_fetch(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    repo: str | None = None,
+    pkg_name: str | None = None,
+) -> str | None:
+    """Return the first token that fetches the target's own source repo/distribution, else ``None``.
+
+    Pure and side-effect free, so it is unit-testable without an agent (mirrors
+    :func:`find_skill_access`). It flags ``git clone``/``fetch``, ``gh repo clone``,
+    ``git+<repo>`` installs and any ``curl``/``wget`` of a ``github.com``/``codeload``/
+    ``raw.githubusercontent`` URL — all of which must name ``owner/repo`` — plus a narrow
+    check for downloading the package's own source archive from an index.
+
+    It deliberately does **not** block reads of skill/guidance files: in the skill arm the agent
+    legitimately reads its own installed skill under ``<sandbox>/.claude/skills/``. Blocking the
+    fetch is what matters — without the clone there is no external skill tree to read.
+    """
+    needles = _source_needles(repo)
+    pkg = pkg_name.lower() if pkg_name else None
+    if not needles and not pkg:
+        return None
+    for value in _iter_strings(tool_input or {}):
+        token = _normalise_token(value)
+        if any(needle in token for needle in needles):
+            return value
+        if pkg and pkg in token:
+            # A source archive of the package (``…/pkg-1.2.3.tar.gz``) …
+            if any(suffix in token for suffix in _ARCHIVE_SUFFIXES):
+                return value
+            # … or a pip/uv install/download of the package. The benchmark forbids installing
+            # anything (the package is already present), so naming it here is only ever an
+            # attempt to fetch a fresh, unscrubbed copy.
+            if ("pip" in token or "uv " in token) and ("install" in token or "download" in token):
+                return value
+    return None
+
+
+def make_source_guard(repo: str | None, pkg_name: str | None) -> HookMatcher:
+    """Build the ``PreToolUse`` hook that denies a benchmark agent the target's own source.
+
+    ``matcher=None`` fires the hook for every tool. Used only by benchmark runs; meta-agents get
+    :func:`make_skill_guard` instead, and ``ship`` gets neither.
+    """
+    from claude_agent_sdk import HookMatcher
+
+    async def guard(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
+        hit = find_source_fetch(
+            input_data.get("tool_name", ""),
+            input_data.get("tool_input", {}) or {},
+            repo=repo,
+            pkg_name=pkg_name,
+        )
+        if hit is None:
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    "acumen benchmarks against the already-installed package only; fetching the "
+                    f"target's source repository or distribution is not permitted ({hit}). Work "
+                    "from the installed package."
+                ),
+            }
+        }
+
+    return HookMatcher(matcher=None, hooks=[guard])
+
+
 def make_skill_guard(original_src: Path) -> HookMatcher:
     """Build the ``PreToolUse`` hook that denies an agent any existing skill/guidance.
 
