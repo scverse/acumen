@@ -263,6 +263,71 @@ def test_cmd_fit_calls_build_training_rows_with_two_args(tmp_path: Path, monkeyp
     assert (tmp_path / "training.csv").is_file()
 
 
+def test_cmd_fit_stops_when_validation_hits_100_percent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A perfect validation epoch ends the loop immediately — even under a fixed --epochs count."""
+    import types
+
+    import acumen.cli as cli
+    from acumen.training import EpochRow
+
+    assert main(["init", "--dir", str(tmp_path)]) == 0
+
+    def perfect_row(version: str) -> EpochRow:
+        return EpochRow(
+            epoch=1,
+            version=version,
+            parent="noskill",
+            n_train=2,
+            n_valid=2,
+            train_success=1.0,
+            valid_success=1.0,  # the whole point: a perfect validation score
+            train_cost=0.1,
+            valid_cost=0.1,
+            train_success_by_model={},
+            valid_success_by_model={},
+            train_cost_by_model={},
+            valid_cost_by_model={},
+        )
+
+    epochs_run = 0
+
+    def fake_epoch(*a: object, **k: object) -> object:
+        nonlocal epochs_run
+        epochs_run += 1
+        return types.SimpleNamespace(new_version="v1", first=True, resumed=False, parent_version=None)
+
+    monkeypatch.setattr(cli, "_prepare_pass", lambda cfg, args: ({}, "session", None, None))
+    monkeypatch.setattr(cli, "_run_one_epoch", fake_epoch)
+    monkeypatch.setattr(cli, "build_training_rows", lambda runs_root, cfg: [perfect_row("v1")])
+    monkeypatch.setattr(cli, "write_training_csv", lambda rows, out: Path(out).write_text("version\n"))
+
+    rc = main(
+        [
+            "fit",
+            "--epochs",  # fixed mode: proves the 100% rule overrides an explicit count
+            "3",
+            "--config",
+            str(tmp_path / "config.yaml"),
+            "--tasks",
+            str(tmp_path / "tasks.yaml"),
+            "--runs",
+            str(tmp_path / "runs"),
+            "--skills",
+            str(tmp_path / "skills"),
+            "--wiki",
+            str(tmp_path / "wiki"),
+            "--out",
+            str(tmp_path / "training.csv"),
+        ]
+    )
+
+    assert rc == 0
+    assert epochs_run == 1, "fit should stop after the first perfect epoch, not run all 3"
+    assert "validation success reached 100%" in capsys.readouterr().out
+
+
 def test_codex_trace_regex_matches_tracing_but_not_sandbox_errors() -> None:
     from acumen.agents import _CODEX_TRACE_RE
 

@@ -143,6 +143,7 @@ from acumen.training import (
     best_version,
     build_training_rows,
     epochs_since_best,
+    is_perfect,
     patience_exhausted,
     write_training_csv,
 )
@@ -4733,6 +4734,15 @@ def test_epochs_since_best_and_patience_use_strict_best_so_far() -> None:
     assert patience_exhausted([0.79, 0.70, 0.75], 2) is True
     # v1-best -> v2-worse -> v3-worse-than-v1 stops at patience 2 (the user's example).
     assert patience_exhausted([0.79, 0.70, 0.75], 1) is True
+
+
+def test_is_perfect_only_for_a_full_pass() -> None:
+    """A perfect validation score is exactly 1.0; nan/None (no runs) and anything less are not."""
+    assert is_perfect(1.0) is True
+    assert is_perfect(0.99) is False
+    assert is_perfect(0.0) is False
+    assert is_perfect(float("nan")) is False
+    assert is_perfect(None) is False
 
 
 def test_build_training_rows_maps_arms_and_computes_means(tmp_path: Path, make_result) -> None:

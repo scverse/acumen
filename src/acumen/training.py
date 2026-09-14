@@ -203,6 +203,15 @@ def patience_exhausted(scores: list[float], patience: int) -> bool:
     return epochs_since_best(scores) >= patience
 
 
+def is_perfect(score: float | None) -> bool:
+    """Whether an epoch's validation mean success is a perfect 1.0 (every valid run passed).
+
+    A perfect score leaves nothing to gain, so ``fit`` stops on it regardless of the epoch cap.
+    ``None``/``nan`` (an arm with no runs) is not perfect.
+    """
+    return score is not None and not (isinstance(score, float) and math.isnan(score)) and score >= 1.0
+
+
 def best_version(rows: list[EpochRow]) -> str | None:
     """The version with the highest validation mean success (first on a tie), or ``None``."""
     best: str | None = None

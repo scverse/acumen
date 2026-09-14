@@ -63,6 +63,7 @@ from acumen.training import (
     best_version,
     build_training_rows,
     epochs_since_best,
+    is_perfect,
     patience_exhausted,
     write_training_csv,
 )
@@ -1175,6 +1176,11 @@ def _cmd_fit(args: argparse.Namespace) -> int:
         best = best_version(rows)
         since = epochs_since_best(valids)
         print(_epoch_bar(done + 1, limit, current, best=best, patience=args.patience, since_best=since, fixed=fixed))
+
+        # A perfect validation score leaves nothing to gain — stop even under a fixed --epochs.
+        if current is not None and is_perfect(current.valid_success):
+            print(f"\nearly stop: validation success reached 100% at {current.version}.")
+            break
 
         if not fixed and patience_exhausted(valids, args.patience):
             print(f"\nearly stop: validation mean success did not improve in {args.patience} epoch(s).")
