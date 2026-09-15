@@ -34,7 +34,8 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
-from matplotlib.colors import is_color_like
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm, is_color_like
 from matplotlib.legend_handler import HandlerPatch
 from matplotlib.lines import Line2D
 from matplotlib.patches import FancyArrowPatch, Patch
@@ -1510,65 +1511,172 @@ _LOADED_COLUMNS = (
 #: Sentinel for the pooled row that restricts both sides to the models which loaded the skill,
 #: alongside :data:`_ALL_MODELS` for the row that pools the arm as it actually ran.
 _LOADED_MODELS = "\x00loaded-models"
-_LOADED_MODELS_LABEL = "models that loaded"
-
-#: Loaded runs below this count are reported without a direction. The rate is still shown —
-#: it is what was measured — but a delta off one or two runs is noise wearing a percentage,
-#: and colouring it green would read as a finding.
-_MIN_LOADED = 5
 
 
-def _loaded_table_html(df: pd.DataFrame) -> str:
-    """The loaded-only comparison: one row per model per skill, pooled row per skill."""
+#: The diverging colour scale for the loaded dotplot: loss red → light neutral → gain green, the
+#: same red/green a delta wears in the tables. Models are the *rows* here, not a colour, so this
+#: scale has the whole colour channel to itself. A numeric Δ rides every dot, so the red/green is
+#: never the sole carrier of the value — the label is the colourblind-safe reading of the sign.
+_DELTA_LOSS = "#a4553f"
+_DELTA_GAIN = "#3f6b4a"
+_DELTA_MID = "#efe9de"  # a light warm neutral, so a near-zero delta recedes toward the page
+_DELTA_CMAP = LinearSegmentedColormap.from_list("loaded-delta", [_DELTA_LOSS, _DELTA_MID, _DELTA_GAIN])
+
+#: Dot area (matplotlib scatter ``s``, in points²): proportional to the load rate (so the radius
+#: goes as its root), capped at :data:`_DOT_AREA_MAX` at a rate of 1 and floored at
+#: :data:`_DOT_AREA_MIN` so a small-but-nonzero rate is still a visible dot rather than a speck.
+_DOT_AREA_MAX = 1500.0
+_DOT_AREA_MIN = 90.0
+#: A cell where the skill never loaded draws a small hollow ring at this area. It reads as never
+#: measured, which is a different thing from a measured zero.
+_DOT_AREA_EMPTY = 70.0
+#: A filled dot at least this large backs its own Δ label, so the label sits inside it (white or
+#: ink by the fill's luminance). Smaller dots carry the label just beneath instead.
+_DOT_AREA_LABEL_INSIDE = 760.0
+
+
+def _signed_pct(value: float) -> str:
+    """A signed percentage for a delta.
+
+    ``"+33%"`` / ``"-17%"``, and ``"0%"`` when it rounds to nothing (never ``"-0%"``: the sign
+    would claim a direction the rounding just erased).
+    """
+    return "0%" if round(value, 2) == 0 else f"{value:+.0%}"
+
+
+def _dot_area(load_rate: float) -> float:
+    """Scatter area for a load rate — proportional, floored so a low rate stays visible."""
+    return max(_DOT_AREA_MIN, load_rate * _DOT_AREA_MAX)
+
+
+def _luminance(rgb: tuple[float, float, float]) -> float:
+    """Rough relative luminance of an RGB triple, for choosing ink vs. white text on a fill."""
+    r, g, b = rgb[:3]
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def loaded_dotplot_figure(df: pd.DataFrame) -> plt.Figure:
+    """The loaded-only comparison as a dot grid — one dot per (model, skill version).
+
+    Rows are the models, most-potent first, with a pooled *all models* row set off at the bottom.
+    Columns are the skill versions. Each dot's **colour** is the change in success rate over the
+    no-skill baseline among the runs that actually loaded the skill (green better, red worse, a
+    light neutral at no change), and its **area** is the load rate, so a big green dot reads
+    "loaded often and helped" and a small one "rarely loaded". The numeric Δ rides every dot, so
+    the red/green never carries the value alone (the colourblind-safe reading is the label). A
+    hollow ring marks a cell where the skill never loaded, which reads as no evidence rather than
+    a measured zero.
+    """
     table = loaded_only_rates(df)
-    if table.empty:
-        return '<div class="note">No skill arm to compare — this report covers the baseline only.</div>'
+    table = table[table["scope"].isin(("model", "all"))]
+    arms = [arm for arm in _arms_in_order(df) if arm != NOSKILL_ARM]
+    present = {m for m in table["model"] if m != _ALL_MODELS}
+    models = [m for m in _models_in_order(df) if m in present]
+    # The pooled row restates the single model when there is only one, so it is left out then —
+    # the same rule the metrics grid uses for its pooled bar (see :func:`_bar_rows`).
+    has_pool = len(models) > 1
+    row_models = [*models, *([_ALL_MODELS] if has_pool else [])]
 
-    def pct(value: float) -> str:
-        return "&mdash;" if pd.isna(value) else f"{value:.0%}"
+    by_key = {(row.arm, row.model): row for row in table.itertuples()}
 
-    def signed(value: float) -> str:
-        # A difference that rounds to nothing is written "0%", never "-0%": the sign would
-        # claim a direction the rounding just erased.
-        return "0%" if round(value, 2) == 0 else f"{value:+.0%}"
+    n = len(models)
+    pool_y = n + 0.4  # an extra half-slot of air above the pooled row
+    y_of: dict[object, float] = {m: float(i) for i, m in enumerate(models)}
+    if has_pool:
+        y_of[_ALL_MODELS] = pool_y
+    y_bottom = pool_y if has_pool else n - 1
 
-    labels = {"all": _ALL_MODELS_LABEL, "matched": _LOADED_MODELS_LABEL}
-    thin = False
-    body = []
-    for row in table.itertuples():
-        pooled = row.scope != "model"
-        label = labels.get(row.scope) or _model_label(row.model)
-        if pd.isna(row.delta):
-            delta = "&mdash;"
-        elif row.loaded < _MIN_LOADED:
-            # Shown, but undressed: too few runs to read a direction from.
-            thin = True
-            delta = f"{signed(row.delta)}&#8203;<sup>†</sup>"
-        elif round(row.delta, 2) == 0:
-            delta = signed(row.delta)
-        else:
-            delta = f'<span class="{"gain" if row.delta > 0 else "loss"}">{signed(row.delta)}</span>'
-        cells = (
-            f"<td>{_skill_label(row.arm)}</td><td>{html.escape(label)}</td>"
-            f"<td>{row.loaded}/{row.runs}</td><td>{pct(row.load_rate)}</td>"
-            f"<td>{pct(row.baseline)}</td><td>{pct(row.overall)}</td>"
-            f"<td>{pct(row.rate)}</td><td>{delta}</td>"
+    deltas = table["delta"].dropna().abs()
+    reach = float(deltas.max()) if len(deltas) else 0.0
+    # Symmetric about zero so the neutral midpoint is a true no-change; rounded up to a tenth and
+    # floored at 0.1 so a tiny spread is not stretched into a full red/green swing.
+    m = max(0.1, math.ceil(reach * 10) / 10)
+    norm = TwoSlopeNorm(vmin=-m, vcenter=0.0, vmax=m)
+
+    with plt.rc_context(_RC):
+        # Kept close to square per cell and not much wider than it needs to be: the page scales the
+        # figure to one text column, so an over-wide figure just renders every label small.
+        width = 1.9 + 0.95 * len(arms) + 1.5  # plot columns + the size legend to the right
+        height = 0.9 + 0.85 * len(row_models) + 1.2  # rows (roomy, so full dots never touch) + bar
+        fig, ax = plt.subplots(figsize=(width, height))
+
+        for xi, arm in enumerate(arms):
+            for model in row_models:
+                row = by_key.get((arm, model))
+                if row is None:
+                    continue  # this model was not run in this arm: reserve the slot, draw nothing
+                y = y_of[model]
+                if pd.isna(row.delta) or row.load_rate == 0:
+                    ax.scatter(
+                        [xi], [y], s=_DOT_AREA_EMPTY, facecolors="none", edgecolors=INK, linewidths=1.0, zorder=3
+                    )
+                    ax.text(xi, y + 0.36, "—", ha="center", va="center", fontsize=11, color=BAR, zorder=4)
+                    continue
+                area = _dot_area(row.load_rate)
+                fill = _DELTA_CMAP(norm(row.delta))
+                ax.scatter([xi], [y], s=area, color=fill, edgecolors=PLOT_BG, linewidths=1.2, zorder=3)
+                text = _signed_pct(row.delta)
+                if area >= _DOT_AREA_LABEL_INSIDE:
+                    ink = "#ffffff" if _luminance(fill) < 0.55 else INK
+                    ax.text(
+                        xi, y, text, ha="center", va="center", fontsize=10.5, fontweight="bold", color=ink, zorder=4
+                    )
+                else:
+                    ax.text(xi, y + 0.40, text, ha="center", va="center", fontsize=10.5, color=INK, zorder=4)
+
+        ax.set_xticks(range(len(arms)))
+        ax.set_xticklabels([_skill_label(arm) for arm in arms], fontsize=12)
+        yticks = [*range(n), *([pool_y] if has_pool else [])]
+        ylabels = [*(_model_label(model) for model in models), *(["all models"] if has_pool else [])]
+        ax.set_yticks(yticks)
+        ax.set_yticklabels(ylabels, fontsize=12)
+        ax.set_xlim(-0.5, len(arms) - 0.5)
+        ax.set_ylim(-0.6, y_bottom + 0.6)
+        ax.invert_yaxis()  # first model (most potent) on top, pooled row at the bottom
+        if has_pool:
+            ax.axhline((n - 1 + pool_y) / 2, color=INK, alpha=0.16, linewidth=0.8)
+        ax.tick_params(length=0)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        sm = ScalarMappable(norm=norm, cmap=_DELTA_CMAP)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax, orientation="horizontal", fraction=0.05, pad=0.12, aspect=26)
+        cbar.set_ticks([-m, 0.0, m])
+        cbar.set_ticklabels([f"{-m:+.0%}", "0%", f"{m:+.0%}"])
+        cbar.ax.tick_params(labelsize=11, length=0)
+        cbar.set_label("Δ success rate when loaded (green better, red worse)", fontsize=12)
+        cbar.outline.set_visible(False)
+
+        # A compact size key: three matching dots, spaced just clear of one another.
+        size_rates = [0.33, 0.66, 1.0]
+        size_handles = [
+            Line2D(
+                [],
+                [],
+                marker="o",
+                linestyle="none",
+                markerfacecolor="#c9c2b4",
+                markeredgecolor=PLOT_BG,
+                markersize=2 * math.sqrt(_dot_area(r) / math.pi),
+            )
+            for r in size_rates
+        ]
+        fig.legend(
+            size_handles,
+            [f"{r:.0%}" for r in size_rates],
+            title="Load rate",
+            frameon=False,
+            loc="center left",
+            bbox_to_anchor=(1.0, 0.5),
+            labelspacing=2.4,
+            borderpad=1.0,
+            handletextpad=1.4,
+            fontsize=12,
+            title_fontsize=12,
         )
-        body.append(f'<tr class="{"pooled" if pooled else ""}">{cells}</tr>')
-
-    footnote = (
-        f'<p class="task-desc">† fewer than {_MIN_LOADED} loaded runs — the rate is what was '
-        "measured, but the difference is not readable at that count.</p>"
-        if thin
-        else ""
-    )
-    return f"""<div class="table-center"><table class="tests loaded">
-<thead><tr>
-<th>Skill</th><th>Model</th><th>Loaded</th><th>Load rate</th>
-<th>Baseline</th><th>All runs</th><th>When loaded</th><th>&Delta; loaded</th>
-</tr></thead>
-<tbody>{"".join(body)}</tbody>
-</table>{footnote}</div>"""
+        fig.tight_layout()
+    return fig
 
 
 @dataclass(frozen=True)
@@ -1785,14 +1893,10 @@ th, td {{ border: 1px solid {INK}22; padding: 0.3rem 0.55rem; text-align: right;
 th:first-child, td:first-child {{ text-align: left; }}
 thead th {{ background: {BAR}1a; }}
 tbody tr:nth-child(even) td {{ background: {INK}08; }}
-tr.fail td {{ background: {ACCENT}66; }}
-/* The loaded-only table names models in its second column, and closes each skill with a
-   pooled row summarising the ones above it. The delta's sign carries the direction; colour
-   only reinforces it, so the pair is never read by hue alone. */
-table.loaded td:nth-child(2) {{ text-align: left; }}
-table.loaded tr.pooled td {{ font-weight: 600; background: {BAR}1f; }}
-.gain {{ color: #3f6b4a; }}
-.loss {{ color: #a4553f; }}
+/* Outrank the zebra rule above: as ``tr.fail td`` it scores below ``tbody tr:nth-child(even)
+   td``, so a failed run on an even row keeps the stripe and never lights up. Matching that
+   selector's specificity (and sitting after it) lets the fail tint win on every row. */
+tbody tr.fail td {{ background: {ACCENT}66; }}
 /* Sorting affordances appear only once the script has wired the table up, so with JS off
    nothing invites a click that would do nothing. The arrow is padded for, not floated over
    the label, so the heading does not shift when the column becomes the sorted one. */
@@ -2027,6 +2131,16 @@ def render_report(
     colors = resolve_palette(_models_in_order(df), palette)
     overview_uri = figure_data_uri(metrics_figure(df, split_hue=False, colors=colors))
     tradeoff_uri = figure_data_uri(tradeoff_figure(df, colors=colors))
+    # The loaded dotplot only exists once there is a skill arm to compare; a baseline-only report
+    # keeps the note the table used to show.
+    if loaded_only_rates(df).empty:
+        loaded_body = '<div class="note">No skill arm to compare — this report covers the baseline only.</div>'
+    else:
+        loaded_uri = figure_data_uri(loaded_dotplot_figure(df))
+        loaded_body = (
+            '<figure><img alt="Change in success rate when the skill loaded, by model and version"'
+            f' src="{loaded_uri}"></figure>'
+        )
     tests = skill_tests(df)
     task_by_id = {t.id: t for t in tasks or []}
     skills_section, skills_toc = _skills_section_html(df, skills_root)
@@ -2104,19 +2218,16 @@ def render_report(
  unit is the task rather than the run.</p>
 {_tests_table_html(tests)}
 <h3 id="loaded">Did it help when it actually loaded?</h3>
-<p class="task-desc">A skill-arm run where the skill never loaded is not evidence about the
- skill's body — the agent never read it, so the run measures the baseline with extra steps.
- Those runs are held out here instead of counted against the skill, which separates a
- <em>description</em> problem (the skill does not load) from a <em>content</em> problem (it
- loads and does not help). Load rate varies widely by model, so the dilution is uneven across
- the matrix. Two pooled rows close each skill, and the pair is the point: <em>all models</em>
- pools the arm as it actually ran, while <em>models that loaded</em> restricts both sides to the
- models that contributed a loaded run. Where the two disagree, the gap is model mix, not skill
- effect — a model that fails every run sits in the all-models baseline while contributing
- nothing to the loaded column. Read this as a diagnostic, not as the headline: conditioning on
- load conditions on something the agent chose, so the loaded runs are not a random subset and a
- gain here is not the same evidence as the test above.</p>
-{_loaded_table_html(df)}
+<p class="task-desc">If a skill never loads, the agent never reads it, so that run tells us nothing
+ about the skill itself and only measures the baseline. Setting those runs aside lets us see
+ whether the guidance helped in the runs where it did reach the agent. This helps tell apart a
+ skill that fails to load from one that loads but still doesn't help. In the plot below, every dot
+ is one model on one skill version. The colour shows how much the success rate changed against the
+ baseline among the runs where the skill loaded, green for better and red for worse. The size shows
+ how often the skill loaded, and a hollow ring means it never did. Keep in mind that a skill
+ doesn't load at random. Whether it loads depends on the model and the task, so these numbers can
+ flatter a skill and shouldn't be read as proof that it works. For that, look at the test above.</p>
+{loaded_body}
 </section>
 <section id="per-task">
 <h2>Per-task breakdown</h2>

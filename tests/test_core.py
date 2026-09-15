@@ -107,6 +107,7 @@ from acumen.report import (
     arm_metrics,
     build_report,
     load_results,
+    loaded_dotplot_figure,
     loaded_only_rates,
     metrics_figure,
     render_report,
@@ -3574,6 +3575,19 @@ def test_reports_show_inferred_cost_and_csv_keeps_the_recorded_one(
     assert "provider_cost_usd" not in exported.columns
 
 
+def test_render_report_shows_the_loaded_section_as_a_dotplot_not_a_table(
+    runs_root: Path, model: str, make_result, tmp_path: Path
+) -> None:
+    """The loaded section is now an embedded dotplot figure, and the old table is gone."""
+    key = RunKey(arm="skill_v1", split="valid", model=model, task_id="example_task", rep=1)
+    make_result(runs_root, key, skill_loaded=True)
+    rendered = render_report(load_results(runs_root), tmp_path)
+
+    assert 'alt="Change in success rate when the skill loaded' in rendered
+    assert 'class="tests loaded"' not in rendered  # the wide table it replaced
+    assert "models that loaded" not in rendered  # the dropped pooled row
+
+
 def test_modern_result_without_inferred_cost_stays_unpriced_in_report(runs_root: Path, model: str, make_result) -> None:
     """A recorded provider estimate must never substitute for missing inference."""
     key = RunKey(arm="noskill", split="valid", model=model, task_id="example_task", rep=1)
@@ -4246,6 +4260,98 @@ def test_loaded_only_rates_reports_a_model_that_never_loaded() -> None:
     assert row["loaded"] == 0
     assert row["load_rate"] == 0.0
     assert pd.isna(row["rate"]) and pd.isna(row["delta"])
+
+
+def _dots(figure: plt.Figure) -> dict[tuple[float, float], object]:
+    """Every scatter mark on the dotplot's main axes, keyed by its ``(x, y)`` offset."""
+    ax = figure.axes[0]  # axes[1] is the colour bar
+    dots: dict[tuple[float, float], object] = {}
+    for coll in ax.collections:
+        for x, y in coll.get_offsets():
+            dots[(round(float(x), 3), round(float(y), 3))] = coll
+    return dots
+
+
+def test_loaded_dotplot_colours_each_dot_by_its_delta_sign() -> None:
+    """A gain reads green, a loss reads red, and no change reads neutral — the sign in the hue."""
+    rows = (
+        # A model the skill lifts: baseline all fail, loaded all pass → a clear gain.
+        [_run("noskill", "up", False, None) for _ in range(6)]
+        + [_run("skill_v1", "up", True, True) for _ in range(6)]
+        # A model the skill hurts: baseline all pass, loaded all fail → a clear loss.
+        + [_run("noskill", "down", True, None) for _ in range(6)]
+        + [_run("skill_v1", "down", False, True) for _ in range(6)]
+    )
+    figure = loaded_dotplot_figure(pd.DataFrame(rows))
+    try:
+        # Models sort alphabetically within the same tier: "down" on top (y=0), "up" below (y=1).
+        down = _dots(figure)[(0.0, 0.0)].get_facecolors()[0]
+        up = _dots(figure)[(0.0, 1.0)].get_facecolors()[0]
+    finally:
+        plt.close(figure)
+    assert down[0] > down[1]  # loss: more red than green
+    assert up[1] > up[0]  # gain: more green than red
+
+
+def test_loaded_dotplot_area_tracks_load_rate_and_rings_a_never_loaded_cell() -> None:
+    """A bigger dot means the skill loaded more often; a cell that never loaded is a hollow ring."""
+    rows = (
+        [_run("noskill", "often", False, None) for _ in range(6)]
+        + [_run("noskill", "never", False, None) for _ in range(6)]
+        # "often" loads every run; "never" loads none of them.
+        + [_run("skill_v1", "often", True, True) for _ in range(6)]
+        + [_run("skill_v1", "never", False, False) for _ in range(6)]
+    )
+    figure = loaded_dotplot_figure(pd.DataFrame(rows))
+    try:
+        dots = _dots(figure)
+        # "never" sorts before "often": y=0 is the never-loaded ring, y=1 the fully-loaded dot.
+        never = dots[(0.0, 0.0)]
+        often = dots[(0.0, 1.0)]
+        never_area = float(never.get_sizes()[0])
+        often_area = float(often.get_sizes()[0])
+        # A hollow ring has a fully transparent fill; the loaded dot is opaque.
+        never_alpha = never.get_facecolors()[0][3] if len(never.get_facecolors()) else 0.0
+        often_alpha = often.get_facecolors()[0][3]
+    finally:
+        plt.close(figure)
+    assert often_area > never_area
+    assert never_alpha == 0.0 and often_alpha == 1.0
+
+
+def test_loaded_dotplot_rows_are_models_plus_one_pooled_row() -> None:
+    """Rows are the models and a single pooled *all models* row — never *models that loaded*."""
+    rows = [_run("noskill", "a", True, None), _run("noskill", "b", True, None)] + [
+        _run("skill_v1", "a", True, True),
+        _run("skill_v1", "b", False, True),
+    ]
+    figure = loaded_dotplot_figure(pd.DataFrame(rows))
+    try:
+        ylabels = [t.get_text() for t in figure.axes[0].get_yticklabels()]
+        xlabels = [t.get_text() for t in figure.axes[0].get_xticklabels()]
+    finally:
+        plt.close(figure)
+    assert ylabels == ["a", "b", "all models"]
+    assert "models that loaded" not in ylabels
+    assert xlabels == ["Skill v1"]
+
+
+def test_loaded_dotplot_labels_each_dot_with_its_signed_delta() -> None:
+    """Every dot carries its signed Δ, and a never-loaded cell shows an em dash instead."""
+    rows = (
+        [_run("noskill", "up", False, None) for _ in range(6)]
+        + [_run("skill_v1", "up", True, True) for _ in range(6)]
+        # A model that never loads the skill: no delta to show, an em dash instead.
+        + [_run("noskill", "off", True, None) for _ in range(6)]
+        + [_run("skill_v1", "off", True, False) for _ in range(6)]
+    )
+    figure = loaded_dotplot_figure(pd.DataFrame(rows))
+    try:
+        texts = {t.get_text() for t in figure.axes[0].texts}
+    finally:
+        plt.close(figure)
+    assert "+100%" in texts  # the clear gain
+    assert "—" in texts  # the never-loaded cell
 
 
 # --- split diff ------------------------------------------------------------------------
