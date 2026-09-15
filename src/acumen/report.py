@@ -8,7 +8,7 @@ few group-bys. Figures are matplotlib rendered to PNG and inlined as base64 data
 The report is regenerated (overwritten) at each skill version — it always reflects every
 run currently on disk across every arm.
 
-The visualisations show **test-split** performance — the held-out measure of whether a
+The visualisations show **valid-split** performance — the held-out measure of whether a
 skill helps. The full per-run table below them still lists both splits, so train runs
 remain inspectable.
 """
@@ -16,7 +16,6 @@ remain inspectable.
 from __future__ import annotations
 
 import base64
-import difflib
 import html
 import io
 import json
@@ -40,21 +39,24 @@ from matplotlib.legend_handler import HandlerPatch
 from matplotlib.lines import Line2D
 from matplotlib.patches import FancyArrowPatch, Patch
 
+# The split-diff renderer moved to :mod:`acumen.htmldiff` so the transcript can share it without
+# importing this module (and its matplotlib weight). ``_split_diff_rows`` is re-exported because
+# tests reach it through ``acumen.report``; ``_split_diff_table`` backs the skill diff below.
+from acumen.htmldiff import _split_diff_rows, _split_diff_table
+from acumen.markdown import render_markdown
 from acumen.paths import NOSKILL_ARM, RESULT_FILE, TRANSCRIPT_HTML, skill_from_arm
 from acumen.skills import SkillError, read_meta, skill_content, skill_dir
 from acumen.tasks import Task
+from acumen.theme import ACCENT, BAR, DIFF_CSS, INK, PAGE, PALETTE_ROOT_CSS, PLOT_BG
+
+__all__ = ["_split_diff_rows"]
 
 # ── Palette ──────────────────────────────────────────────────────────────────────────
-# A warm-neutral scheme fixed by the maintainer. The page and the plot area are both white,
-# so a figure sits on the page with no visible frame around it and the ink carries the
-# structure. Bars are coloured by model (see the sequential ramp below), with a grey bar
-# pooling every model; train/test is a texture, not a colour.
-INK = "#1c1813"  # axes, text, ticks
-PAGE = "#ffffff"  # page + figure background
-PLOT_BG = "#ffffff"  # the plot area itself; also the hairline between adjacent bars
-SURFACE = "#f7f3ec"  # the one tinted surface — the inline skill diffs, so code reads as a block
-BAR = "#565149"  # a neutral tone, used where model hue does not apply
-ACCENT = "#b2ac9e"  # the light warm tone, for table tints and notes
+# A warm-neutral scheme fixed by the maintainer, shared with the transcript renderer so both
+# pages read as one product (see :mod:`acumen.theme`). The page and the plot area are both white,
+# so a figure sits on the page with no visible frame around it and the ink carries the structure.
+# Bars are coloured by model (see the sequential ramp below), with a grey bar pooling every model;
+# train/test is a texture, not a colour.
 
 # The model is the hue, in two dimensions: the *provider* picks the hue family, and the tier
 # picks the step within it — darkest is most potent, each weaker tier a lighter step of the
@@ -91,9 +93,9 @@ _ALL_MODELS = "\x00all-models"  # sentinel model id; not a value any real id can
 _ALL_MODELS_LABEL = "all models"
 _ALL_MODELS_COLOR = "#9b968d"
 
-# Train vs test is a *texture*, not a colour — so it never competes with the model hue.
-_SPLIT_ORDER = ("train", "test")
-_SPLIT_HATCH = {"train": "////", "test": ""}
+# Train vs valid is a *texture*, not a colour — so it never competes with the model hue.
+_SPLIT_ORDER = ("train", "valid")
+_SPLIT_HATCH = {"train": "////", "valid": ""}
 
 #: rcParams applied around every figure via :func:`matplotlib.pyplot.rc_context`, so the
 #: report's styling never leaks into a caller's global matplotlib state.
@@ -118,8 +120,8 @@ _RC = {
 }
 
 #: The split every figure reports on. Train runs feed the improver; the report measures
-#: held-out (test) performance.
-_REPORTED_SPLIT = "test"
+#: held-out (valid) performance.
+_REPORTED_SPLIT = "valid"
 
 
 #: Brand assets bundled with the package (see ``src/acumen/assets``). Inlined as ``data:``
@@ -216,13 +218,18 @@ def _fmt_seconds(value: float) -> str:
     return f"{value:.0f}s"
 
 
-def load_results(runs_root: Path) -> pd.DataFrame:
+def load_results(runs_root: Path, *, skip_invalid: bool = False) -> pd.DataFrame:
     """Load every ``result.json`` under ``runs_root`` into a DataFrame.
 
     Parameters
     ----------
     runs_root
         The ``runs/`` root directory.
+    skip_invalid
+        By default an infrastructure-invalid result (``valid: false`` — exhausted credit, a
+        refused host, a dropped connection) raises, because a *report* must never present one as
+        a measurement. Pass ``True`` to skip those rows instead: the training curve is built over
+        actual measurements while a broken/pending epoch's cells wait to be re-run on resume.
 
     Returns
     -------
@@ -233,7 +240,8 @@ def load_results(runs_root: Path) -> pd.DataFrame:
     Raises
     ------
     ReportError
-        If ``runs_root`` is missing or holds no readable results.
+        If ``runs_root`` is missing or holds no readable results, or (unless ``skip_invalid``)
+        any result is infrastructure-invalid.
     """
     if not runs_root.is_dir():
         raise ReportError(f"no runs directory: {runs_root}")
@@ -256,7 +264,7 @@ def load_results(runs_root: Path) -> pd.DataFrame:
         data["transcript_path"] = (result_path.parent / TRANSCRIPT_HTML).resolve()
         rows.append(data)
 
-    if invalid:
+    if invalid and not skip_invalid:
         sample = ", ".join(str(path) for path in invalid[:3])
         more = f" (+{len(invalid) - 3} more)" if len(invalid) > 3 else ""
         raise ReportError(
@@ -327,7 +335,7 @@ def _loaded_flags(df: pd.DataFrame) -> pd.Series:
 def arm_metrics(df: pd.DataFrame) -> pd.DataFrame:
     """Per-arm success rate and resource totals for the runs in ``df``.
 
-    The caller filters ``df`` first — to the test split, and optionally to one task. Each
+    The caller filters ``df`` first — to the valid split, and optionally to one task. Each
     row is one arm, in report order.
 
     The resource columns here are **totals** — the budget view, "what did this arm cost to
@@ -613,7 +621,7 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, st
         Results to plot — the full frame, or one task's slice.
     split_hue
         ``True`` for the per-task view (train + test as texture); ``False`` for the
-        overview (the reported test split only).
+        overview (the reported valid split only).
     colors
         Bar colour per model id, as returned by :func:`resolve_palette`. It may cover more
         models than ``df`` holds — one map resolved over the whole report is reused for
@@ -860,7 +868,7 @@ def tradeoff_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None
     Parameters
     ----------
     df
-        Results from :func:`load_results`. Only the reported (test) split is plotted.
+        Results from :func:`load_results`. Only the reported (valid) split is plotted.
     colors
         Mark colour per model id, as returned by :func:`resolve_palette`; models missing from it
         fall back to their tier default, and ``None`` uses the defaults throughout.
@@ -1124,13 +1132,13 @@ def _cluster_totals(df: pd.DataFrame, arms: Sequence[str]) -> tuple[np.ndarray, 
     These are the sufficient statistics for the bootstrap: both metrics are ratios of sums, so a
     resample never has to touch an individual run again.
     """
-    test = df[df["split"] == _REPORTED_SPLIT]
-    clusters = sorted(test[_CLUSTER_COLUMN].unique())
+    reported = df[df["split"] == _REPORTED_SPLIT]
+    clusters = sorted(reported[_CLUSTER_COLUMN].unique())
     shape = (len(clusters), len(arms))
     cost, successes, runs = np.zeros(shape), np.zeros(shape), np.zeros(shape)
     for ci, cluster in enumerate(clusters):
         for ai, arm in enumerate(arms):
-            rows = test[(test[_CLUSTER_COLUMN] == cluster) & (test["arm"] == arm)]
+            rows = reported[(reported[_CLUSTER_COLUMN] == cluster) & (reported["arm"] == arm)]
             run_cost = rows["cost_usd"]
             cost[ci, ai] = run_cost.sum() if run_cost.notna().all() else math.nan
             successes[ci, ai] = rows["success"].sum()
@@ -1244,7 +1252,7 @@ def skill_tests(df: pd.DataFrame, *, resamples: int = _BOOTSTRAP_RESAMPLES, seed
     Parameters
     ----------
     df
-        Results from :func:`load_results`. Only the reported (test) split is used.
+        Results from :func:`load_results`. Only the reported (valid) split is used.
     resamples, seed
         Bootstrap size and its seed. The default seed is fixed so a rebuilt report reproduces
         its own p-values exactly.
@@ -1324,7 +1332,7 @@ def _fmt_p(p: float) -> str:
 #: and the *lowest* cost, and a reader scanning the bold cells for the winner should not have to
 #: keep track of which column runs which way. The first few describe an arm on its own; the rest
 #: compare it with the baseline.
-_TEST_COLUMNS = (
+_VALID_COLUMNS = (
     ("Success rate", "rate", True, lambda v: f"{v:.1%}"),
     ("Cost / run", "cost", False, lambda v: f"${v:.3f}"),
     ("On frontier", "frontier", True, lambda v: f"{v:.1%}"),
@@ -1368,7 +1376,7 @@ def _tests_table_html(tests: SkillTests) -> str:
         )
 
     by_arm = {row.challenger: row for row in tests.comparisons.itertuples()}
-    compared = [field for _title, field, _highest, _fmt in _TEST_COLUMNS[_ARM_COLUMNS:]]
+    compared = [field for _title, field, _highest, _fmt in _VALID_COLUMNS[_ARM_COLUMNS:]]
     records = []
     for row in tests.arms.itertuples():
         match = by_arm.get(row.arm)
@@ -1380,21 +1388,21 @@ def _tests_table_html(tests: SkillTests) -> str:
         )
     best = [
         _best_cells([record[field] for record in records], highest=highest)
-        for _title, field, highest, _fmt in _TEST_COLUMNS
+        for _title, field, highest, _fmt in _VALID_COLUMNS
     ]
 
     body = []
     for index, (arm, record) in enumerate(zip(tests.arms["arm"], records, strict=True)):
         cells = [f"<td>{_skill_label(arm)}</td>"]
-        for column, (_title, field, _highest, fmt) in enumerate(_TEST_COLUMNS):
+        for column, (_title, field, _highest, fmt) in enumerate(_VALID_COLUMNS):
             value = record[field]
             text = "&mdash;" if value is None else fmt(value)
             cells.append(f"<td><strong>{text}</strong></td>" if index in best[column] else f"<td>{text}</td>")
         body.append(f"<tr>{''.join(cells)}</tr>")
 
-    own = "".join(f'<th rowspan="2">{title}</th>' for title, *_ in _TEST_COLUMNS[:_ARM_COLUMNS])
-    versus = "".join(f"<th>{title}</th>" for title, *_ in _TEST_COLUMNS[_ARM_COLUMNS:])
-    span = len(_TEST_COLUMNS) - _ARM_COLUMNS
+    own = "".join(f'<th rowspan="2">{title}</th>' for title, *_ in _VALID_COLUMNS[:_ARM_COLUMNS])
+    versus = "".join(f"<th>{title}</th>" for title, *_ in _VALID_COLUMNS[_ARM_COLUMNS:])
+    span = len(_VALID_COLUMNS) - _ARM_COLUMNS
     return f"""<div class="table-center"><table class="tests">
 <thead>
 <tr><th rowspan="2">Skill</th>{own}<th colspan="{span}">Compared with {_skill_label(tests.baseline)}</th></tr>
@@ -1437,12 +1445,12 @@ def loaded_only_rates(df: pd.DataFrame) -> pd.DataFrame:
     distance between them *is* the dilution the non-loading runs cause. ``rate`` is ``NaN``
     where nothing loaded, and ``baseline`` is ``NaN`` where that model has no baseline runs.
     """
-    test = df[df["split"] == _REPORTED_SPLIT]
-    arms = [arm for arm in _arms_in_order(test) if arm != NOSKILL_ARM]
-    base = test[test["arm"] == NOSKILL_ARM]
+    reported = df[df["split"] == _REPORTED_SPLIT]
+    arms = [arm for arm in _arms_in_order(reported) if arm != NOSKILL_ARM]
+    base = reported[reported["arm"] == NOSKILL_ARM]
     records: list[dict[str, object]] = []
     for arm in arms:
-        subset = test[test["arm"] == arm]
+        subset = reported[reported["arm"] == arm]
         contributing = {
             model for model in subset["model"].unique() if _loaded_flags(subset[subset["model"] == model]).any()
         }
@@ -1742,7 +1750,7 @@ def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
 
 
 _STYLE = f"""
-:root {{ color-scheme: light; --ink: {INK}; --page: {PAGE}; --surface: {SURFACE}; --bar: {BAR}; }}
+{PALETTE_ROOT_CSS}
 * {{ box-sizing: border-box; }}
 html {{ scroll-behavior: smooth; }}
 body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin: 0; line-height: 1.5;
@@ -1800,30 +1808,27 @@ table.sortable thead th[aria-sort="descending"]::after {{ content: "\\2193"; opa
 .skill-miss {{ color: #a4432b; font-weight: 700; }}
 .note {{ background: {ACCENT}55; border-left: 3px solid var(--bar); padding: 0.5rem 0.8rem;
         margin: 0.5rem 0; border-radius: 3px; }}
-.rationale {{ margin: 0.3rem 0 0.8rem; white-space: pre-wrap; }}
-/* Split diff: old version left, new version right, one bordered box per changed file. */
-.diff {{ background: var(--surface); border: 1px solid {INK}22; border-radius: 4px;
-        overflow-x: auto; margin: 0.4rem 0 1.4rem; }}
-.diff-file {{ color: {INK}; font-weight: 700; padding: 0.4rem 0.8rem;
-        border-bottom: 1px solid {INK}22; font-size: 0.82rem;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
-table.diff-table {{ display: table; table-layout: fixed; width: 100%; min-width: 34rem; margin: 0;
-        border-collapse: collapse; overflow-x: visible; font-size: 0.82rem; line-height: 1.35;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
-table.diff-table td {{ border: 0; padding: 0 0.5rem; text-align: left; vertical-align: top;
-        white-space: pre-wrap; overflow-wrap: anywhere; background: none; }}
-table.diff-table td.ln {{ width: 2.8rem; text-align: right; user-select: none;
-        color: {INK}77; background: {INK}0a; }}
-table.diff-table tr.diff-head td {{ color: {BAR}; font-weight: 600; background: {INK}0a;
-        border-bottom: 1px solid {INK}22; }}
-table.diff-table tr.diff-gap td {{ color: {INK}77; text-align: center; background: {INK}0a;
-        border-top: 1px solid {INK}22; border-bottom: 1px solid {INK}22; }}
-table.diff-table td.diff-add {{ background: #4c7a3322; color: #2f5d1c; }}
-table.diff-table td.diff-del {{ background: #a4432b22; color: #8a2f1b; }}
-table.diff-table td.diff-none {{ background: {INK}0a; }}
-table.diff-table td.diff-ctx {{ color: {INK}bb; }}
-table.diff-table td.diff-add mark {{ background: #4c7a3355; color: inherit; }}
-table.diff-table td.diff-del mark {{ background: #a4432b55; color: inherit; }}
+/* The rationale/feedback is authored in markdown and rendered to HTML (see
+   acumen.markdown.render_markdown), so these scope its elements to the block rather than
+   leaning on the page's global rules. Headings render at <h3>+ and are toned down so they
+   never compete with the section's own "Skill vN" heading. */
+.rationale {{ margin: 0.3rem 0 0.8rem; }}
+.rationale > :first-child {{ margin-top: 0; }}
+.rationale > :last-child {{ margin-bottom: 0; }}
+.rationale p {{ margin: 0.3rem 0; }}
+.rationale h3, .rationale h4, .rationale h5, .rationale h6 {{
+        font-size: 0.95rem; font-weight: 700; margin: 0.7rem 0 0.3rem; }}
+.rationale ul, .rationale ol {{ margin: 0.3rem 0 0.6rem; padding-left: 1.4rem; }}
+.rationale li {{ margin: 0.15rem 0; }}
+.rationale code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.86em; background: var(--surface); border: 1px solid {INK}22;
+        border-radius: 3px; padding: 0.05rem 0.25rem; }}
+.rationale pre {{ background: var(--surface); border: 1px solid {INK}22; border-radius: 4px;
+        padding: 0.5rem 0.8rem; overflow-x: auto; margin: 0.4rem 0; }}
+.rationale pre code {{ background: none; border: 0; padding: 0; font-size: 0.82rem; }}
+/* Split diff: old version left, new version right, one bordered box per changed file.
+   Shared with the transcript renderer — see acumen.theme.DIFF_CSS. */
+{DIFF_CSS}
 section {{ margin-top: 2.5rem; scroll-margin-top: 1rem; }}
 @media (max-width: 720px) {{
   body {{ display: block; }}
@@ -1905,131 +1910,6 @@ def _task_desc_html(task: Task) -> str:
     return "".join(parts)
 
 
-#: Unchanged lines kept on either side of a change, as in ``diff -u``. Longer untouched runs
-#: collapse to a single marker row, so a version bump reads as only what actually moved.
-_DIFF_CONTEXT = 3
-
-#: Below this line-similarity the two sides of a replaced row are treated as unrelated text,
-#: so the row is tinted whole instead of being picked apart into confetti-sized highlights.
-_DIFF_INLINE_RATIO = 0.5
-
-
-@dataclass(frozen=True)
-class _DiffRow:
-    """One row of a split diff: the same logical line on each side, either side possibly absent.
-
-    ``kind`` is the change type from :class:`difflib.SequenceMatcher` (``equal``, ``replace``,
-    ``delete``, ``insert``), plus ``gap`` for the marker standing in for an elided run of
-    unchanged lines. A side is ``None`` where that version has no line there at all — a pure
-    insertion has no left-hand text — and renders as an inert filler cell.
-    """
-
-    kind: str
-    left_no: int | None
-    left: str | None
-    right_no: int | None
-    right: str | None
-
-
-def _equal_rows(before: list[str], after: list[str], i: int, j: int, count: int) -> list[_DiffRow]:
-    """``count`` rows of unchanged text, starting at line ``i`` on the left and ``j`` on the right."""
-    return [_DiffRow("equal", i + k + 1, before[i + k], j + k + 1, after[j + k]) for k in range(count)]
-
-
-def _split_diff_rows(before: list[str], after: list[str]) -> list[_DiffRow]:
-    """Align two versions of a file into side-by-side rows, old on the left, new on the right.
-
-    Changed runs pair off line by line, so a rewritten paragraph sits opposite its replacement
-    rather than being stacked below it; where one side runs out, the other continues against
-    filler. Unchanged stretches beyond :data:`_DIFF_CONTEXT` lines from any change collapse to
-    a gap row.
-    """
-    rows: list[_DiffRow] = []
-    opcodes = difflib.SequenceMatcher(a=before, b=after, autojunk=False).get_opcodes()
-    for index, (tag, i1, i2, j1, j2) in enumerate(opcodes):
-        if tag == "equal":
-            head = _DIFF_CONTEXT if index > 0 else 0
-            tail = _DIFF_CONTEXT if index < len(opcodes) - 1 else 0
-            if i2 - i1 > head + tail:
-                rows += _equal_rows(before, after, i1, j1, head)
-                rows.append(_DiffRow("gap", None, None, None, None))
-                rows += _equal_rows(before, after, i2 - tail, j2 - tail, tail)
-            else:
-                rows += _equal_rows(before, after, i1, j1, i2 - i1)
-            continue
-        left, right = before[i1:i2], after[j1:j2]
-        for k in range(max(len(left), len(right))):
-            has_left, has_right = k < len(left), k < len(right)
-            rows.append(
-                _DiffRow(
-                    tag,
-                    i1 + k + 1 if has_left else None,
-                    left[k] if has_left else None,
-                    j1 + k + 1 if has_right else None,
-                    right[k] if has_right else None,
-                )
-            )
-    return rows
-
-
-def _inline_pair(left: str, right: str) -> tuple[str, str]:
-    """Both sides of a replaced line, escaped, with the words that differ wrapped in ``<mark>``.
-
-    The comparison runs over words rather than characters, so a changed word lights up whole
-    instead of down to the letters it happens to share with its replacement. Lines too
-    dissimilar to be a rewrite of one another are left unmarked — highlighting nearly every
-    word says less than the row tint already does.
-    """
-    a, b = re.findall(r"\w+|\W", left), re.findall(r"\w+|\W", right)
-    matcher = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
-    if matcher.ratio() < _DIFF_INLINE_RATIO:
-        return html.escape(left), html.escape(right)
-    marked = ["", ""]
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        for side, tokens, start, end in ((0, a, i1, i2), (1, b, j1, j2)):
-            chunk = html.escape("".join(tokens[start:end]))
-            if chunk:
-                marked[side] += chunk if tag == "equal" else f"<mark>{chunk}</mark>"
-    return marked[0], marked[1]
-
-
-def _diff_cells(number: int | None, text: str | None, marked: str | None, cls: str) -> str:
-    """The line-number and content cell for one side of a row, or filler where that side is empty."""
-    if text is None:
-        return '<td class="ln"></td><td class="diff-none"></td>'
-    body = marked if marked is not None else html.escape(text)
-    return f'<td class="ln">{number}</td><td class="{cls}">{body or "&nbsp;"}</td>'
-
-
-def _split_diff_table(rel: str, before: list[str], after: list[str], labels: tuple[str, str]) -> str:
-    """One file's split diff as a table: line numbers and text for each version, side by side."""
-    body: list[str] = []
-    for row in _split_diff_rows(before, after):
-        if row.kind == "gap":
-            body.append('<tr class="diff-gap"><td colspan="4">&hellip;</td></tr>')
-            continue
-        left_mark = right_mark = None
-        if row.kind == "replace" and row.left is not None and row.right is not None:
-            left_mark, right_mark = _inline_pair(row.left, row.right)
-        left_cls = "diff-ctx" if row.kind == "equal" else "diff-del"
-        right_cls = "diff-ctx" if row.kind == "equal" else "diff-add"
-        body.append(
-            "<tr>"
-            + _diff_cells(row.left_no, row.left, left_mark, left_cls)
-            + _diff_cells(row.right_no, row.right, right_mark, right_cls)
-            + "</tr>"
-        )
-    head = (
-        f'<tr class="diff-head"><td class="ln"></td><td>{html.escape(labels[0])}</td>'
-        f'<td class="ln"></td><td>{html.escape(labels[1])}</td></tr>'
-    )
-    return (
-        f'<div class="diff"><div class="diff-file">{html.escape(rel)}</div>'
-        f'<table class="diff-table"><thead>{head}</thead>'
-        f"<tbody>{''.join(body)}</tbody></table></div>"
-    )
-
-
 def _skill_diff_html(parent: dict[str, str] | None, child: dict[str, str], labels: tuple[str, str]) -> str:
     """Split diff of a skill version's content against its parent, one table per changed file.
 
@@ -2093,8 +1973,8 @@ def _skills_section_html(df: pd.DataFrame, skills_root: Path | None) -> tuple[st
             f'<h3 id="{html.escape(anchor)}">Skill {html.escape(version)}</h3>'
             f'<p class="task-desc">{provenance}'
             f"{f' &middot; {html.escape(hash_short)}…' if hash_short else ''}</p>"
-            f'<p class="rationale">{html.escape(rationale)}</p>'
-            f"{f'<p class="rationale"><em>Maintainer feedback:</em> {html.escape(feedback)}</p>' if feedback else ''}"
+            f'<div class="rationale">{render_markdown(rationale)}</div>'
+            f"{f'<div class="rationale"><p><em>Maintainer feedback:</em></p>{render_markdown(feedback)}</div>' if feedback else ''}"
             f"{_skill_diff_html(parent_content, content, (parent_version or '', version))}"
         )
         toc.append(f'<li><a href="#{html.escape(anchor)}">Skill {html.escape(version)}</a></li>')
@@ -2197,7 +2077,7 @@ def render_report(
 {toc}
 <main>
 <h1>acumen benchmark report</h1>
-<div class="meta">Generated {generated} &middot; {len(df)} runs &middot; test split shown
+<div class="meta">Generated {generated} &middot; {len(df)} runs &middot; valid split shown
  &middot; arms: {html.escape(arms)} &middot; tasks: {html.escape(tasks)}</div>
 {notes}
 <section id="overview">

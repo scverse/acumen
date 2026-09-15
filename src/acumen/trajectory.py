@@ -18,11 +18,15 @@ JSON, so a Codex-only install renders its own transcripts without the SDK instal
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
 from typing import Any, Literal
+
+from acumen.htmldiff import split_diff_table
+from acumen.markdown import clip as _clip
+from acumen.markdown import render_markdown as _markdown
+from acumen.theme import BAR, DIFF_CSS, INK, PALETTE_ROOT_CSS
 
 #: Bumped when the on-disk ``trajectory.json`` shape changes in a way a reader must notice.
 SCHEMA = "acumen-transcript-v1"
@@ -186,6 +190,25 @@ def _metrics_from(usage: dict[str, Any] | None) -> Metrics | None:
     return None if metrics.is_empty() else metrics
 
 
+def _claude_metrics(usage: dict[str, Any] | None) -> Metrics | None:
+    """Footer metrics for a Claude run from its authoritative usage (``ResultMessage.usage``).
+
+    This is the one usage figure the whole run is billed on, and it is what ``result.json`` records.
+    It must NOT be reconstructed by summing the session file's per-message usage: each Claude turn
+    re-sends the whole conversation, so every turn's ``usage`` already counts the cached prefix, and
+    summing them across turns overcounts (the same context, billed once, added once per turn). The
+    numbers are normalized so the footer matches ``result.json``: ``input`` is the total input
+    (fresh + cache read + cache write), ``cached`` is the cache-read count, output as reported.
+    """
+    if not usage:
+        return None
+    from acumen.prices import normalize_usage
+
+    norm = normalize_usage(usage, provider="claude")
+    metrics = Metrics(input_tokens=norm.input, output_tokens=norm.output, cached_tokens=norm.cache_read)
+    return None if metrics.is_empty() else metrics
+
+
 # ── Codex mapper ─────────────────────────────────────────────────────────────────────────
 
 
@@ -285,12 +308,19 @@ def _codex_step(item: dict[str, Any], index: int, *, incomplete: bool) -> _StepB
 # ── Claude Code mapper ─────────────────────────────────────────────────────────────────────
 
 
-def from_claude_records(records: list[dict[str, Any]], *, prompt: str = "") -> Trajectory:
+def from_claude_records(
+    records: list[dict[str, Any]], *, prompt: str = "", usage: dict[str, Any] | None = None
+) -> Trajectory:
     """Map Claude's SDK-native session records (already parsed) into a :class:`Trajectory`.
 
     Assistant messages become agent steps (text, thinking as reasoning, ``tool_use`` blocks as
     tool calls); a user message's ``tool_result`` blocks become observations attached to the step
     that issued the matching call. The run's first plain-string user message is the prompt.
+
+    ``usage`` is the run's authoritative ``ResultMessage.usage``; when given, the footer reports it
+    (matching ``result.json``). It is only reconstructed by summing the session file's per-message
+    usage — which overcounts, since each turn re-counts the cached context — when no authoritative
+    usage is available (e.g. rendering a bare transcript file with no result to hand).
     """
     session = ""
     model = ""
@@ -308,12 +338,12 @@ def from_claude_records(records: list[dict[str, Any]], *, prompt: str = "") -> T
         content = message.get("content")
         if rtype == "assistant":
             model = model or str(message.get("model") or "")
-            usage = message.get("usage")
-            if isinstance(usage, dict):
+            msg_usage = message.get("usage")
+            if isinstance(msg_usage, dict):
                 saw_usage = True
-                usage_totals["input_tokens"] += int(usage.get("input_tokens") or 0)
-                usage_totals["output_tokens"] += int(usage.get("output_tokens") or 0)
-                usage_totals["cached_tokens"] += int(usage.get("cache_read_input_tokens") or 0)
+                usage_totals["input_tokens"] += int(msg_usage.get("input_tokens") or 0)
+                usage_totals["output_tokens"] += int(msg_usage.get("output_tokens") or 0)
+                usage_totals["cached_tokens"] += int(msg_usage.get("cache_read_input_tokens") or 0)
             builder = _StepBuilder(index=len(steps) + 1, source="agent")
             for block in content if isinstance(content, list) else []:
                 _apply_assistant_block(block, builder, by_call)
@@ -329,7 +359,7 @@ def from_claude_records(records: list[dict[str, Any]], *, prompt: str = "") -> T
             detail = record.get("subtype") or record.get("result") or record.get("error")
             errors.append(str(detail or "run reported an error"))
 
-    metrics = _metrics_from(usage_totals) if saw_usage else None
+    metrics = _claude_metrics(usage) if usage else (_metrics_from(usage_totals) if saw_usage else None)
     return Trajectory(
         harness="claude-code",
         session_id=session,
@@ -398,8 +428,12 @@ def _result_text(content: Any) -> str:
     return "" if content is None else str(content)
 
 
-def from_claude_transcript(jsonl: Path, *, prompt: str = "") -> Trajectory | None:
-    """Read a Claude SDK-native session file and map it. ``None`` if the file cannot be read."""
+def from_claude_transcript(jsonl: Path, *, prompt: str = "", usage: dict[str, Any] | None = None) -> Trajectory | None:
+    """Read a Claude SDK-native session file and map it. ``None`` if the file cannot be read.
+
+    ``usage`` is the run's authoritative ``ResultMessage.usage`` for the footer (see
+    :func:`from_claude_records`).
+    """
     try:
         lines = jsonl.read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -412,209 +446,246 @@ def from_claude_transcript(jsonl: Path, *, prompt: str = "") -> Trajectory | Non
             continue
         if isinstance(record, dict):
             records.append(record)
-    return from_claude_records(records, prompt=prompt)
+    return from_claude_records(records, prompt=prompt, usage=usage)
 
 
 # ── The one renderer ─────────────────────────────────────────────────────────────────────
 
-_CSS = """\
-:root { color-scheme: light dark; }
-body { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; margin: 0 auto; max-width: 60rem; padding: 2rem 1rem; }
-h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
-.meta { color: #6b7280; font-size: .8rem; margin-bottom: 1.5rem; }
-.item { border-left: 3px solid #d1d5db; margin: 0 0 1rem; padding: .25rem 0 .25rem .75rem; }
-.item > .label { color: #6b7280; font-size: .7rem; letter-spacing: .04em; text-transform: uppercase; }
-.prompt { border-left-color: #4b8b9b; }
-.agent { border-left-color: #6b8f71; }
-.user { border-left-color: #7f9cb5; }
-.system { border-left-color: #b6a8c9; }
-.failed { border-left-color: #c0685c; }
-details.tool, details.reasoning { margin-top: .4rem; }
-details.reasoning { color: #6b7280; }
-summary { cursor: pointer; color: #6b7280; font-size: .8rem; }
-summary .name { color: inherit; font-weight: 600; }
-summary .preview { color: #9ca3af; font-weight: 400; }
-pre { background: #00000010; border-radius: .25rem; margin: .35rem 0 0; overflow-x: auto; padding: .5rem .65rem; white-space: pre-wrap; word-break: break-word; }
-.md { overflow-wrap: anywhere; }
-.md > :first-child { margin-top: .2rem; }
-.md > :last-child { margin-bottom: 0; }
-.md p { margin: .5rem 0; }
-.md h3, .md h4, .md h5, .md h6 { margin: .8rem 0 .3rem; font-size: 1rem; }
-.md ul, .md ol { margin: .4rem 0; padding-left: 1.4rem; }
-.md code { background: #00000010; border-radius: .2rem; padding: .05rem .3rem; font-size: .9em; }
-.md pre code { background: none; padding: 0; }
-.md a { color: #4b8b9b; }
-.md table { border-collapse: collapse; margin: .6rem 0; font-size: .9em; }
-.md th, .md td { border: 1px solid #d1d5db; padding: .25rem .55rem; text-align: left; }
-.md th { background: #00000010; }
-.exit { color: #6b7280; font-size: .75rem; }
-table { border-collapse: collapse; font-size: .8rem; margin-top: .5rem; }
-td { border-top: 1px solid #d1d5db; padding: .2rem .75rem .2rem 0; }
-td.n { text-align: right; }
+_MONO = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+
+#: The transcript's stylesheet. It shares the report's palette tokens and the exact split-diff
+#: rules (see :mod:`acumen.theme`), so a file edit here reads the same as a skill diff there, while
+#: the page stays a single self-contained file with no external stylesheet.
+_CSS = f"""\
+{PALETTE_ROOT_CSS}
+* {{ box-sizing: border-box; }}
+body {{ font: 14px/1.6 system-ui, -apple-system, Segoe UI, sans-serif; margin: 0 auto; max-width: 62rem;
+        padding: 2rem 1.2rem; background: var(--page); color: var(--ink); }}
+h1 {{ font-size: 1.25rem; margin: 0 0 .25rem; }}
+.meta {{ color: {BAR}; font-size: .8rem; margin-bottom: 1.5rem; }}
+.item {{ border-left: 3px solid {INK}22; margin: 0 0 1rem; padding: .25rem 0 .25rem .85rem; }}
+.item > .label {{ color: {BAR}; font-size: .7rem; letter-spacing: .04em; text-transform: uppercase; }}
+.prompt {{ border-left-color: #4b8b9b; }}
+.agent {{ border-left-color: #6b8f71; }}
+.user {{ border-left-color: #7f9cb5; }}
+.system {{ border-left-color: #b6a8c9; }}
+.failed {{ border-left-color: #a4432b; }}
+details.tool, details.reasoning {{ margin-top: .4rem; }}
+details.reasoning {{ color: {BAR}; }}
+summary {{ cursor: pointer; color: {BAR}; font-size: .8rem; }}
+summary .name {{ color: inherit; font-weight: 600; }}
+summary .preview {{ color: {BAR}; opacity: .8; font-weight: 400; font-family: {_MONO}; }}
+.call {{ margin-top: .35rem; }}
+.call .path {{ font-family: {_MONO}; font-size: .8rem; color: {INK}; overflow-wrap: anywhere; }}
+.call .note {{ color: {BAR}; font-size: .74rem; margin-top: .15rem; }}
+.call a {{ color: var(--bar); overflow-wrap: anywhere; }}
+dl.kv {{ margin: .35rem 0 0; display: grid; grid-template-columns: max-content 1fr; gap: .12rem .7rem;
+        font-size: .82rem; }}
+dl.kv dt {{ color: {BAR}; font-family: {_MONO}; }}
+dl.kv dd {{ margin: 0; overflow-wrap: anywhere; }}
+pre {{ background: var(--surface); border: 1px solid {INK}22; border-radius: .25rem; margin: .35rem 0 0;
+        overflow-x: auto; padding: .5rem .65rem; white-space: pre-wrap; word-break: break-word; font-family: {_MONO}; }}
+.md {{ overflow-wrap: anywhere; }}
+.md > :first-child {{ margin-top: .2rem; }}
+.md > :last-child {{ margin-bottom: 0; }}
+.md p {{ margin: .5rem 0; }}
+.md h3, .md h4, .md h5, .md h6 {{ margin: .8rem 0 .3rem; font-size: 1rem; }}
+.md ul, .md ol {{ margin: .4rem 0; padding-left: 1.4rem; }}
+.md code {{ background: var(--surface); border: 1px solid {INK}22; border-radius: .2rem;
+        padding: .05rem .3rem; font-size: .9em; }}
+.md pre code {{ background: none; border: 0; padding: 0; }}
+.md a {{ color: var(--bar); }}
+.md table {{ border-collapse: collapse; margin: .6rem 0; font-size: .9em; }}
+.md th, .md td {{ border: 1px solid {INK}22; padding: .25rem .55rem; text-align: left; }}
+.md th {{ background: {INK}0a; }}
+.exit {{ color: {BAR}; font-size: .75rem; }}
+table {{ border-collapse: collapse; font-size: .8rem; margin-top: .5rem; }}
+td {{ border-top: 1px solid {INK}22; padding: .2rem .75rem .2rem 0; }}
+td.n {{ text-align: right; }}
+{DIFF_CSS}
 """
 
-#: How much of one tool observation the page keeps. The full output is in the JSONL beside it.
-_OUTPUT_CAP = 20_000
 #: How much of a tool call to show in its collapsed summary before the reader expands it.
 _PREVIEW_CAP = 90
 
 
-def _clip(text: str) -> str:
-    if len(text) <= _OUTPUT_CAP:
-        return text
-    return text[:_OUTPUT_CAP] + f"\n… {len(text) - _OUTPUT_CAP} more characters"
+#: Lines of a written file or long command shown inline before the rest folds into a toggle.
+_INLINE_LINES = 30
 
 
-def _md_inline(text: str) -> str:
-    """Render inline markdown (code, bold, italic, links) on one line, escaping HTML first."""
-    codes: list[str] = []
-
-    def stash(match: re.Match[str]) -> str:
-        codes.append(match.group(1))
-        return f"\x00{len(codes) - 1}\x00"
-
-    text = re.sub(r"`([^`]+)`", stash, text)
-    text = escape(text)
-    text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", r'<a href="\2">\1</a>', text)
-    text = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", text)
-    text = re.sub(r"__([^_]+)__", r"<strong>\1</strong>", text)
-    text = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"<em>\1</em>", text)
-    text = re.sub(r"(?<![\w_])_([^_\n]+)_(?![\w_])", r"<em>\1</em>", text)
-    return re.sub(r"\x00(\d+)\x00", lambda m: f"<code>{escape(codes[int(m.group(1))])}</code>", text)
-
-
-def _table_cells(line: str) -> list[str]:
-    """Split one pipe-table row into cells, dropping the optional outer pipes."""
-    stripped = line.strip()
-    stripped = stripped.removeprefix("|").removesuffix("|")
-    return stripped.split("|")
-
-
-def _is_table_delimiter(line: str) -> bool:
-    """Whether ``line`` is a GFM table delimiter row (``| --- | :--: |``)."""
-    cells = _table_cells(line)
-    return "|" in line and bool(cells) and all(re.fullmatch(r"\s*:?-+:?\s*", cell) for cell in cells)
-
-
-def _table_align(spec: str) -> str:
-    spec = spec.strip()
-    left, right = spec.startswith(":"), spec.endswith(":")
-    if left and right:
-        return "center"
-    if right:
-        return "right"
-    return "left" if left else ""
-
-
-def _render_table(header: list[str], aligns: list[str], rows: list[list[str]]) -> str:
-    def cell(tag: str, text: str, index: int) -> str:
-        align = aligns[index] if index < len(aligns) else ""
-        style = f' style="text-align:{align}"' if align else ""
-        return f"<{tag}{style}>{_md_inline(text.strip())}</{tag}>"
-
-    head = "<tr>" + "".join(cell("th", value, i) for i, value in enumerate(header)) + "</tr>"
-    body = "".join("<tr>" + "".join(cell("td", value, i) for i, value in enumerate(row)) + "</tr>" for row in rows)
-    return f"<table><thead>{head}</thead><tbody>{body}</tbody></table>"
-
-
-def _markdown(text: str) -> str:
-    """A small, safe markdown-to-HTML renderer for agent messages — headings, lists, code, inline.
-
-    Deliberately a common-case subset (not full CommonMark): agent prose is paragraphs, bullet
-    lists, fenced code and inline emphasis. Everything is HTML-escaped, so no message can inject
-    markup, and anything unrecognized falls through as plain text.
-    """
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    out: list[str] = []
-    para: list[str] = []
-    items: list[str] = []
-    list_tag = ""
-
-    def flush_para() -> None:
-        if para:
-            out.append("<p>" + "<br>".join(_md_inline(line) for line in para) + "</p>")
-            para.clear()
-
-    def flush_list() -> None:
-        nonlocal list_tag
-        if items:
-            out.append(f"<{list_tag}>" + "".join(f"<li>{_md_inline(it)}</li>" for it in items) + f"</{list_tag}>")
-            items.clear()
-            list_tag = ""
-
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-        if stripped.startswith("```"):
-            flush_para()
-            flush_list()
-            i += 1
-            code: list[str] = []
-            while i < len(lines) and not lines[i].strip().startswith("```"):
-                code.append(lines[i])
-                i += 1
-            i += 1  # skip the closing fence
-            out.append(f"<pre><code>{escape(_clip(chr(10).join(code)))}</code></pre>")
-            continue
-        if "|" in stripped and i + 1 < len(lines) and _is_table_delimiter(lines[i + 1]):
-            flush_para()
-            flush_list()
-            header = _table_cells(line)
-            aligns = [_table_align(spec) for spec in _table_cells(lines[i + 1])]
-            i += 2
-            rows: list[list[str]] = []
-            while i < len(lines) and lines[i].strip() and "|" in lines[i]:
-                rows.append(_table_cells(lines[i]))
-                i += 1
-            out.append(_render_table(header, aligns, rows))
-            continue
-        if not stripped:
-            flush_para()
-            flush_list()
-        elif heading := re.match(r"(#{1,6})\s+(.*)", stripped):
-            flush_para()
-            flush_list()
-            level = min(len(heading.group(1)) + 2, 6)  # start at h3 so a message never out-shouts the page
-            out.append(f"<h{level}>{_md_inline(heading.group(2))}</h{level}>")
-        elif bullet := re.match(r"[-*+]\s+(.*)", stripped):
-            flush_para()
-            if list_tag and list_tag != "ul":
-                flush_list()
-            list_tag = "ul"
-            items.append(bullet.group(1))
-        elif ordered := re.match(r"\d+[.)]\s+(.*)", stripped):
-            flush_para()
-            if list_tag and list_tag != "ol":
-                flush_list()
-            list_tag = "ol"
-            items.append(ordered.group(1))
-        else:
-            flush_list()
-            para.append(stripped)
-        i += 1
-    flush_para()
-    flush_list()
-    return "".join(out)
-
-
-def _call_preview(call: ToolCall) -> str:
-    if call.name == "command_execution":
-        body = str(call.arguments.get("command") or "")
-    elif list(call.arguments) == ["input"] and isinstance(call.arguments["input"], str):
-        body = call.arguments["input"]
-    else:
-        body = ", ".join(f"{key}={value!r}" for key, value in call.arguments.items())
-    preview = " ".join(body.split())
+def _clamp(text: str) -> str:
+    """A one-line summary preview: whitespace collapsed, clamped to :data:`_PREVIEW_CAP`."""
+    preview = " ".join(text.split())
     return preview if len(preview) <= _PREVIEW_CAP else preview[:_PREVIEW_CAP] + "…"
 
 
-def _call_body(call: ToolCall) -> str:
-    if call.name == "command_execution":
-        return str(call.arguments.get("command") or "")
-    if list(call.arguments) == ["input"] and isinstance(call.arguments["input"], str):
-        return call.arguments["input"]
-    return json.dumps(call.arguments, indent=2, default=str) if call.arguments else ""
+def _tool_kind(call: ToolCall) -> str:
+    """Classify a tool call into a render kind, working across harnesses.
+
+    Keyed on the tool *name* first, then the argument-key signature, so Claude Code's native names
+    (``Bash``, ``Edit``, ``Write``, …), Codex's names (``command_execution``, ``file_change``) and
+    an unfamiliar future tool whose arguments match a known shape all land on the same rendering.
+    Returns one of ``command``, ``read``, ``write``, ``edit``, ``file_change``, ``web_fetch``,
+    ``web_search`` or ``generic``.
+    """
+    name = call.name.lower()
+    keys = set(call.arguments)
+    if name in {"bash", "command_execution", "shell", "bashoutput"} or "command" in keys:
+        return "command"
+    if name in {"edit", "multiedit", "notebookedit"} or {"old_string", "new_string"} <= keys:
+        return "edit"
+    if name == "write" or {"file_path", "content"} <= keys:
+        return "write"
+    if name == "read" or ("file_path" in keys and not keys & {"content", "old_string", "new_string"}):
+        return "read"
+    if name == "file_change" or keys & {"diff", "unified_diff", "patch", "changes"}:
+        return "file_change"
+    if name in {"webfetch", "web_fetch"} or {"url", "prompt"} <= keys:
+        return "web_fetch"
+    if name in {"websearch", "web_search", "toolsearch"} or ("query" in keys and keys <= {"query", "max_results"}):
+        return "web_search"
+    return "generic"
+
+
+def _code_block(text: str, *, cls: str = "") -> str:
+    """A ``<pre><code>`` block, clipped, folded into a nested toggle when it runs long."""
+    clipped = _clip(text)
+    attr = f' class="{cls}"' if cls else ""
+    block = f"<pre{attr}><code>{escape(clipped)}</code></pre>"
+    n_lines = clipped.count("\n") + 1
+    if n_lines > _INLINE_LINES:
+        return f"<details><summary>{n_lines} lines</summary>{block}</details>"
+    return block
+
+
+def _kv_list(args: dict[str, Any]) -> str:
+    """A tool's raw arguments as a definition list — the readable fallback for unmodelled tools."""
+    if not args:
+        return ""
+    rows: list[str] = []
+    for key, value in args.items():
+        if isinstance(value, str) and "\n" in value:
+            rendered = _code_block(value)
+        elif isinstance(value, dict | list):
+            rendered = f"<pre><code>{escape(_clip(json.dumps(value, indent=2, default=str)))}</code></pre>"
+        else:
+            rendered = escape(str(value))
+        rows.append(f"<dt>{escape(str(key))}</dt><dd>{rendered}</dd>")
+    return f'<dl class="kv">{"".join(rows)}</dl>'
+
+
+def _range_note(offset: object, limit: object) -> str:
+    """A compact 'lines a–b' note for a windowed file read, tolerating missing bounds."""
+    try:
+        off = int(offset) if offset is not None else None
+        lim = int(limit) if limit is not None else None
+    except (TypeError, ValueError):
+        return ""
+    if off is not None and lim is not None:
+        return f"lines {off}–{off + lim}"
+    if lim is not None:
+        return f"first {lim} lines"
+    if off is not None:
+        return f"from line {off}"
+    return ""
+
+
+def _diff_tables(path: str, pairs: list[tuple[str, str]]) -> str:
+    """One split diff per (old, new) pair — a plain Edit is one pair, a MultiEdit several."""
+    return "".join(
+        split_diff_table(path, _clip(old).splitlines(), _clip(new).splitlines(), ("before", "after"))
+        for old, new in pairs
+    )
+
+
+def _edit_body(call: ToolCall) -> str:
+    """A file edit as a red/green split diff — the same renderer the report uses for skill diffs."""
+    args = call.arguments
+    path = str(args.get("file_path") or args.get("notebook_path") or call.name)
+    pairs: list[tuple[str, str]] = []
+    edits = args.get("edits")
+    if isinstance(edits, list):  # MultiEdit: a list of {old_string, new_string}
+        pairs = [
+            (str(e["old_string"]), str(e["new_string"]))
+            for e in edits
+            if isinstance(e, dict) and "old_string" in e and "new_string" in e
+        ]
+    elif "old_string" in args and "new_string" in args:
+        pairs = [(str(args["old_string"]), str(args["new_string"]))]
+    if not pairs:  # a shape we don't model (e.g. NotebookEdit cell ops) — show the raw arguments
+        return f'<div class="path">{escape(path)}</div>{_kv_list(args)}'
+    note = '<div class="note">replace all</div>' if args.get("replace_all") else ""
+    return f'<div class="path">{escape(path)}</div>{_diff_tables(path, pairs)}{note}'
+
+
+def _file_change_body(args: dict[str, Any]) -> str:
+    """A Codex ``file_change`` item, best-effort: a unified diff if present, else per-file entries."""
+    for key in ("diff", "unified_diff", "patch"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return _code_block(value)
+    changes = args.get("changes")
+    parts: list[str] = []
+    if isinstance(changes, list):
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            path = str(change.get("path") or change.get("file") or "")
+            if "old" in change and "new" in change:
+                parts.append(_diff_tables(path, [(str(change["old"]), str(change["new"]))]))
+            else:
+                what = str(change.get("kind") or change.get("type") or "change")
+                parts.append(f'<div class="path">{escape(what)}: {escape(path)}</div>')
+    return "".join(parts) or _kv_list(args)
+
+
+def _file_change_preview(args: dict[str, Any]) -> str:
+    changes = args.get("changes")
+    if isinstance(changes, list) and changes:
+        paths = [str(c.get("path") or c.get("file") or "") for c in changes if isinstance(c, dict)]
+        if any(paths):
+            return ", ".join(p for p in paths if p)
+    if any(isinstance(args.get(k), str) and args[k].strip() for k in ("diff", "unified_diff", "patch")):
+        return "patch"
+    return ", ".join(f"{key}={value!r}" for key, value in args.items())
+
+
+def _render_call(call: ToolCall, kind: str) -> tuple[str, str]:
+    """The ``(summary preview, body HTML)`` for one tool call, dispatched on its kind."""
+    args = call.arguments
+    if kind == "command":
+        command = str(args.get("command") or args.get("input") or "")
+        return _clamp(command), _code_block(command, cls="sh")
+    if kind == "read":
+        path = str(args.get("file_path") or "")
+        note = _range_note(args.get("offset"), args.get("limit"))
+        note_html = f'<div class="note">{escape(note)}</div>' if note else ""
+        return _clamp(path), f'<div class="path">{escape(path)}</div>{note_html}'
+    if kind == "write":
+        path = str(args.get("file_path") or "")
+        content = str(args.get("content") or "")
+        return _clamp(path), f'<div class="path">{escape(path)}</div>{_code_block(content)}'
+    if kind == "edit":
+        path = str(args.get("file_path") or args.get("notebook_path") or "")
+        return _clamp(path or call.name), _edit_body(call)
+    if kind == "file_change":
+        return _clamp(_file_change_preview(args)), _file_change_body(args)
+    if kind == "web_fetch":
+        url = str(args.get("url") or "")
+        prompt = str(args.get("prompt") or "")
+        body = f'<div class="path"><a href="{escape(url)}">{escape(url)}</a></div>'
+        if prompt:
+            body += f'<div class="note">{escape(prompt)}</div>'
+        return _clamp(url), body
+    if kind == "web_search":
+        query = str(args.get("query") or "")
+        results = args.get("max_results")
+        note = f'<div class="note">max results: {escape(str(results))}</div>' if results is not None else ""
+        return _clamp(query), f'<div class="path">{escape(query)}</div>{note}'
+    # generic: a single string argument reads as a body; anything else as a key/value list.
+    if list(args) == ["input"] and isinstance(args["input"], str):
+        return _clamp(args["input"]), _code_block(args["input"])
+    return _clamp(", ".join(f"{key}={value!r}" for key, value in args.items())), _kv_list(args)
 
 
 def _observation_html(obs: Observation) -> str:
@@ -627,15 +698,20 @@ def _observation_html(obs: Observation) -> str:
 
 
 def _tool_details(call: ToolCall, observations: list[Observation]) -> str:
-    """Render one tool call and its results in a collapsed ``<details>`` toggle."""
+    """Render one tool call and its results in a collapsed ``<details>`` toggle.
+
+    The call is classified by :func:`_tool_kind` and rendered per kind (a command as a shell
+    block, a file edit as a red/green diff, and so on); the kind rides on an inner ``div`` so the
+    outer ``<details class="tool">`` tag stays stable for callers keying on it.
+    """
     errored = any(obs.is_error for obs in observations)
-    preview = _call_preview(call)
+    kind = _tool_kind(call)
+    preview, body = _render_call(call, kind)
     summary = f'<span class="name">{escape(call.name)}</span>'
     if preview:
         summary += f' <span class="preview">{escape(preview)}</span>'
-    body = _call_body(call)
-    inner = f"<pre>{escape(_clip(body))}</pre>" if body.strip() else ""
-    inner += "".join(_observation_html(obs) for obs in observations)
+    obs_html = "".join(_observation_html(obs) for obs in observations)
+    inner = f'<div class="call call-{kind}">{body}{obs_html}</div>' if (body or obs_html) else ""
     return f'<details class="tool"{" open" if errored else ""}><summary>{summary}</summary>{inner}</details>'
 
 

@@ -17,7 +17,7 @@ import pytest
 
 from acumen.config import parse_config
 from acumen.env import READY_MARKER, cache_key, prepare_target
-from acumen.scrub import build_filtered_source, find_guidance, scrub_venv
+from acumen.scrub import build_filtered_source, find_guidance, find_source_fetch, scrub_venv
 
 SITE = "lib/python3.12/site-packages"
 
@@ -194,3 +194,65 @@ def test_prepare_target_scrubs_a_cached_venv(tmp_path: Path, monkeypatch: pytest
     assert target.pkg_version == "0.1"
     assert not list((entry / "venv").rglob("SKILL.md"))
     assert (entry / "venv/bin/python").is_file()
+
+
+# ── find_source_fetch: the benchmark source guard ────────────────────────────────────────
+#
+# The venv a benchmark run reads is scrubbed, but the upstream repo is not. A run that clones or
+# re-installs the target smuggles the shipped skill back in and contaminates the baseline. This
+# guard denies the fetch; it deliberately does NOT block reading skill files, because the skill
+# arm legitimately reads its own installed skill.
+
+_REPO = "https://github.com/owner/repo"
+_PKG = "repo"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git clone https://github.com/owner/repo.git",
+        "git clone git@github.com:owner/repo.git",
+        "gh repo clone owner/repo",
+        "curl -L https://raw.githubusercontent.com/owner/repo/main/_skills/data/SKILL.md",
+        "wget https://codeload.github.com/owner/repo/tar.gz/refs/heads/main",
+        "pip install git+https://github.com/owner/repo",
+        "pip download repo --no-binary :all:",
+        "uv pip install repo -t ./vendor",
+        "curl -O https://files.pythonhosted.org/packages/aa/repo-1.2.3.tar.gz",
+    ],
+)
+def test_find_source_fetch_denies_fetching_the_target(command: str) -> None:
+    assert find_source_fetch("Bash", {"command": command}, repo=_REPO, pkg_name=_PKG) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'python -c "import repo as r; print(r.__version__)"',
+        "python script.py",
+        "curl -O https://example.org/data/sample.h5ad",
+        "grep -rn something /venv/lib/python3.12/site-packages/repo",
+    ],
+)
+def test_find_source_fetch_allows_ordinary_work(command: str) -> None:
+    assert find_source_fetch("Bash", {"command": command}, repo=_REPO, pkg_name=_PKG) is None
+
+
+def test_find_source_fetch_scans_path_and_nested_inputs() -> None:
+    """It walks all string leaves, so a path key (Read) or Codex's nested argv is covered too."""
+    read = {"file_path": "/work/repo/_skills/data/SKILL.md"}
+    assert find_source_fetch("Read", read, repo=_REPO, pkg_name=_PKG) is None  # a bare read is allowed
+    nested = {"cmd": ["git", "clone", "https://github.com/owner/repo"]}
+    assert find_source_fetch("shell", nested, repo=_REPO, pkg_name=_PKG) is not None
+
+
+def test_find_source_fetch_local_target_has_no_repo_needles() -> None:
+    """A local target passes ``repo=None``; its source is not fetchable and never in the sandbox."""
+    # With no repo, an unrelated clone is not the target's and is not guarded here …
+    clone = {"command": "git clone https://github.com/owner/repo"}
+    assert find_source_fetch("Bash", clone, repo=None, pkg_name=_PKG) is None
+    # … but a pip install/download of the package name is still caught (block_pkg is always set).
+    install = {"command": "pip install repo -t ./vendor"}
+    assert find_source_fetch("Bash", install, repo=None, pkg_name=_PKG) is not None
+    # Nothing to match on at all → allowed.
+    assert find_source_fetch("Bash", {"command": "cat notes.txt"}, repo=None, pkg_name=None) is None

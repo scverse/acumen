@@ -47,13 +47,13 @@ meta_model: claude-opus-5             # model for the meta-agent commands (draft
 """
 
 #: A tasks file with one placeholder task, showing the required shape. Each task needs a
-#: stable `id` and a train/test pair; the answer is graded by exact string match after
+#: stable `id` and a train/valid pair; the answer is graded by exact string match after
 #: `strip()`.
 TASKS_TEMPLATE = """\
 # acumen tasks — what the agent is asked to do, and the answer it is graded against.
 #
 # Each task has a stable `id` (used in run paths — renaming it orphans old runs) and a
-# train/test pair. The improver only ever sees train results; test is the held-out measure
+# train/valid pair. The improver only ever sees train results; valid is the held-out measure
 # of whether a skill actually helps. Answers are compared by EXACT string match after
 # strip(), so keep them to a single unambiguous token.
 #
@@ -81,11 +81,11 @@ tasks:
         — the data, the goal, and exactly what to report. Do not name the package (it is
         provided). End by asking for only the final answer, so it grades as a single token.
       answer: REPLACE_ME_TRAIN
-    test:
+    valid:
       prompt: >-
         The same kind of analysis on a different, held-out input. This split is what measures
         whether the skill generalizes; the improver never sees its results.
-      answer: REPLACE_ME_TEST
+      answer: REPLACE_ME_VALID
 """
 
 

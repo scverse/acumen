@@ -13,9 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-Split = Literal["train", "test"]
+# ``valid`` is the held-out split — the improver never sees it. ``test`` is reserved for a
+# future train/valid/test three-way split; only train/valid exist today.
+Split = Literal["train", "valid"]
 
-SPLITS: tuple[Split, ...] = ("train", "test")
+SPLITS: tuple[Split, ...] = ("train", "valid")
 
 NOSKILL_ARM = "noskill"
 

@@ -18,7 +18,7 @@ Reproducers are the operator's own scripts, so they run with the operator's envi
 throwaway environment an agent gets. Each one still gets a fresh empty working directory, so
 its ``answer.md`` cannot be another script's and nothing it writes lands in the project.
 
-The scripts hold the ground truth for the **held-out test split**, so nothing may ever read
+The scripts hold the ground truth for the **held-out valid split**, so nothing may ever read
 them into an agent. That holds today because ``bench``, ``draft`` and ``improve`` confine their
 agents to explicit read roots (:mod:`acumen.guard`) that never include the project directory.
 """
