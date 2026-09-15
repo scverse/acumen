@@ -97,6 +97,9 @@ _ALL_MODELS_COLOR = "#9b968d"
 # Train vs valid is a *texture*, not a colour — so it never competes with the model hue.
 _SPLIT_ORDER = ("train", "valid")
 _SPLIT_HATCH = {"train": "////", "valid": ""}
+# The line-chart analogue of the hatch above: on the training curve train and valid are told
+# apart by dash, leaving colour free to carry the model.
+_SPLIT_STYLE = {"train": "--", "valid": "-"}
 
 #: rcParams applied around every figure via :func:`matplotlib.pyplot.rc_context`, so the
 #: report's styling never leaks into a caller's global matplotlib state.
@@ -1053,6 +1056,107 @@ def tradeoff_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None
             series.setdefault(model, []).append((arm, cost, rate))
         for model, model_series in series.items():
             _trajectory_arrows(ax, model_series, colors[model])
+    return fig
+
+
+def _version_label(arm: str) -> str:
+    """Compact x-axis tick for the training curve — ``"No skill"`` then ``"v1"``, ``"v2"``, …"""
+    return "No skill" if arm == NOSKILL_ARM else (skill_from_arm(arm) or arm)
+
+
+def training_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None) -> plt.Figure:
+    """Success rate as the skill improves, version by version — the training curve.
+
+    The x-axis walks the arms in order (no skill, then v1, v2, …); the y-axis is the success
+    rate. Every model gets two lines, coloured by the model: a solid one over the valid tasks and
+    a dashed one over the train tasks, each arm measured on both splits. A grey pair pools every
+    model — the mean run at each version — and is drawn last so it stays legible where the model
+    lines overlap. A version with no runs on a split leaves a gap rather than a false zero, so the
+    newest version (valid only, never trained from) simply ends its train lines a step early.
+    """
+    arms = _arms_in_order(df)
+    models = _models_in_order(df)
+    resolved = colors or {}
+    colors = {model: resolved.get(model, _model_color(model)) for model in models}
+    colors[_ALL_MODELS] = _ALL_MODELS_COLOR
+    rows = _bar_rows(models)  # models, plus the pooled row when there is more than one
+    positions = list(range(len(arms)))
+
+    def rates(model: str, split: str) -> list[float]:
+        # NaN where a cell has no runs, so matplotlib breaks the line instead of inventing a zero.
+        return [
+            value if present else math.nan
+            for arm in arms
+            for value, _err, present in [_cell_value(df, arm, model, split, "rate")]
+        ]
+
+    with plt.rc_context(_RC):
+        width = 2.2 + 0.85 * len(arms) + 1.8  # plot columns + the two legends on the right
+        fig, ax = plt.subplots(figsize=(width, 4.2))
+
+        for model in rows:
+            pooled = model == _ALL_MODELS
+            for split in _SPLIT_ORDER:
+                ax.plot(
+                    positions,
+                    rates(model, split),
+                    color=colors[model],
+                    linestyle=_SPLIT_STYLE[split],
+                    marker="o",
+                    # The pooled pair is heavier and rides on top, with a surface ring on its
+                    # markers so it reads through the model lines it summarises.
+                    markersize=6 if pooled else 4,
+                    markeredgecolor=PLOT_BG,
+                    markeredgewidth=1.0 if pooled else 0.6,
+                    linewidth=2.6 if pooled else 1.6,
+                    zorder=4 if pooled else 3,
+                )
+
+        ax.set_xticks(positions)
+        ax.set_xticklabels([_version_label(arm) for arm in arms], fontsize=12)
+        ax.set_xlim(-0.3, len(arms) - 0.7)
+        ax.set_ylim(-0.02, 1.03)
+        ax.yaxis.set_major_formatter(mticker.PercentFormatter(1.0))
+        ax.tick_params(labelsize=12, length=0)
+        ax.set_ylabel("Success rate", fontsize=12)
+        ax.grid(axis="y", color=INK, alpha=0.14, linewidth=0.8)
+        ax.set_axisbelow(True)
+
+        model_handles = [
+            Line2D(
+                [],
+                [],
+                color=colors[m],
+                marker="o",
+                linestyle="none",
+                markersize=7,
+                markeredgecolor=PLOT_BG,
+                label=_row_label(m),
+            )
+            for m in rows
+        ]
+        fig.legend(
+            model_handles,
+            [_row_label(m) for m in rows],
+            title="model",
+            frameon=False,
+            loc="upper left",
+            bbox_to_anchor=(1.0, 0.98),
+            fontsize=10,
+            title_fontsize=11,
+        )
+        split_handles = [Line2D([], [], color=INK, linestyle=_SPLIT_STYLE[s], label=s) for s in _SPLIT_ORDER]
+        fig.legend(
+            split_handles,
+            list(_SPLIT_ORDER),
+            title="split",
+            frameon=False,
+            loc="upper left",
+            bbox_to_anchor=(1.0, 0.48),
+            fontsize=10,
+            title_fontsize=11,
+        )
+        fig.tight_layout()
     return fig
 
 
@@ -2131,6 +2235,24 @@ def render_report(
     colors = resolve_palette(_models_in_order(df), palette)
     overview_uri = figure_data_uri(metrics_figure(df, split_hue=False, colors=colors))
     tradeoff_uri = figure_data_uri(tradeoff_figure(df, colors=colors))
+    # The training curve needs at least one skill version to trace; a baseline-only report has
+    # nothing to plot across, so the whole subsection (and its TOC entry) is dropped.
+    has_versions = len([arm for arm in _arms_in_order(df) if arm != NOSKILL_ARM]) >= 1
+    if has_versions:
+        training_uri = figure_data_uri(training_figure(df, colors=colors))
+        training_block = (
+            '<h3 id="training">Success across versions</h3>'
+            '<p class="task-desc">Each line follows one model\'s success rate as the skill goes from'
+            " no skill through each version. Solid lines are the valid tasks and dashed lines are the"
+            " train tasks. The grey line is the mean across models and sits on top. The newest"
+            " version has only valid runs, so the train lines stop one step short.</p>"
+            '<figure><img alt="Success rate across versions, by model and split"'
+            f' src="{training_uri}"></figure>'
+        )
+        training_toc = '<li><a href="#training">Success across versions</a></li>\n'
+    else:
+        training_block = ""
+        training_toc = ""
     # The loaded dotplot only exists once there is a skill arm to compare; a baseline-only report
     # keeps the note the table used to show.
     if loaded_only_rates(df).empty:
@@ -2164,7 +2286,7 @@ def render_report(
 <img class="toc-banner" src="{_asset_data_uri("banner.svg")}" alt="acumen">
 <div class="toc-title">acumen report</div>
 <ul>
-<li><a href="#overview">Overview</a><ul><li><a href="#tradeoff">Cost vs. success</a></li>
+<li><a href="#overview">Overview</a><ul>{training_toc}<li><a href="#tradeoff">Cost vs. success</a></li>
 <li><a href="#dominance">Is the difference real?</a></li>
 <li><a href="#loaded">Did it help when it actually loaded?</a></li></ul></li>
 <li><a href="#per-task">Per-task breakdown</a><ul>{"".join(toc_tasks)}</ul></li>
@@ -2198,6 +2320,7 @@ def render_report(
 <h2>Overview</h2>
 <p class="task-desc">Per-run means over test runs; error bars are standard errors.</p>
 <figure><img alt="Success rate, tokens, cost and time per skill" src="{overview_uri}"></figure>
+{training_block}
 <h3 id="tradeoff">Cost vs. success</h3>
 <p class="task-desc">One mark per model and skill version, where colour is the model and the
  &#10005; is that model's no-skill baseline. Arrows join one model's own marks in version order,

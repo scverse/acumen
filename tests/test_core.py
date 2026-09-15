@@ -91,6 +91,7 @@ from acumen.prices import (
 from acumen.procs import label_env, reap, supported, survivors
 from acumen.prompts import feedback_block, improve_prompt, wiki_prompt
 from acumen.report import (
+    _ALL_MODELS_COLOR,
     ReportError,
     _arm_marker,
     _best_cells,
@@ -114,6 +115,7 @@ from acumen.report import (
     resolve_palette,
     skill_tests,
     tradeoff_figure,
+    training_figure,
 )
 from acumen.review import (
     MAX_NOTE_CHARS,
@@ -4352,6 +4354,135 @@ def test_loaded_dotplot_labels_each_dot_with_its_signed_delta() -> None:
         plt.close(figure)
     assert "+100%" in texts  # the clear gain
     assert "—" in texts  # the never-loaded cell
+
+
+def test_training_curve_colours_by_model_and_dashes_by_split(runs_root: Path, model: str, make_result) -> None:
+    """One line per (model, split): colour carries the model, dash carries the split, and the
+    x-axis walks the arms in order with the valid rate landing on the solid line."""
+    make_result(runs_root, RunKey(arm="skill_v1", split="train", model=model, task_id="example_task", rep=1))
+    make_result(
+        runs_root, RunKey(arm="skill_v1", split="valid", model=model, task_id="example_task", rep=1), success=False
+    )
+    make_result(runs_root, RunKey(arm="skill_v2", split="train", model=model, task_id="example_task", rep=1))
+    make_result(runs_root, RunKey(arm="skill_v2", split="valid", model=model, task_id="example_task", rep=1))
+    df = load_results(runs_root)
+
+    figure = training_figure(df, colors=resolve_palette([model], {model: "#3b7ea1"}))
+    try:
+        lines = figure.axes[0].lines
+        colours = {to_hex(line.get_color()) for line in lines}
+        styles = {line.get_linestyle() for line in lines}
+        xs = {tuple(line.get_xdata()) for line in lines}
+        (valid,) = [line for line in lines if line.get_linestyle() == "-"]
+        valid_y = list(valid.get_ydata())
+    finally:
+        plt.close(figure)
+
+    assert colours == {"#3b7ea1"}  # a single model, so no pooled grey line and the override reaches the marks
+    assert styles == {"-", "--"}  # valid solid, train dashed
+    assert xs == {(0, 1, 2)}  # noskill, v1, v2 in arm order
+    assert valid_y == [1.0, 0.0, 1.0]  # noskill pass, v1 forced fail, v2 pass
+
+
+def _two_model_curve(runs_root: Path, model: str, make_result) -> pd.DataFrame:
+    """A run tree with two models across noskill and skill_v1 on both splits."""
+    other = "claude-opus-5"
+    for m in (model, other):
+        for split in ("train", "valid"):
+            if m != model:  # the fixture already seeds the primary model's noskill runs
+                make_result(runs_root, RunKey(arm="noskill", split=split, model=m, task_id="example_task", rep=1))
+            make_result(runs_root, RunKey(arm="skill_v1", split=split, model=m, task_id="example_task", rep=1))
+    return load_results(runs_root)
+
+
+def test_training_curve_draws_the_pooled_mean_line_on_top(runs_root: Path, model: str, make_result) -> None:
+    """With several models a grey all-models line appears and sits above the per-model lines."""
+    df = _two_model_curve(runs_root, model, make_result)
+
+    figure = training_figure(df)
+    try:
+        lines = figure.axes[0].lines
+        pooled = [line for line in lines if to_hex(line.get_color()) == to_hex(_ALL_MODELS_COLOR)]
+        pooled_z = {line.get_zorder() for line in pooled}
+        model_z = {line.get_zorder() for line in lines if line not in pooled}
+    finally:
+        plt.close(figure)
+
+    assert len(pooled) == 2  # a train and a valid mean line
+    assert min(pooled_z) > max(model_z)  # drawn on top of the model lines it summarises
+
+
+def test_training_curve_single_model_has_no_pooled_line(runs_root: Path, model: str, make_result) -> None:
+    """One model needs no mean line — it would just restate that model."""
+    for split in ("train", "valid"):
+        make_result(runs_root, RunKey(arm="skill_v1", split=split, model=model, task_id="example_task", rep=1))
+    df = load_results(runs_root)
+
+    figure = training_figure(df, colors=resolve_palette([model]))
+    try:
+        greys = [line for line in figure.axes[0].lines if to_hex(line.get_color()) == to_hex(_ALL_MODELS_COLOR)]
+    finally:
+        plt.close(figure)
+
+    assert greys == []
+
+
+def test_training_curve_breaks_the_train_line_where_a_version_has_no_train_runs(
+    runs_root: Path, model: str, make_result
+) -> None:
+    """A version measured on valid only leaves a gap in the train line, never a false zero."""
+    for split in ("train", "valid"):
+        make_result(runs_root, RunKey(arm="skill_v1", split=split, model=model, task_id="example_task", rep=1))
+    make_result(runs_root, RunKey(arm="skill_v2", split="valid", model=model, task_id="example_task", rep=1))
+    df = load_results(runs_root)
+
+    figure = training_figure(df, colors=resolve_palette([model]))
+    try:
+        (train,) = [line for line in figure.axes[0].lines if line.get_linestyle() == "--"]
+        (valid,) = [line for line in figure.axes[0].lines if line.get_linestyle() == "-"]
+        train_last = train.get_ydata()[-1]
+        valid_last = valid.get_ydata()[-1]
+    finally:
+        plt.close(figure)
+
+    assert pd.isna(train_last)  # skill_v2 has no train runs
+    assert not pd.isna(valid_last)  # but it does have valid runs
+
+
+def test_training_curve_has_a_model_and_a_split_legend(runs_root: Path, model: str, make_result) -> None:
+    """Two legends: colour for the model, dash for the split."""
+    df = _two_model_curve(runs_root, model, make_result)
+
+    figure = training_figure(df)
+    try:
+        titles = {legend.get_title().get_text() for legend in figure.legends}
+        (split_legend,) = [lg for lg in figure.legends if lg.get_title().get_text() == "split"]
+        split_styles = {handle.get_linestyle() for handle in split_legend.legend_handles}
+        model_labels = [
+            t.get_text() for lg in figure.legends if lg.get_title().get_text() == "model" for t in lg.get_texts()
+        ]
+    finally:
+        plt.close(figure)
+
+    assert titles == {"model", "split"}
+    assert split_styles == {"-", "--"}
+    assert "all models" in model_labels
+
+
+def test_render_report_includes_the_training_curve_only_with_versions(
+    runs_root: Path, model: str, make_result, tmp_path: Path
+) -> None:
+    """The training subsection appears once there is a version to chart, and not before."""
+    make_result(runs_root, RunKey(arm="skill_v1", split="valid", model=model, task_id="example_task", rep=1))
+    df = load_results(runs_root)
+
+    rendered = render_report(df, tmp_path)
+    assert 'id="training"' in rendered
+    assert 'href="#training"' in rendered  # the TOC entry
+    assert 'alt="Success rate across versions' in rendered
+
+    baseline_only = df[df["arm"] == "noskill"]
+    assert 'id="training"' not in render_report(baseline_only, tmp_path)
 
 
 # --- split diff ------------------------------------------------------------------------
