@@ -1517,6 +1517,33 @@ def _tests_table_html(tests: SkillTests) -> str:
 </table></div>"""
 
 
+def _paired_delta(loaded: pd.DataFrame, base_rate: pd.Series) -> tuple[float, float, float]:
+    """Success rate, matched baseline, and their difference over the ``loaded`` runs.
+
+    Every loaded run is paired with ``base_rate`` on its own ``(task_id, model)`` and the per-run
+    differences are averaged, so the delta measures the improvement on the tasks that loaded
+    rather than a comparison against the baseline's whole task mix. Runs with no baseline to pair
+    against are dropped; an empty or all-unpaired input returns NaNs. The returned ``rate`` and
+    ``baseline`` are means over the paired runs, so ``delta == rate - baseline`` always holds.
+    """
+    if loaded.empty:
+        return math.nan, math.nan, math.nan
+    matched = np.array(
+        [
+            base_rate.get((task, model), math.nan)
+            for task, model in zip(loaded["task_id"], loaded["model"], strict=True)
+        ],
+        dtype=float,
+    )
+    success = loaded["success"].to_numpy(dtype=float)
+    pair = ~np.isnan(matched)
+    if not pair.any():
+        return math.nan, math.nan, math.nan
+    rate = float(success[pair].mean())
+    baseline = float(matched[pair].mean())
+    return rate, baseline, rate - baseline
+
+
 def loaded_only_rates(df: pd.DataFrame) -> pd.DataFrame:
     """Success rate restricted to the runs that actually loaded the skill, per skill and model.
 
@@ -1526,59 +1553,47 @@ def loaded_only_rates(df: pd.DataFrame) -> pd.DataFrame:
     the thing to fix is the frontmatter ``description`` rather than the guidance — and the load
     rate varies enormously by model, so the dilution is uneven across the matrix.
 
-    This is the overview's comparison with those runs held out instead of counted against the
-    skill. It is deliberately *not* the headline number: conditioning on load is conditioning on
-    something the agent chose, so the loaded runs are not a random subset and this cannot prove
-    a skill works. It answers the narrower question — when the guidance did reach the agent, did
-    it help? — and separates a description problem from a content problem.
+    This is the overview's comparison with the non-loading runs held out instead of counted
+    against the skill. Each loaded run is paired with the baseline on its own task and model, and
+    those per-run differences are averaged, so the delta is a real effect and does not depend on
+    which tasks happened to load. It answers the narrower question of whether the guidance helped
+    where it reached the agent, and separates a description problem (the skill does not load) from
+    a content problem (it loads and does not help). It is still measured only on the tasks that
+    loaded, and it is a point estimate rather than a significance test, so on its own it cannot
+    prove a skill works.
 
-    Two pooled rows close each skill, and the pair is the point. ``all models`` pools every
-    model in the arm; ``models that loaded`` restricts **both sides** to the models that
-    contributed at least one loaded run. When they disagree, the gap is model mix rather than
-    skill effect — a model that fails every run (an outage, an unavailable id) sits in the
-    all-models baseline while contributing nothing to the loaded column, which on its own would
-    manufacture a gain out of an absence. Reporting only the matched row would hide that the
-    arm's headline moved; reporting only the raw row would credit the skill for it.
+    A pooled ``all models`` row closes each skill, pairing every loaded run in the arm with its
+    own (task, model) baseline. A model with no loaded runs contributes nothing to the pool, and
+    the pairing already leaves its baseline out, so no separate model-matched row is needed.
 
     Returns
     -------
-    One row per (arm, model) over the reported split, then the two pooled rows per arm.
-    Columns: ``arm``, ``model``, ``scope`` (``"model"``, ``"all"`` or ``"matched"``),
-    ``loaded``, ``runs``, ``load_rate``, ``baseline``, ``overall`` (the arm's rate over every
-    run, which is what the overview reports), ``rate`` (successes among loaded runs only), and
-    ``delta`` (``rate - baseline``). ``overall`` and ``rate`` are shown side by side because the
-    distance between them *is* the dilution the non-loading runs cause. ``rate`` is ``NaN``
-    where nothing loaded, and ``baseline`` is ``NaN`` where that model has no baseline runs.
+    One row per (arm, model) over the reported split, then a pooled ``all models`` row per arm.
+    Columns: ``arm``, ``model``, ``scope`` (``"model"`` or ``"all"``), ``loaded``, ``runs``,
+    ``load_rate``, ``baseline`` (mean baseline over the same (task, model) cells the loaded runs
+    cover), ``overall`` (the arm's rate over every run), ``rate`` (success over the loaded runs),
+    and ``delta`` (``rate - baseline``, the mean per-run improvement on the tasks that loaded).
+    ``rate``, ``baseline`` and ``delta`` are ``NaN`` where nothing loaded or nothing could be
+    paired against a baseline.
     """
     reported = df[df["split"] == _REPORTED_SPLIT]
     arms = [arm for arm in _arms_in_order(reported) if arm != NOSKILL_ARM]
     base = reported[reported["arm"] == NOSKILL_ARM]
+    # Baseline success on each (task, model). A loaded run is compared with the baseline on the
+    # very same task and model, so the delta is not swayed by which tasks happened to load.
+    base_rate = base.groupby(["task_id", "model"])["success"].mean() if not base.empty else pd.Series(dtype=float)
     records: list[dict[str, object]] = []
     for arm in arms:
         subset = reported[reported["arm"] == arm]
-        contributing = {
-            model for model in subset["model"].unique() if _loaded_flags(subset[subset["model"] == model]).any()
-        }
-        plan: list[tuple[str, object, pd.DataFrame, pd.DataFrame]] = [
-            ("model", model, subset[subset["model"] == model], base[base["model"] == model])
-            for model in _models_in_order(subset)
+        plan: list[tuple[str, object, pd.DataFrame]] = [
+            ("model", model, subset[subset["model"] == model]) for model in _models_in_order(subset)
         ]
-        plan.append(("all", _ALL_MODELS, subset, base))
-        plan.append(
-            (
-                "matched",
-                _LOADED_MODELS,
-                subset[subset["model"].isin(contributing)],
-                base[base["model"].isin(contributing)],
-            )
-        )
-        for scope, model, runs, reference in plan:
+        plan.append(("all", _ALL_MODELS, subset))
+        for scope, model, runs in plan:
             if runs.empty:
                 continue
             loaded = runs[_loaded_flags(runs)]
-            rate = float(loaded["success"].mean()) if len(loaded) else math.nan
-            overall = float(runs["success"].mean())
-            baseline = float(reference["success"].mean()) if len(reference) else math.nan
+            rate, baseline, delta = _paired_delta(loaded, base_rate)
             records.append(
                 {
                     "arm": arm,
@@ -1588,11 +1603,9 @@ def loaded_only_rates(df: pd.DataFrame) -> pd.DataFrame:
                     "runs": len(runs),
                     "load_rate": len(loaded) / len(runs),
                     "baseline": baseline,
-                    # The arm as it ran (what the overview reports) beside the arm with the
-                    # non-loading runs held out. The gap between them is the dilution.
-                    "overall": overall,
+                    "overall": float(runs["success"].mean()),
                     "rate": rate,
-                    "delta": rate - baseline,
+                    "delta": delta,
                 }
             )
     return pd.DataFrame.from_records(records, columns=_LOADED_COLUMNS)
@@ -1611,11 +1624,6 @@ _LOADED_COLUMNS = (
     "rate",
     "delta",
 )
-
-#: Sentinel for the pooled row that restricts both sides to the models which loaded the skill,
-#: alongside :data:`_ALL_MODELS` for the row that pools the arm as it actually ran.
-_LOADED_MODELS = "\x00loaded-models"
-
 
 #: The diverging colour scale for the loaded dotplot: loss red → light neutral → gain green, the
 #: same red/green a delta wears in the tables. Models are the *rows* here, not a colour, so this
@@ -1663,9 +1671,9 @@ def loaded_dotplot_figure(df: pd.DataFrame) -> plt.Figure:
     """The loaded-only comparison as a dot grid — one dot per (model, skill version).
 
     Rows are the models, most-potent first, with a pooled *all models* row set off at the bottom.
-    Columns are the skill versions. Each dot's **colour** is the change in success rate over the
-    no-skill baseline among the runs that actually loaded the skill (green better, red worse, a
-    light neutral at no change), and its **area** is the load rate, so a big green dot reads
+    Columns are the skill versions. Each dot's **colour** is the change in success rate against
+    the baseline on the same task and model, over the runs that loaded the skill (green better,
+    red worse, a light neutral at no change), and its **area** is the load rate, so a big green dot reads
     "loaded often and helped" and a small one "rarely loaded". The numeric Δ rides every dot, so
     the red/green never carries the value alone (the colourblind-safe reading is the label). A
     hollow ring marks a cell where the skill never loaded, which reads as no evidence rather than
@@ -2345,11 +2353,12 @@ def render_report(
  about the skill itself and only measures the baseline. Setting those runs aside lets us see
  whether the guidance helped in the runs where it did reach the agent. This helps tell apart a
  skill that fails to load from one that loads but still doesn't help. In the plot below, every dot
- is one model on one skill version. The colour shows how much the success rate changed against the
- baseline among the runs where the skill loaded, green for better and red for worse. The size shows
- how often the skill loaded, and a hollow ring means it never did. Keep in mind that a skill
- doesn't load at random. Whether it loads depends on the model and the task, so these numbers can
- flatter a skill and shouldn't be read as proof that it works. For that, look at the test above.</p>
+ is one model on one skill version. The colour shows the change in success rate against the
+ baseline, green for better and red for worse. The size shows how often the skill loaded, and a
+ hollow ring means it never did. Each loaded run is compared with the baseline on the very same
+ task and model, and those differences are averaged, so the number is a real effect and does not
+ depend on which tasks happened to load. It is still measured only on the tasks that loaded, and
+ it does not test whether a gain is more than noise. For that, look at the test above.</p>
 {loaded_body}
 </section>
 <section id="per-task">

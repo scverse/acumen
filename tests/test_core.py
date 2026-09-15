@@ -4221,16 +4221,34 @@ def test_runs_table_ranks_a_skill_that_failed_to_load_above_one_that_loaded() ->
     assert ranks == sorted(ranks, reverse=True)
 
 
-def _run(arm: str, model: str, success: bool, loaded: object, split: str = "valid") -> dict:
-    return {"arm": arm, "model": model, "split": split, "success": success, "skill_loaded": loaded}
+def _run(arm: str, model: str, success: bool, loaded: object, split: str = "valid", task: str = "t") -> dict:
+    return {"arm": arm, "model": model, "split": split, "success": success, "skill_loaded": loaded, "task_id": task}
 
 
-def test_loaded_only_rates_pools_over_one_model_mix_on_both_sides() -> None:
-    """A model that never loaded the skill must leave the pooled baseline too.
+def test_loaded_only_rates_pairs_against_the_baseline_on_the_same_task() -> None:
+    """The delta pairs each loaded run with the baseline on its own task, so it is not fooled by
+    a skill that only loads on the tasks the baseline already passes."""
+    rows = (
+        # Baseline: the easy task passes, the hard one fails.
+        [_run("noskill", "m", True, None, task="easy")]
+        + [_run("noskill", "m", False, None, task="hard")]
+        # The skill loads only on the easy task (and passes it); it never loads on the hard task.
+        + [_run("skill_v1", "m", True, True, task="easy")]
+        + [_run("skill_v1", "m", False, False, task="hard")]
+    )
+    row = loaded_only_rates(pd.DataFrame(rows)).iloc[0]
 
-    Otherwise a model that fails every run — an outage, an unavailable id — depresses the
-    baseline while contributing nothing to the loaded side, manufacturing a gain from nothing.
-    """
+    assert row["load_rate"] == 0.5  # loaded on 1 of the 2 runs
+    assert row["rate"] == 1.0  # the loaded (easy) run passed
+    # Paired against the easy-task baseline (which also passed) the gain is zero, not the +50%
+    # an unpaired comparison against the whole-baseline mean of 50% would have shown.
+    assert row["baseline"] == 1.0
+    assert row["delta"] == 0.0
+
+
+def test_loaded_only_rates_pooled_row_leaves_out_a_model_that_never_loaded() -> None:
+    """A model that fails every run and never loads contributes nothing to the pooled comparison,
+    so pairing keeps its baseline out and no gain is manufactured from its absence."""
     rows = (
         # A working model: loads the skill, same rate in both arms.
         [_run("noskill", "good", True, None) for _ in range(4)]
@@ -4240,17 +4258,14 @@ def test_loaded_only_rates_pools_over_one_model_mix_on_both_sides() -> None:
         + [_run("skill_v1", "broken", False, False) for _ in range(4)]
     )
     table = loaded_only_rates(pd.DataFrame(rows))
-    pooled = table[table["scope"] == "matched"].iloc[0]
-    raw = table[table["scope"] == "all"].iloc[0]
+    pooled = table[table["scope"] == "all"].iloc[0]
 
-    # Only the loading model is pooled, on both sides — so the skill shows no gain…
-    assert pooled["loaded"] == 4 and pooled["runs"] == 4
+    # Only the loading model's runs are paired, against its own baseline, so no artefact gain.
+    assert pooled["loaded"] == 4
     assert pooled["baseline"] == 1.0 and pooled["rate"] == 1.0
     assert pooled["delta"] == 0.0
-    # …while the raw all-models row keeps the mix as it ran, and shows the artifact the
-    # matched row exists to expose: a +50% that is entirely the broken model leaving.
-    assert raw["runs"] == 8 and raw["baseline"] == 0.5 and raw["rate"] == 1.0
-    assert raw["delta"] == 0.5
+    # The model-matched scope is gone: pairing makes it identical to the pooled row.
+    assert (table["scope"] == "matched").sum() == 0
 
 
 def test_loaded_only_rates_reports_a_model_that_never_loaded() -> None:
