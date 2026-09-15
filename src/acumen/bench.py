@@ -16,6 +16,12 @@ from acumen.runner import RunOutcome, run_once
 from acumen.skills import Skill
 from acumen.tasks import Task
 
+#: Invalid reasons that stop the rest of a provider's cells for this pass: the credential is
+#: empty (``provider_exhausted``) or the network is down (``connection_error``). Both would fail
+#: every remaining cell the same way, so the pass raises ``BenchmarkInvalidError`` and the cells
+#: stay pending for the next run to resume. ``sandbox_blocked`` is handled separately (pass-scoped).
+_PROVIDER_SCOPED_STOP = frozenset({"provider_exhausted", "connection_error"})
+
 
 @dataclass(frozen=True)
 class PlannedRun:
@@ -275,7 +281,7 @@ async def run_matrix(
                     if peer is not asyncio.current_task() and not peer.done():
                         peer.cancel()
                 return outcome
-            if outcome.reason == "provider_exhausted" and provider not in exhausted:
+            if outcome.reason in _PROVIDER_SCOPED_STOP and provider not in exhausted:
                 exhausted[provider] = outcome
                 current = asyncio.current_task()
                 # Stop both queued and in-flight siblings for this provider. Tasks for the

@@ -11,7 +11,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import date
@@ -34,7 +34,7 @@ from acumen.check import (
 )
 from acumen.config import Config, ConfigError, load_config
 from acumen.env import DEFAULT_CACHE_ROOT, AuthMode, EnvError, prepare_target, resolve_auth_mode
-from acumen.epoch import EpochPlan, resolve_epoch
+from acumen.epoch import EpochPlan, completed_epochs, resolve_epoch
 from acumen.grade import INVALID_REASONS
 from acumen.improve import ImproveError, improve_skill
 from acumen.logs import LiveLog
@@ -947,6 +947,20 @@ def _prepare_pass(cfg: Config, args: argparse.Namespace):
     return auth_modes, meta_auth, prices, target
 
 
+def _valid_complete_fn(cfg: Config, tasks: list[Task], runs_root: Path) -> Callable[[str], bool]:
+    """Build the "does this version have a complete ``valid`` bench?" predicate.
+
+    Shared by epoch resolution (``resolve_epoch``/``completed_epochs``) so the two never
+    disagree on what "done" means.
+    """
+
+    def valid_complete(version: str) -> bool:
+        planned = build_matrix(cfg, tasks, skill=version, splits=["valid"])
+        return not pending(planned, runs_root, resume=True)
+
+    return valid_complete
+
+
 def _run_one_epoch(
     args: argparse.Namespace,
     *,
@@ -970,10 +984,7 @@ def _run_one_epoch(
     """
     runs_root = args.runs
 
-    def valid_complete(version: str) -> bool:
-        planned = build_matrix(cfg, tasks, skill=version, splits=["valid"])
-        return not pending(planned, runs_root, resume=True)
-
+    valid_complete = _valid_complete_fn(cfg, tasks, runs_root)
     plan = resolve_epoch(args.skills, valid_complete=valid_complete)
     parent_label = plan.parent_version or arm_name(None)
     tail = " (resuming)" if plan.resumed else ""
@@ -1132,14 +1143,13 @@ def _cmd_fit(args: argparse.Namespace) -> int:
         cfg = replace(cfg, meta_model=args.model)
 
     fixed = args.epochs is not None
-    limit = args.epochs if fixed else args.max_epochs
-    if limit < 1:
+    # A GLOBAL target across invocations, not a per-run count: --epochs/--max-epochs is the total
+    # number of epochs to end up with. It is taken from this invocation's flag and not persisted,
+    # so re-run with the same flag to keep continuing toward the same target.
+    total = args.epochs if fixed else args.max_epochs
+    if total < 1:
         print("error: nothing to run — --epochs/--max-epochs must be >= 1", file=sys.stderr)
         return 2
-    if fixed:
-        print(f"fit: running exactly {limit} epoch(s) (early stopping disabled)")
-    else:
-        print(f"fit: up to {limit} epoch(s), early stopping with patience {args.patience}")
 
     try:
         auth_modes, meta_auth, prices, target = _prepare_pass(cfg, args)
@@ -1148,9 +1158,38 @@ def _cmd_fit(args: argparse.Namespace) -> int:
         print("Retry when the pricing pages are reachable, or pin rates in config.yaml.", file=sys.stderr)
         return 2
 
+    # How many epochs are already fully done on disk — the loop resumes from the next one.
+    completed = completed_epochs(args.skills, valid_complete=_valid_complete_fn(cfg, tasks, args.runs))
+    remaining = max(0, total - completed)
+    prior = [row for row in build_training_rows(args.runs, cfg) if row.epoch <= completed] if completed else []
+    stopping = "early stopping disabled" if fixed else f"early stopping with patience {args.patience}"
+    if completed:
+        print(f"fit: target {total} epoch(s) total ({stopping}); {completed} done, {remaining} to go")
+        # Show the progress of the epochs already finished (skip any in-progress/partial version).
+        prior_best = best_version(prior)
+        print(f"\nresuming: {completed} epoch(s) already complete (target {total})")
+        for index, row in enumerate(prior):
+            since = epochs_since_best([r.valid_success for r in prior[: index + 1]])
+            print(
+                _epoch_bar(
+                    row.epoch, total, row, best=prior_best, patience=args.patience, since_best=since, fixed=fixed
+                )
+            )
+    else:
+        print(f"fit: target {total} epoch(s) total ({stopping})")
+
+    # A finished epoch that already hit 100% means there is nothing left to gain — do not resume
+    # into more epochs. Mirrors the in-loop is_perfect stop, which never sees a prior epoch.
+    already_perfect = next((row for row in prior if is_perfect(row.valid_success)), None)
+    if already_perfect is not None:
+        print(f"\nearly stop: validation success already reached 100% at {already_perfect.version}.")
+    elif remaining == 0:
+        print(f"\nnothing to do: already at {completed} epoch(s) (target {total}).")
+
     mode = _progress_mode(args)
-    for done in range(limit):
-        _epoch_header(mode, done + 1, limit)
+    epochs = range(completed + 1, total + 1) if already_perfect is None else range(0)
+    for epoch_no in epochs:
+        _epoch_header(mode, epoch_no, total)
         try:
             plan = _run_one_epoch(
                 args,
@@ -1175,7 +1214,7 @@ def _cmd_fit(args: argparse.Namespace) -> int:
         valids = [row.valid_success for row in rows]
         best = best_version(rows)
         since = epochs_since_best(valids)
-        print(_epoch_bar(done + 1, limit, current, best=best, patience=args.patience, since_best=since, fixed=fixed))
+        print(_epoch_bar(epoch_no, total, current, best=best, patience=args.patience, since_best=since, fixed=fixed))
 
         # A perfect validation score leaves nothing to gain — stop even under a fixed --epochs.
         if current is not None and is_perfect(current.valid_success):

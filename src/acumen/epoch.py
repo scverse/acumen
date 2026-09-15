@@ -61,3 +61,13 @@ def resolve_epoch(skills_root, *, valid_complete: Callable[[str], bool]) -> Epoc
 
     new = next_version(skills_root)
     return EpochPlan(parent_version=latest, new_version=new, first=latest is None, resumed=False)
+
+
+def completed_epochs(skills_root, *, valid_complete: Callable[[str], bool]) -> int:
+    """How many epochs are fully finished — versions on disk whose ``valid`` bench is complete.
+
+    Used to resume ``fit`` toward a global epoch target: the next epoch to run is
+    ``completed_epochs(...) + 1``. Takes the same injected ``valid_complete`` predicate as
+    :func:`resolve_epoch`, so it stays pure and unit-testable.
+    """
+    return sum(1 for version in available_versions(skills_root) if valid_complete(version))

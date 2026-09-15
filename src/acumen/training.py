@@ -79,7 +79,10 @@ def build_training_rows(runs_root: Path, cfg: Config) -> list[EpochRow]:
     -------
     The rows, epoch 1 first. Empty if no produced version has runs yet.
     """
-    df = load_results(runs_root)
+    # Skip infrastructure-invalid cells: the training curve is built over actual measurements,
+    # and a broken/pending epoch's invalid runs are waiting to be re-run on resume — they must not
+    # abort the curve the way they (rightly) abort a final report.
+    df = load_results(runs_root, skip_invalid=True)
     models = list(cfg.models)
 
     arms: list[tuple[int, str]] = []

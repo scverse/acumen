@@ -328,6 +328,148 @@ def test_cmd_fit_stops_when_validation_hits_100_percent(
     assert "validation success reached 100%" in capsys.readouterr().out
 
 
+def test_cmd_fit_resumes_from_completed_epochs_toward_a_global_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With 2 epochs already done, `fit --max-epochs 4` announces resuming, numbers the next
+    epoch 3/4, and runs only the remaining 2 (global target, not 4 more)."""
+    import types
+
+    import acumen.cli as cli
+    from acumen.training import EpochRow
+
+    assert main(["init", "--dir", str(tmp_path)]) == 0
+
+    def row(version: str, epoch: int, valid: float) -> EpochRow:
+        return EpochRow(
+            epoch=epoch,
+            version=version,
+            parent="noskill" if epoch == 1 else f"v{epoch - 1}",
+            n_train=2,
+            n_valid=2,
+            train_success=0.5,
+            valid_success=valid,  # strictly increasing so best is always latest (no patience stop), never 1.0
+            train_cost=0.1,
+            valid_cost=0.1,
+            train_success_by_model={},
+            valid_success_by_model={},
+            train_cost_by_model={},
+            valid_cost_by_model={},
+        )
+
+    all_rows = [row("v1", 1, 0.5), row("v2", 2, 0.6), row("v3", 3, 0.7), row("v4", 4, 0.8)]
+    epochs_run = 0
+
+    def fake_epoch(*a: object, **k: object) -> object:
+        nonlocal epochs_run
+        epochs_run += 1
+        return types.SimpleNamespace(
+            new_version=f"v{2 + epochs_run}",
+            first=False,
+            resumed=(epochs_run == 1),
+            parent_version=f"v{1 + epochs_run}",
+        )
+
+    monkeypatch.setattr(cli, "_prepare_pass", lambda cfg, args: ({}, "session", None, None))
+    monkeypatch.setattr(cli, "completed_epochs", lambda skills_root, *, valid_complete: 2)
+    monkeypatch.setattr(cli, "_run_one_epoch", fake_epoch)
+    monkeypatch.setattr(cli, "build_training_rows", lambda runs_root, cfg: all_rows)
+    monkeypatch.setattr(cli, "write_training_csv", lambda rows, out: Path(out).write_text("version\n"))
+
+    rc = main(
+        [
+            "fit",
+            "--max-epochs",
+            "4",
+            "--config",
+            str(tmp_path / "config.yaml"),
+            "--tasks",
+            str(tmp_path / "tasks.yaml"),
+            "--runs",
+            str(tmp_path / "runs"),
+            "--skills",
+            str(tmp_path / "skills"),
+            "--wiki",
+            str(tmp_path / "wiki"),
+            "--out",
+            str(tmp_path / "training.csv"),
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert epochs_run == 2, "should run only the 2 remaining epochs toward the global target of 4"
+    assert "resuming: 2 epoch(s) already complete" in out
+    assert "Epoch 3/4" in out and "Epoch 4/4" in out
+
+
+def test_cmd_fit_does_not_resume_past_a_completed_perfect_epoch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """If an already-finished epoch hit 100% validation, re-running fit stops without new epochs."""
+    import types
+
+    import acumen.cli as cli
+    from acumen.training import EpochRow
+
+    assert main(["init", "--dir", str(tmp_path)]) == 0
+
+    perfect_prior = [
+        EpochRow(
+            epoch=3,
+            version="v3",
+            parent="v2",
+            n_train=2,
+            n_valid=2,
+            train_success=0.5,
+            valid_success=1.0,  # a finished epoch that already reached a perfect validation score
+            train_cost=0.1,
+            valid_cost=0.1,
+            train_success_by_model={},
+            valid_success_by_model={},
+            train_cost_by_model={},
+            valid_cost_by_model={},
+        )
+    ]
+    epochs_run = 0
+
+    def fake_epoch(*a: object, **k: object) -> object:
+        nonlocal epochs_run
+        epochs_run += 1
+        return types.SimpleNamespace(new_version="v4", first=False, resumed=False, parent_version="v3")
+
+    monkeypatch.setattr(cli, "_prepare_pass", lambda cfg, args: ({}, "session", None, None))
+    monkeypatch.setattr(cli, "completed_epochs", lambda skills_root, *, valid_complete: 3)
+    monkeypatch.setattr(cli, "_run_one_epoch", fake_epoch)
+    monkeypatch.setattr(cli, "build_training_rows", lambda runs_root, cfg: perfect_prior)
+    monkeypatch.setattr(cli, "write_training_csv", lambda rows, out: Path(out).write_text("version\n"))
+
+    rc = main(
+        [
+            "fit",
+            "--max-epochs",
+            "10",
+            "--config",
+            str(tmp_path / "config.yaml"),
+            "--tasks",
+            str(tmp_path / "tasks.yaml"),
+            "--runs",
+            str(tmp_path / "runs"),
+            "--skills",
+            str(tmp_path / "skills"),
+            "--wiki",
+            str(tmp_path / "wiki"),
+            "--out",
+            str(tmp_path / "training.csv"),
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert epochs_run == 0, "must not start epoch 4 when a finished epoch already reached 100%"
+    assert "validation success already reached 100%" in out
+
+
 def test_codex_trace_regex_matches_tracing_but_not_sandbox_errors() -> None:
     from acumen.agents import _CODEX_TRACE_RE
 

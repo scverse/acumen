@@ -128,6 +128,7 @@ from acumen.review import (
 from acumen.runner import (
     RunOutcome,
     StderrFilter,
+    _connection_error,
     _provider_exhaustion_error,
     _sandbox_denial,
     _skill_fired,
@@ -1396,6 +1397,45 @@ def test_transient_rate_limit_and_acumen_caps_are_not_provider_exhaustion() -> N
     assert _provider_exhaustion_error(capped) is None
 
 
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "ConnectionError: Connection reset by peer",
+        "httpx.ConnectError: [Errno 111] Connection refused",
+        "TimeoutError: read timed out",
+        "socket.gaierror: [Errno -3] Temporary failure in name resolution",
+        "Server disconnected without sending a response",
+        "APIStatusError: 503 Service Unavailable",
+    ],
+)
+def test_connection_drops_are_infrastructure_invalid(detail: str) -> None:
+    assert _connection_error(None, detail) is not None
+
+
+def test_non_connection_errors_and_caps_are_not_connection_errors() -> None:
+    # A model/answer error or ordinary throttling is not a connection drop.
+    assert _connection_error(None, "ValueError: bad answer format") is None
+    assert _connection_error(None, "429 rate limit exceeded; retry after 2s") is None
+    # An intentional acumen cap must never be reclassified, even if its text mentions a timeout.
+    capped = AgentResult(
+        provider="claude",
+        is_error=True,
+        subtype="error_max_turns",
+        errors=["read timed out"],
+        session_id=None,
+        result="",
+        num_turns=0,
+        total_cost_usd=None,
+        duration_ms=1,
+        usage={},
+    )
+    assert _connection_error(capped) is None
+
+
+def test_connection_error_is_invalid_reason() -> None:
+    assert "connection_error" in INVALID_REASONS
+
+
 def test_provider_exhaustion_result_is_diagnostic_not_complete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     box_root = tmp_path / "box"
     box_root.mkdir()
@@ -1453,6 +1493,57 @@ def test_provider_exhaustion_result_is_diagnostic_not_complete(tmp_path: Path, m
 
     persisted = json.loads((directory / "result.json").read_text())
     assert outcome.reason == "provider_exhausted"
+    assert persisted["valid"] is False
+    assert not is_complete(directory)
+
+
+def test_connection_error_result_is_diagnostic_not_complete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transient network drop is recorded invalid so resume retries it, not sealed as a result."""
+    box_root = tmp_path / "box"
+    box_root.mkdir()
+    box = Sandbox(
+        root=box_root,
+        home=tmp_path / "home",
+        config_dir=tmp_path / "codex-home",
+        env={},
+        authenticated=True,
+        provider="codex",
+    )
+
+    @asynccontextmanager
+    async def fake_sandbox(*_args, **_kwargs):
+        yield box
+
+    async def dropped(*_args, **_kwargs) -> AgentResult:
+        raise ConnectionError("Connection reset by peer")
+
+    monkeypatch.setattr("acumen.runner.sandbox", fake_sandbox)
+    monkeypatch.setattr("acumen.runner.run_agent", dropped)
+    monkeypatch.setattr("acumen.runner._collect_artifacts", lambda *_args: None)
+    monkeypatch.setattr("acumen.runner.agent_version", lambda _provider: "test")
+    directory = tmp_path / "run"
+    outcome = asyncio.run(
+        run_once(
+            key=RunKey(arm="noskill", split="valid", model="gpt-5.6-sol", task_id="task", rep=1),
+            task=Task(id="task", train=TaskSplit("prompt", "OK"), valid=TaskSplit("prompt", "OK")),
+            target=Target(
+                source="target",
+                ref="main",
+                src_dir=tmp_path / "src",
+                venv_dir=tmp_path / "venv",
+                commit="abc",
+                pkg_name="target",
+                pkg_version="1",
+            ),
+            run_dir=directory,
+            model="gpt-5.6-sol",
+            max_turns=1,
+            max_usd=1.0,
+        )
+    )
+
+    persisted = json.loads((directory / "result.json").read_text())
+    assert outcome.reason == "connection_error"
     assert persisted["valid"] is False
     assert not is_complete(directory)
 
@@ -1622,6 +1713,55 @@ def test_run_matrix_cancels_remaining_cells_when_provider_is_exhausted(
                 success=False,
                 reason="provider_exhausted",
                 payload={"agent": "codex", "auth_mode": "session", "error": "usage limit reached"},
+            )
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(key.task_id)
+
+    monkeypatch.setattr("acumen.bench.run_once", fake_run_once)
+    monkeypatch.setattr("acumen.bench.preflight_models", _no_preflight)
+    target = Target(
+        source="target",
+        ref="main",
+        src_dir=tmp_path / "src",
+        venv_dir=tmp_path / "venv",
+        commit="abc",
+        pkg_name="target",
+        pkg_version="1",
+    )
+
+    with pytest.raises(BenchmarkInvalidError, match="benchmark invalid"):
+        asyncio.run(run_matrix(planned, target=target, runs_root=tmp_path / "runs", max_concurrency=3))
+    assert set(cancelled) == {"task_1", "task_2"}
+
+
+def test_run_matrix_cancels_remaining_cells_on_connection_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A network drop stops the provider's remaining cells and raises invalid, like exhaustion —
+    so the cells stay pending and the next run resumes them."""
+    task = Task(id="net", train=TaskSplit("prompt", "OK"), valid=TaskSplit("prompt", "OK"))
+    planned = [
+        PlannedRun(
+            key=RunKey(arm="noskill", split="valid", model="gpt-5.6-sol", task_id=f"task_{index}", rep=1),
+            task=task,
+            model="gpt-5.6-sol",
+            max_turns=1,
+            max_usd=1.0,
+        )
+        for index in range(3)
+    ]
+    cancelled: list[str] = []
+
+    async def fake_run_once(*, key: RunKey, **_kwargs: object) -> RunOutcome:
+        if key.task_id == "task_0":
+            await asyncio.sleep(0)  # let sibling cells become in-flight
+            return RunOutcome(
+                key=key,
+                success=False,
+                reason="connection_error",
+                payload={"agent": "codex", "auth_mode": "session", "error": "Connection reset by peer"},
             )
         try:
             await asyncio.Event().wait()
@@ -1998,6 +2138,82 @@ def test_render_trajectory_renders_gfm_tables(tmp_path: Path) -> None:
     assert '<td style="text-align:right">1</td>' in body  # score col is right-aligned from --:
     assert "<code>a</code>" in body and "<code>b</code>" in body  # inline markdown inside cells
     assert "<p>| id" not in body  # the pipe rows are not left as paragraph text
+
+
+def _render_call_body(tmp_path: Path, call: ToolCall, observations: tuple[Observation, ...] = ()) -> str:
+    """Render a one-step trajectory carrying ``call`` and return the HTML."""
+    step = Step(index=1, source="agent", tool_calls=(call,), observations=observations)
+    html = tmp_path / "t.html"
+    assert render_trajectory(Trajectory(harness="claude-code", steps=(step,)), html) is True
+    return html.read_text()
+
+
+def test_render_trajectory_tool_kinds_are_harness_neutral(tmp_path: Path) -> None:
+    """A Claude ``Bash`` and a Codex ``command_execution`` both render as a command, not a dict."""
+    for name in ("Bash", "command_execution"):
+        body = _render_call_body(tmp_path, ToolCall(call_id="c", name=name, arguments={"command": "ls -la"}))
+        assert 'class="call call-command"' in body
+        assert '<pre class="sh"><code>ls -la</code></pre>' in body
+        assert '{"command"' not in body  # not a raw JSON dump
+
+
+def test_render_trajectory_edit_renders_as_diff(tmp_path: Path) -> None:
+    """A file edit renders as a red/green split diff, not its raw old_string/new_string args."""
+    call = ToolCall(
+        call_id="c",
+        name="Edit",
+        arguments={"file_path": "/w/f.py", "old_string": "x = 1", "new_string": "x = 2", "replace_all": False},
+    )
+    body = _render_call_body(tmp_path, call)
+    assert 'class="call call-edit"' in body
+    assert 'class="diff"' in body and "diff-del" in body and "diff-add" in body
+    assert "/w/f.py" in body
+    assert "old_string" not in body  # the raw argument is not dumped
+
+
+def test_render_trajectory_write_read_web(tmp_path: Path) -> None:
+    """Write shows its content as code, Read shows the path+range, WebFetch shows a link."""
+    write = _render_call_body(
+        tmp_path, ToolCall(call_id="c", name="Write", arguments={"file_path": "/w/a.txt", "content": "hello world"})
+    )
+    assert 'class="call call-write"' in write and "hello world" in write and '{"content"' not in write
+
+    read = _render_call_body(
+        tmp_path, ToolCall(call_id="c", name="Read", arguments={"file_path": "/w/a.txt", "offset": 30, "limit": 20})
+    )
+    assert 'class="call call-read"' in read and "/w/a.txt" in read and "lines 30–50" in read
+
+    web = _render_call_body(
+        tmp_path,
+        ToolCall(call_id="c", name="WebFetch", arguments={"url": "https://example.com/x", "prompt": "summarize"}),
+    )
+    assert 'class="call call-web_fetch"' in web and '<a href="https://example.com/x">' in web
+
+
+def test_render_trajectory_codex_file_change(tmp_path: Path) -> None:
+    """A Codex ``file_change`` (path + kind, no content) renders one readable line per file."""
+    call = ToolCall(
+        call_id="c",
+        name="file_change",
+        arguments={
+            "changes": [{"path": "/w/answer.md", "kind": "add"}, {"path": "/w/s.py", "kind": "update"}],
+            "status": "completed",
+        },
+    )
+    body = _render_call_body(tmp_path, call)
+    assert 'class="call call-file_change"' in body
+    assert "add: /w/answer.md" in body and "update: /w/s.py" in body
+    assert '{"changes"' not in body  # not a raw JSON dump
+
+
+def test_render_trajectory_generic_tool_is_kv_not_json(tmp_path: Path) -> None:
+    """An unmodelled tool renders its arguments as a definition list, not a JSON dump."""
+    body = _render_call_body(
+        tmp_path, ToolCall(call_id="c", name="Grep", arguments={"pattern": "def foo", "glob": "*.py"})
+    )
+    assert 'class="call call-generic"' in body
+    assert '<dl class="kv">' in body and "<dt>pattern</dt>" in body
+    assert "{\n" not in body  # not indented json.dumps output
 
 
 def test_render_agent_transcript_dispatches_on_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4745,6 +4961,18 @@ def test_is_perfect_only_for_a_full_pass() -> None:
     assert is_perfect(None) is False
 
 
+def test_completed_epochs_counts_versions_with_a_complete_valid_bench(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only versions whose valid bench is done count as finished epochs — the resume start point."""
+    import acumen.epoch as epoch
+
+    monkeypatch.setattr(epoch, "available_versions", lambda _root: ["v1", "v2", "v3"])
+    done = {"v1", "v2"}  # v3 exists but its valid bench is unfinished (the crashed epoch)
+    assert epoch.completed_epochs(Path("skills"), valid_complete=lambda v: v in done) == 2
+
+    monkeypatch.setattr(epoch, "available_versions", lambda _root: [])
+    assert epoch.completed_epochs(Path("skills"), valid_complete=lambda _v: True) == 0
+
+
 def test_build_training_rows_maps_arms_and_computes_means(tmp_path: Path, make_result) -> None:
     """Epoch N's train arm is v(N-1)/noskill; its valid arm is vN. Means are per-model and overall."""
     runs = tmp_path / "runs"
@@ -4779,6 +5007,27 @@ def test_build_training_rows_maps_arms_and_computes_means(tmp_path: Path, make_r
     assert v1.valid_cost == pytest.approx(0.10)
 
     assert best_version(rows) == "v1"
+
+
+def test_build_training_rows_skips_infrastructure_invalid_cells(tmp_path: Path, make_result) -> None:
+    """A broken epoch leaves valid=false cells on disk; the training curve skips them (so `fit`
+    can resume) rather than raising the way a final report does, and excludes them from the mean."""
+    runs = tmp_path / "runs"
+    cfg = parse_config({"repo": "https://example.com/pkg", "models": ["m1"]})
+    # v1 valid: one real pass plus one provider-exhausted cell from a crash (valid=false).
+    make_result(runs, RunKey(arm="skill_v1", split="valid", model="m1", task_id="t1", rep=1), success=True)
+    make_result(
+        runs,
+        RunKey(arm="skill_v1", split="valid", model="m1", task_id="t2", rep=1),
+        success=False,
+        reason="provider_exhausted",
+        valid=False,
+    )
+
+    rows = build_training_rows(runs, cfg)  # must not raise despite the invalid cell
+
+    v1 = next(r for r in rows if r.version == "v1")
+    assert v1.valid_success == 1.0  # only the measured cell counts; the invalid one is skipped, not a fail
 
 
 def test_write_training_csv_roundtrips_header_and_per_model_columns(tmp_path: Path, make_result) -> None:
