@@ -835,7 +835,9 @@ def _legend_arrow(*, width: float, height: float, **_unused: object) -> FancyArr
     )
 
 
-def tradeoff_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None) -> plt.Figure:
+def tradeoff_figure(
+    df: pd.DataFrame, *, colors: Mapping[str, str] | None = None, split: str = _REPORTED_SPLIT
+) -> plt.Figure:
     """Cost per run against success rate — where each skill version buys what, and at what price.
 
     The metrics grid reports every measure on its own axis, which answers "how much?" but never
@@ -888,10 +890,10 @@ def tradeoff_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None
     points = []
     for arm in arms:
         for model in [*models, _ALL_MODELS]:
-            cost, cost_err, present = _cell_value(df, arm, model, _REPORTED_SPLIT, "cost")
+            cost, cost_err, present = _cell_value(df, arm, model, split, "cost")
             if not present:
                 continue
-            rate, rate_err, _ = _cell_value(df, arm, model, _REPORTED_SPLIT, "rate")
+            rate, rate_err, _ = _cell_value(df, arm, model, split, "rate")
             points.append((arm, model, cost, cost_err, rate, rate_err))
 
     x_max = max((cost + err for _a, _m, cost, err, _r, _re in points), default=0.0) * 1.15 or 1.0
@@ -1231,13 +1233,15 @@ def _holm(pvalues: Sequence[float]) -> list[float]:
     return adjusted
 
 
-def _cluster_totals(df: pd.DataFrame, arms: Sequence[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Summed cost, successes and run counts per (task, arm) over the reported split.
+def _cluster_totals(
+    df: pd.DataFrame, arms: Sequence[str], *, split: str = _REPORTED_SPLIT
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Summed cost, successes and run counts per (task, arm) over one split.
 
     These are the sufficient statistics for the bootstrap: both metrics are ratios of sums, so a
     resample never has to touch an individual run again.
     """
-    reported = df[df["split"] == _REPORTED_SPLIT]
+    reported = df[df["split"] == split]
     clusters = sorted(reported[_CLUSTER_COLUMN].unique())
     shape = (len(clusters), len(arms))
     cost, successes, runs = np.zeros(shape), np.zeros(shape), np.zeros(shape)
@@ -1340,7 +1344,13 @@ class SkillTests:
         return self.n_clusters >= _MIN_CLUSTERS and not self.comparisons.empty
 
 
-def skill_tests(df: pd.DataFrame, *, resamples: int = _BOOTSTRAP_RESAMPLES, seed: int = _BOOTSTRAP_SEED) -> SkillTests:
+def skill_tests(
+    df: pd.DataFrame,
+    *,
+    split: str = _REPORTED_SPLIT,
+    resamples: int = _BOOTSTRAP_RESAMPLES,
+    seed: int = _BOOTSTRAP_SEED,
+) -> SkillTests:
     """Test which skill versions beat which, on cost and success rate jointly.
 
     Deliberately reports no single combined score. Folding rate and cost into one number picks an
@@ -1357,13 +1367,16 @@ def skill_tests(df: pd.DataFrame, *, resamples: int = _BOOTSTRAP_RESAMPLES, seed
     Parameters
     ----------
     df
-        Results from :func:`load_results`. Only the reported (valid) split is used.
+        Results from :func:`load_results`. Only the ``split`` below is used.
     resamples, seed
         Bootstrap size and its seed. The default seed is fixed so a rebuilt report reproduces
         its own p-values exactly.
+    split
+        Which split to test on. Defaults to the reported (valid) split; the held-out ``test``
+        section passes ``"test"``. Arms are drawn from the runs present in that split.
     """
-    arms = _arms_in_order(df)
-    cost, successes, runs = _cluster_totals(df, arms)
+    arms = _arms_in_order(df[df["split"] == split])
+    cost, successes, runs = _cluster_totals(df, arms, split=split)
     n_clusters = len(cost)
     baseline = arms[0] if arms else NOSKILL_ARM  # noskill sorts first when it is present
     empty = pd.DataFrame(columns=["challenger", "reference", "d_rate", "d_cost", "p", "p_adjusted"])
@@ -2272,6 +2285,26 @@ def render_report(
             f' src="{loaded_uri}"></figure>'
         )
     tests = skill_tests(df)
+    # The held-out test split is benched only at the end of a fit, on the best kept version and the
+    # baseline. It appears as its own section when those runs exist; otherwise it is omitted.
+    test_df = df[df["split"] == "test"]
+    if not test_df.empty and test_df["arm"].nunique() >= 2:
+        test_tradeoff_uri = figure_data_uri(tradeoff_figure(df, colors=colors, split="test"))
+        test_section = (
+            '<section id="test">\n<h2>Held-out test</h2>\n'
+            '<p class="task-desc">This is the truly held-out split. It is benched once at the very end'
+            " of a fit, on the best kept version and the baseline, and nothing in the loop ever sees it."
+            " Training learns from the train split and the best version is picked on valid, so the test"
+            " split is the first and only place the skill meets these tasks. Read it as the honest final"
+            " estimate of what the skill buys.</p>\n"
+            f'<figure><img alt="Cost per run against success rate on the held-out test split"'
+            f' src="{test_tradeoff_uri}"></figure>\n'
+            f"{_tests_table_html(skill_tests(df, split='test'))}\n</section>"
+        )
+        test_toc = '<li><a href="#test">Held-out test</a></li>\n'
+    else:
+        test_section = ""
+        test_toc = ""
     task_by_id = {t.id: t for t in tasks or []}
     skills_section, skills_toc = _skills_section_html(df, skills_root)
 
@@ -2297,6 +2330,7 @@ def render_report(
 <li><a href="#overview">Overview</a><ul>{training_toc}<li><a href="#tradeoff">Cost vs. success</a></li>
 <li><a href="#dominance">Is the difference real?</a></li>
 <li><a href="#loaded">Did it help when it actually loaded?</a></li></ul></li>
+{test_toc}
 <li><a href="#per-task">Per-task breakdown</a><ul>{"".join(toc_tasks)}</ul></li>
 {skills_toc}
 <li><a href="#runs">Runs</a></li>
@@ -2321,12 +2355,12 @@ def render_report(
 {toc}
 <main>
 <h1>acumen benchmark report</h1>
-<div class="meta">Generated {generated} &middot; {len(df)} runs &middot; valid split shown
+<div class="meta">Generated {generated} &middot; {len(df)} runs &middot; figures show the valid split
  &middot; arms: {html.escape(arms)} &middot; tasks: {html.escape(tasks)}</div>
 {notes}
 <section id="overview">
 <h2>Overview</h2>
-<p class="task-desc">Per-run means over test runs; error bars are standard errors.</p>
+<p class="task-desc">Per-run means over the valid split; error bars are standard errors.</p>
 <figure><img alt="Success rate, tokens, cost and time per skill" src="{overview_uri}"></figure>
 {training_block}
 <h3 id="tradeoff">Cost vs. success</h3>
@@ -2358,9 +2392,10 @@ def render_report(
  hollow ring means it never did. Each loaded run is compared with the baseline on the very same
  task and model, and those differences are averaged, so the number is a real effect and does not
  depend on which tasks happened to load. It is still measured only on the tasks that loaded, and
- it does not test whether a gain is more than noise. For that, look at the test above.</p>
+ it does not test whether a gain is more than noise. For that, look at the significance test above.</p>
 {loaded_body}
 </section>
+{test_section}
 <section id="per-task">
 <h2>Per-task breakdown</h2>
 {"".join(task_blocks)}

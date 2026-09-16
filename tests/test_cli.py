@@ -300,6 +300,7 @@ def test_cmd_fit_stops_when_validation_hits_100_percent(
 
     monkeypatch.setattr(cli, "_prepare_pass", lambda cfg, args: ({}, "session", None, None))
     monkeypatch.setattr(cli, "_run_one_epoch", fake_epoch)
+    monkeypatch.setattr(cli, "_run_test_phase", lambda *a, **k: None)
     monkeypatch.setattr(cli, "build_training_rows", lambda runs_root, cfg: [perfect_row("v1")])
     monkeypatch.setattr(cli, "write_training_csv", lambda rows, out: Path(out).write_text("version\n"))
 
@@ -373,6 +374,7 @@ def test_cmd_fit_resumes_from_completed_epochs_toward_a_global_target(
     monkeypatch.setattr(cli, "_prepare_pass", lambda cfg, args: ({}, "session", None, None))
     monkeypatch.setattr(cli, "completed_epochs", lambda skills_root, *, valid_complete: 2)
     monkeypatch.setattr(cli, "_run_one_epoch", fake_epoch)
+    monkeypatch.setattr(cli, "_run_test_phase", lambda *a, **k: None)
     monkeypatch.setattr(cli, "build_training_rows", lambda runs_root, cfg: all_rows)
     monkeypatch.setattr(cli, "write_training_csv", lambda rows, out: Path(out).write_text("version\n"))
 
@@ -441,6 +443,7 @@ def test_cmd_fit_does_not_resume_past_a_completed_perfect_epoch(
     monkeypatch.setattr(cli, "_prepare_pass", lambda cfg, args: ({}, "session", None, None))
     monkeypatch.setattr(cli, "completed_epochs", lambda skills_root, *, valid_complete: 3)
     monkeypatch.setattr(cli, "_run_one_epoch", fake_epoch)
+    monkeypatch.setattr(cli, "_run_test_phase", lambda *a, **k: None)
     monkeypatch.setattr(cli, "build_training_rows", lambda runs_root, cfg: perfect_prior)
     monkeypatch.setattr(cli, "write_training_csv", lambda rows, out: Path(out).write_text("version\n"))
 
@@ -1112,12 +1115,13 @@ def test_check_passes_when_every_answer_reproduces(
     _stub_target(project, monkeypatch)
     _write_reproducer(project, "train", "TRAIN_ANSWER")
     _write_reproducer(project, "valid", "TEST_ANSWER")
+    _write_reproducer(project, "test", "HELDOUT_ANSWER")
 
     assert main(check_args(project, "--no-review", "--jobs", "1")) == 0
 
     out = capsys.readouterr().out
     assert "imports as yaml" in out, "the probe reports the module it actually imported"
-    assert "reproduced 2/2 (100%)" in _squash(out)
+    assert "reproduced 3/3 (100%)" in _squash(out)
     assert "tasks fully reproduced 1/1 (100%)" in _squash(out)
     assert "every task's ground truth reproduced" in out
 
@@ -1135,8 +1139,8 @@ def test_check_exits_nonzero_and_names_what_is_wrong(
     assert "got SOMETHING_ELSE / want TRAIN_ANSWER" in captured.out
     assert "no reproducer at" in captured.out
     squashed = _squash(captured.out)
-    assert "reproduced 0/2 (0%)" in squashed
-    assert "wrong_answer 1" in squashed and "missing 1" in squashed
+    assert "reproduced 0/3 (0%)" in squashed
+    assert "wrong_answer 1" in squashed and "missing 2" in squashed
     assert "fix the reproducers and answers above" in captured.err
 
 
@@ -1192,6 +1196,7 @@ def test_check_warns_about_a_reproducer_no_task_claims(
     _stub_target(project, monkeypatch)
     _write_reproducer(project, "train", "TRAIN_ANSWER")
     _write_reproducer(project, "valid", "TEST_ANSWER")
+    _write_reproducer(project, "test", "HELDOUT_ANSWER")
     (project / "tasks" / "renamed_away-train.py").write_text("pass\n")
 
     assert main(check_args(project, "--no-review", "--jobs", "1")) == 0
@@ -1229,6 +1234,7 @@ def test_check_no_review_spawns_nothing_and_never_reaches_a_credential(
     _stub_target(project, monkeypatch)
     _write_reproducer(project, "train", "TRAIN_ANSWER")
     _write_reproducer(project, "valid", "TEST_ANSWER")
+    _write_reproducer(project, "test", "HELDOUT_ANSWER")
     monkeypatch.setattr("acumen.cli.check_agent_cli", _boom)
     monkeypatch.setattr("acumen.cli.review_tasks", _boom)
 
@@ -1251,6 +1257,7 @@ def test_check_flags_a_coherent_looking_task_whose_prompt_asks_for_something_els
     _stub_target(project, monkeypatch)
     _write_reproducer(project, "train", "TRAIN_ANSWER")
     _write_reproducer(project, "valid", "TEST_ANSWER")
+    _write_reproducer(project, "test", "HELDOUT_ANSWER")
     _stub_review(
         monkeypatch,
         {("example_task", "valid"): ("mismatch", "prompt says ascending; script and answer are descending")},
@@ -1260,8 +1267,8 @@ def test_check_flags_a_coherent_looking_task_whose_prompt_asks_for_something_els
 
     captured = capsys.readouterr()
     squashed = _squash(captured.out)
-    assert "reproduced 2/2 (100%)" in squashed, "the deterministic phase saw nothing wrong"
-    assert "reviewed 2/2 (100%)" in squashed
+    assert "reproduced 3/3 (100%)" in squashed, "the deterministic phase saw nothing wrong"
+    assert "reviewed 3/3 (100%)" in squashed
     assert "mismatch 1" in squashed
     # The reason and the fix are both shown, and briefly.
     assert "prompt says ascending; script and answer are descending" in captured.out
@@ -1277,6 +1284,7 @@ def test_check_reports_a_failed_review_as_an_incomplete_check(
     _stub_target(project, monkeypatch)
     _write_reproducer(project, "train", "TRAIN_ANSWER")
     _write_reproducer(project, "valid", "TEST_ANSWER")
+    _write_reproducer(project, "test", "HELDOUT_ANSWER")
     _stub_review(monkeypatch, {})
 
     async def die(**_kwargs):
@@ -1287,7 +1295,7 @@ def test_check_reports_a_failed_review_as_an_incomplete_check(
     assert main(check_args(project, "--jobs", "1")) == 2
 
     captured = capsys.readouterr()
-    assert "reproduced 2/2 (100%)" in _squash(captured.out), "the deterministic results survive"
+    assert "reproduced 3/3 (100%)" in _squash(captured.out), "the deterministic results survive"
     assert "did not write review.json" in captured.err
     assert "not a clean check" in captured.err
 

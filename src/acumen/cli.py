@@ -38,7 +38,7 @@ from acumen.epoch import EpochPlan, completed_epochs, resolve_epoch
 from acumen.grade import INVALID_REASONS
 from acumen.improve import ImproveError, improve_skill
 from acumen.logs import LiveLog
-from acumen.paths import SPLITS, Split, arm_name
+from acumen.paths import BENCH_SPLITS, SPLITS, Split, arm_name
 from acumen.pricefeed import (
     PRICE_SOURCES,
     PRICE_TIER,
@@ -512,7 +512,7 @@ def _resolve_arms(cfg: Config, tasks: Sequence[Task], args: argparse.Namespace) 
     arms = []
     for version in versions:
         skill = None if version is None else load_skill(args.skills, version, expect_name=cfg.skill_name)
-        planned = build_matrix(cfg, tasks, skill=version, splits=args.split or SPLITS, task_ids=args.task)
+        planned = build_matrix(cfg, tasks, skill=version, splits=args.split or BENCH_SPLITS, task_ids=args.task)
         todo = pending(planned, args.runs, resume=not args.no_resume)
         arms.append(_Arm(version=version, skill=skill, planned=planned, todo=todo))
     return arms
@@ -669,6 +669,48 @@ def _build_arms(
         todo = pending(planned, runs_root, resume=resume)
         arms.append(_Arm(version=version, skill=skill, planned=planned, todo=todo))
     return arms
+
+
+def _run_test_phase(
+    best: str,
+    *,
+    cfg: Config,
+    tasks: Sequence[Task],
+    runs_root: Path,
+    skills_root: Path,
+    target,
+    auth_modes: dict[AgentProvider, AuthMode],
+    prices: PriceTable,
+    mode: str,
+) -> None:
+    """Bench the held-out test split once, on the best kept version and the baseline.
+
+    Nothing in the fit loop ever benches ``test`` (epochs run only train and valid, and the wiki
+    and improver read train alone), so this final pass is the skill's first and only contact with
+    it. Runs resume via ``pending``, so re-running an already-tested fit does nothing.
+    """
+    specs: list[tuple[str | None, Sequence[Split]]] = [(best, ["test"]), (None, ["test"])]
+    arms = _build_arms(specs, cfg=cfg, tasks=tasks, runs_root=runs_root, skills_root=skills_root)
+    todo = sum(len(arm.todo) for arm in arms)
+    if not todo:
+        return
+    if mode == "verbose":
+        print(f"\nheld-out test: benching [{best}] and [{arm_name(None)}] on the test split ...", flush=True)
+        _print_plan(arms)
+    bar = None if mode == "verbose" else _PhaseBar("held-out test", todo, mode)
+    _execute_arms(
+        arms,
+        cfg=cfg,
+        target=target,
+        runs_root=runs_root,
+        auth_modes=auth_modes,
+        prices=prices,
+        keep_sandboxes=False,
+        progress=bar,
+        quiet=mode != "verbose",
+    )
+    if bar is not None:
+        bar.finish()
 
 
 def _invalid_bench_note() -> None:
@@ -1228,6 +1270,22 @@ def _cmd_fit(args: argparse.Namespace) -> int:
     rows = build_training_rows(args.runs, cfg)
     best = best_version(rows)
     if best is not None:
+        try:
+            _run_test_phase(
+                best,
+                cfg=cfg,
+                tasks=tasks,
+                runs_root=args.runs,
+                skills_root=args.skills,
+                target=target,
+                auth_modes=auth_modes,
+                prices=prices,
+                mode=mode,
+            )
+        except BenchmarkInvalidError as err:
+            print(f"\nerror: {err}", file=sys.stderr)
+            _invalid_bench_note()
+            return 2
         best_row = next(row for row in rows if row.version == best)
         print(f"\nfit complete: best version {best} (valid {_fmt_rate(best_row.valid_success)}).")
     else:

@@ -53,9 +53,10 @@ TASKS_TEMPLATE = """\
 # acumen tasks — what the agent is asked to do, and the answer it is graded against.
 #
 # Each task has a stable `id` (used in run paths — renaming it orphans old runs) and a
-# train/valid pair. The improver only ever sees train results; valid is the held-out measure
-# of whether a skill actually helps. Answers are compared by EXACT string match after
-# strip(), so keep them to a single unambiguous token.
+# train/valid/test triple. The improver only ever sees train results; valid is the held-out
+# measure used to pick the best version; test is the untouched final split, benched once at the
+# end of a fit on the best version and the baseline. Answers are compared by EXACT string match
+# after strip(), so keep them to a single unambiguous token.
 #
 # Do NOT name the target package in a prompt. The agent is already told, before every task,
 # that your package (from `config.yaml`) is installed and is the one to use — so "using
@@ -83,9 +84,14 @@ tasks:
       answer: REPLACE_ME_TRAIN
     valid:
       prompt: >-
-        The same kind of analysis on a different, held-out input. This split is what measures
-        whether the skill generalizes; the improver never sees its results.
+        The same kind of analysis on a different, held-out input. This split picks the best
+        version; the improver never sees its results.
       answer: REPLACE_ME_VALID
+    test:
+      prompt: >-
+        The same kind of analysis on a third, untouched input. This split is benched only once
+        at the end of a fit, as the final check that the skill generalizes.
+      answer: REPLACE_ME_TEST
 """
 
 

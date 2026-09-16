@@ -34,6 +34,9 @@ tasks:
     valid:
       prompt: Do the same analysis on the held-out input.
       answer: TEST_ANSWER
+    test:
+      prompt: Do the same analysis on the final held-out input.
+      answer: HELDOUT_ANSWER
 """
 
 SKILL_MD = """\

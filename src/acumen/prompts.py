@@ -378,11 +378,13 @@ Illustration (style only — invent tasks that fit the actual package):
 - GOOD (a lazy goal): "Using the pbmc3k data, find which transcription factor is most active in
   the monocytes. Give only the factor's symbol."
 
-# Train and valid variants
+# Train, valid and test variants
 
-Give each task a train and a valid variant of the SAME goal, differing only in the input or the
-target it asks about (a different cell type, group, condition, or dataset). Two instances of one
-analysis with two different correct answers — so a skill cannot pass by memorising one answer.
+Give each task a train, a valid and a test variant of the SAME goal, differing only in the input
+or the target it asks about (a different cell type, group, condition, or dataset). Three instances
+of one analysis with three different correct answers — so a skill cannot pass by memorising one.
+Train drives learning, valid picks the best version, and test is the untouched held-out check, so
+all three must be genuinely different instances.
 
 # Ground truth by execution
 
@@ -396,8 +398,9 @@ one answer stands — never by adding back instructions.
 
 The script you run to obtain an answer is NOT scratch. Save one per split to
 `{scripts_dir}/<id>-<split>.py`, using the SAME `id` you gave the task in `{out}` — so the task
-`bulk` needs `{scripts_dir}/bulk-train.py` and `{scripts_dir}/bulk-valid.py`. These are what
-`acumen check` reruns later to confirm the answer still holds, so each one must:
+`bulk` needs `{scripts_dir}/bulk-train.py`, `{scripts_dir}/bulk-valid.py` and
+`{scripts_dir}/bulk-test.py`. These are what `acumen check` reruns later to confirm the answer
+still holds, so each one must:
 
 - Be SELF-CONTAINED and runnable from ANY empty working directory: `<python> <script>` with no
   arguments, no setup, no input files. Do not read or write anything outside the working
@@ -430,8 +433,12 @@ tasks:
       prompt: |
         <one-paragraph goal for the valid variant>
       answer: "<the exact answer string the real valid run produced>"
+    test:
+      prompt: |
+        <one-paragraph goal for the test variant>
+      answer: "<the exact answer string the real test run produced>"
 
-`id` must be unique across all tasks. Both `train` and `valid` are required, each with a
+`id` must be unique across all tasks. All of `train`, `valid` and `test` are required, each with a
 non-empty `prompt` and a non-empty `answer`. Add `needs_script: false` at the task level (a
 sibling of `id`) only for a task that needs no code to answer; it defaults to true and is then
 omitted. Do not add other keys unless you deliberately want a per-task override (`max_turns`,
@@ -441,8 +448,9 @@ omitted. Do not add other keys unless you deliberately want a per-task override 
 
 - Every `answer` is the exact content of the `answer.md` written by the script you ran in the
   venv — not a guess, not lifted from docs.
-- Every task with `needs_script` unset has BOTH `{scripts_dir}/<id>-train.py` and
-  `{scripts_dir}/<id>-valid.py`, each verified by running it in an empty directory.
+- Every task with `needs_script` unset has ALL of `{scripts_dir}/<id>-train.py`,
+  `{scripts_dir}/<id>-valid.py` and `{scripts_dir}/<id>-test.py`, each verified by running it in an
+  empty directory.
 - Every prompt is ONE paragraph: a goal in plain English, with no steps, no code, no package
   name, no version, no data description — only the goal and a precise statement of the output.
 - You wrote at least one task per tutorial, and covered all of them.
@@ -490,9 +498,9 @@ returns or which sign convention it uses. That is the limit.
 
 # What is NOT a mismatch
 
-- **Train and valid differ on purpose.** They are two instances of one analysis with two different
-  answers, deliberately asking about different groups, conditions, datasets, or directions. A
-  difference between the two splits is the design, not a defect.
+- **Train, valid and test differ on purpose.** They are three instances of one analysis with three
+  different answers, deliberately asking about different groups, conditions, datasets, or
+  directions. A difference between the splits is the design, not a defect.
 - **A terse prompt naming no function, parameter, or output field.** Working out HOW is exactly
   what the benchmark tests; a prompt that only states the goal is correct by design.
 - **A script that is longer, slower, or less elegant than it needs to be.** You are not reviewing
@@ -515,6 +523,7 @@ Write `{out}` as JSON with exactly this shape, with ONE entry for every task spl
 
 {{"reviews": [
   {{"task": "<task id>", "split": "train", "verdict": "ok"}},
+  {{"task": "<task id>", "split": "test", "verdict": "ok"}},
   {{"task": "<task id>", "split": "valid", "verdict": "mismatch",
    "issue": "prompt says ascending; script and answer are descending",
    "fix": "say descending in the prompt, or reverse the answer"}}

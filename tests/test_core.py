@@ -201,6 +201,15 @@ def test_run_dir_round_trips(tmp_path: Path) -> None:
     assert key.skill == "v2"
 
 
+def test_run_dir_accepts_the_test_split(tmp_path: Path) -> None:
+    """The held-out test split is a first-class path component, round-tripping like the others."""
+    key = RunKey(arm="skill_v1", split="test", model="claude-opus-5", task_id="tf_activity", rep=1)
+    directory = run_dir(tmp_path, key)
+
+    assert directory == tmp_path / "skill_v1/test/claude-opus-5/tf_activity/rep_1"
+    assert parse_run_dir(tmp_path, directory) == key
+
+
 def test_arm_name() -> None:
     assert arm_name(None) == "noskill"
     assert arm_name("v1") == "skill_v1"
@@ -333,9 +342,25 @@ def test_load_tasks(project: Path) -> None:
 
 
 def test_tasks_reject_duplicate_ids() -> None:
-    entry = {"id": "dup", "train": {"prompt": "p", "answer": "a"}, "valid": {"prompt": "p", "answer": "a"}}
+    entry = {
+        "id": "dup",
+        "train": {"prompt": "p", "answer": "a"},
+        "valid": {"prompt": "p", "answer": "a"},
+        "test": {"prompt": "p", "answer": "a"},
+    }
     with pytest.raises(TaskError, match="duplicate task id"):
         parse_tasks({"tasks": [entry, dict(entry)]})
+
+
+def test_tasks_require_the_test_split() -> None:
+    """test is a required split now; a task without it is rejected, like a missing train/valid."""
+    entry = {"id": "t", "train": {"prompt": "p", "answer": "a"}, "valid": {"prompt": "p", "answer": "b"}}
+    with pytest.raises(TaskError, match="missing the 'test' split"):
+        parse_tasks({"tasks": [entry]})
+
+    (task,) = parse_tasks({"tasks": [{**entry, "test": {"prompt": "p", "answer": "c"}}]})
+    assert task.split("test").answer == "c"
+    assert task.split("train").answer == "a"
 
 
 # --- matrix ----------------------------------------------------------------------------
@@ -354,6 +379,17 @@ def test_build_matrix_and_resume(project: Path, model: str, make_result) -> None
     make_result(runs, RunKey(arm="skill_v1", split="train", model=model, task_id="example_task", rep=1))
     assert [p.key.split for p in pending(planned, runs)] == ["valid"]
     assert len(pending(planned, runs, resume=False)) == 2
+
+
+def test_build_matrix_excludes_test_by_default_and_runs_it_when_asked(project: Path) -> None:
+    """The held-out test split is never benched by default; it runs only when named explicitly."""
+    cfg = load_config(project / "config.yaml")
+    tasks = load_tasks(project / "tasks.yaml")
+
+    assert "test" not in {p.key.split for p in build_matrix(cfg, tasks, skill="v1")}
+    on_test = build_matrix(cfg, tasks, skill="v1", splits=["test"])
+    assert {p.key.split for p in on_test} == {"test"}
+    assert all(p.key.arm == "skill_v1" for p in on_test)
 
 
 def test_skill_fired_matches_the_skill_under_test_only(tmp_path: Path) -> None:
@@ -1477,7 +1513,12 @@ def test_provider_exhaustion_result_is_diagnostic_not_complete(tmp_path: Path, m
     outcome = asyncio.run(
         run_once(
             key=RunKey(arm="noskill", split="valid", model="gpt-5.6-sol", task_id="task", rep=1),
-            task=Task(id="task", train=TaskSplit("prompt", "OK"), valid=TaskSplit("prompt", "OK")),
+            task=Task(
+                id="task",
+                train=TaskSplit("prompt", "OK"),
+                valid=TaskSplit("prompt", "OK"),
+                test=TaskSplit("prompt", "OK"),
+            ),
             target=Target(
                 source="target",
                 ref="main",
@@ -1528,7 +1569,12 @@ def test_connection_error_result_is_diagnostic_not_complete(tmp_path: Path, monk
     outcome = asyncio.run(
         run_once(
             key=RunKey(arm="noskill", split="valid", model="gpt-5.6-sol", task_id="task", rep=1),
-            task=Task(id="task", train=TaskSplit("prompt", "OK"), valid=TaskSplit("prompt", "OK")),
+            task=Task(
+                id="task",
+                train=TaskSplit("prompt", "OK"),
+                valid=TaskSplit("prompt", "OK"),
+                test=TaskSplit("prompt", "OK"),
+            ),
             target=Target(
                 source="target",
                 ref="main",
@@ -1593,7 +1639,12 @@ def _run_once_with(
     asyncio.run(
         run_once(
             key=RunKey(arm="noskill", split="valid", model=model, task_id="task", rep=1),
-            task=Task(id="task", train=TaskSplit("prompt", "SPI1"), valid=TaskSplit("prompt", "SPI1")),
+            task=Task(
+                id="task",
+                train=TaskSplit("prompt", "SPI1"),
+                valid=TaskSplit("prompt", "SPI1"),
+                test=TaskSplit("prompt", "SPI1"),
+            ),
             target=Target(
                 source="target",
                 ref="main",
@@ -1695,7 +1746,9 @@ async def _no_preflight(*_args: object, **_kwargs: object) -> dict[str, str]:
 def test_run_matrix_cancels_remaining_cells_when_provider_is_exhausted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    task = Task(id="quota", train=TaskSplit("prompt", "OK"), valid=TaskSplit("prompt", "OK"))
+    task = Task(
+        id="quota", train=TaskSplit("prompt", "OK"), valid=TaskSplit("prompt", "OK"), test=TaskSplit("prompt", "OK")
+    )
     planned = [
         PlannedRun(
             key=RunKey(arm="noskill", split="valid", model="gpt-5.6-sol", task_id=f"task_{index}", rep=1),
@@ -1744,7 +1797,9 @@ def test_run_matrix_cancels_remaining_cells_on_connection_error(
 ) -> None:
     """A network drop stops the provider's remaining cells and raises invalid, like exhaustion —
     so the cells stay pending and the next run resumes them."""
-    task = Task(id="net", train=TaskSplit("prompt", "OK"), valid=TaskSplit("prompt", "OK"))
+    task = Task(
+        id="net", train=TaskSplit("prompt", "OK"), valid=TaskSplit("prompt", "OK"), test=TaskSplit("prompt", "OK")
+    )
     planned = [
         PlannedRun(
             key=RunKey(arm="noskill", split="valid", model="gpt-5.6-sol", task_id=f"task_{index}", rep=1),
@@ -1791,7 +1846,9 @@ def test_run_matrix_cancels_remaining_cells_on_connection_error(
 def test_run_matrix_continues_other_provider_after_one_is_exhausted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    task = Task(id="mixed", train=TaskSplit("prompt", "OK"), valid=TaskSplit("prompt", "OK"))
+    task = Task(
+        id="mixed", train=TaskSplit("prompt", "OK"), valid=TaskSplit("prompt", "OK"), test=TaskSplit("prompt", "OK")
+    )
 
     def planned(model: str, task_id: str) -> PlannedRun:
         return PlannedRun(
@@ -2478,7 +2535,12 @@ def test_benchmark_persists_unavailable_cost_as_null(tmp_path: Path, monkeypatch
     outcome = asyncio.run(
         run_once(
             key=RunKey(arm="noskill", split="valid", model="gpt-unpriced", task_id="task", rep=1),
-            task=Task(id="task", train=TaskSplit("prompt", "OK"), valid=TaskSplit("prompt", "OK")),
+            task=Task(
+                id="task",
+                train=TaskSplit("prompt", "OK"),
+                valid=TaskSplit("prompt", "OK"),
+                test=TaskSplit("prompt", "OK"),
+            ),
             target=Target(
                 source="target",
                 ref="main",
@@ -2552,7 +2614,12 @@ def test_benchmark_persists_inferred_cost_and_records_the_claude_sdk_figure(
     asyncio.run(
         run_once(
             key=RunKey(arm="noskill", split="valid", model="claude-opus-5", task_id="task", rep=1),
-            task=Task(id="task", train=TaskSplit("prompt", "OK"), valid=TaskSplit("prompt", "OK")),
+            task=Task(
+                id="task",
+                train=TaskSplit("prompt", "OK"),
+                valid=TaskSplit("prompt", "OK"),
+                test=TaskSplit("prompt", "OK"),
+            ),
             target=Target(
                 source="target",
                 ref="main",
@@ -4500,6 +4567,39 @@ def test_render_report_includes_the_training_curve_only_with_versions(
     assert 'id="training"' not in render_report(baseline_only, tmp_path)
 
 
+def test_skill_tests_can_run_on_the_test_split() -> None:
+    """The significance machinery compares on whichever split it is given, and draws its arms from
+    that split alone — a version benched only on valid never enters the test comparison."""
+    rows = [
+        {"arm": arm, "split": "test", "model": "m", "task_id": task, "rep": 1, "success": ok, "cost_usd": 0.1}
+        for arm, ok in (("noskill", False), ("skill_v1", True))
+        for task in ("t1", "t2", "t3")
+    ]
+    # A later version that only ran on valid must not appear in the test comparison.
+    rows.append(
+        {"arm": "skill_v2", "split": "valid", "model": "m", "task_id": "t1", "rep": 1, "success": True, "cost_usd": 0.1}
+    )
+
+    tests = skill_tests(pd.DataFrame(rows), split="test")
+
+    assert tests.baseline == "noskill"
+    assert set(tests.comparisons["challenger"]) == {"skill_v1"}
+
+
+def test_render_report_shows_the_test_section_only_with_test_runs(
+    runs_root: Path, model: str, make_result, tmp_path: Path
+) -> None:
+    """The held-out test section appears once test runs exist for two arms, and not before."""
+    make_result(runs_root, RunKey(arm="skill_v1", split="valid", model=model, task_id="example_task", rep=1))
+    assert 'id="test"' not in render_report(load_results(runs_root), tmp_path)
+
+    for arm in ("noskill", "skill_v1"):
+        make_result(runs_root, RunKey(arm=arm, split="test", model=model, task_id="example_task", rep=1))
+    rendered = render_report(load_results(runs_root), tmp_path)
+    assert 'id="test"' in rendered
+    assert 'href="#test"' in rendered  # the TOC entry
+
+
 # --- split diff ------------------------------------------------------------------------
 
 
@@ -4617,11 +4717,12 @@ def _fake_venv(tmp_path: Path) -> Path:
     return venv
 
 
-def _task(task_id: str, train: str = "TRAIN", valid: str = "VALID", **kwargs) -> Task:
+def _task(task_id: str, train: str = "TRAIN", valid: str = "VALID", test: str = "TEST", **kwargs) -> Task:
     return Task(
         id=task_id,
         train=TaskSplit(prompt="do the thing", answer=train),
         valid=TaskSplit(prompt="do the other thing", answer=valid),
+        test=TaskSplit(prompt="do the final thing", answer=test),
         **kwargs,
     )
 
@@ -4639,7 +4740,12 @@ _REPRODUCERS = {
 
 
 def test_needs_script_defaults_to_true_and_must_be_a_bool() -> None:
-    entry = {"id": "t", "train": {"prompt": "p", "answer": "a"}, "valid": {"prompt": "p", "answer": "b"}}
+    entry = {
+        "id": "t",
+        "train": {"prompt": "p", "answer": "a"},
+        "valid": {"prompt": "p", "answer": "b"},
+        "test": {"prompt": "p", "answer": "c"},
+    }
 
     (task,) = parse_tasks({"tasks": [entry]})
     assert task.needs_script is True
@@ -4659,6 +4765,15 @@ def test_dump_tasks_writes_needs_script_only_when_it_is_off() -> None:
     assert "needs_script: false" in text
     # Round-tripping is what the generator's output is validated by, so it must survive.
     assert [t.needs_script for t in parse_tasks(yaml.safe_load(text))] == [True, False]
+
+
+def test_dump_tasks_round_trips_the_test_split() -> None:
+    """The generator must serialise the test split, or its own output fails to re-parse."""
+    text = dump_tasks([_task("code", test="TEST_ANS")])
+
+    assert "test:" in text
+    (task,) = parse_tasks(yaml.safe_load(text))
+    assert task.test.answer == "TEST_ANS"
 
 
 def test_check_tells_every_failure_mode_apart(tmp_path: Path) -> None:
@@ -4683,6 +4798,7 @@ def test_check_tells_every_failure_mode_apart(tmp_path: Path) -> None:
         tasks,
         scripts_root=scripts,
         python=_fake_venv(tmp_path).joinpath("bin", "python"),
+        splits=["train", "valid"],
         timeout=1,
         jobs=4,
     )
@@ -4747,6 +4863,7 @@ def test_check_runs_each_reproducer_in_its_own_empty_directory(tmp_path: Path) -
         [_task("solo")],
         scripts_root=scripts,
         python=_fake_venv(tmp_path).joinpath("bin", "python"),
+        splits=["train", "valid"],
         jobs=2,
     )
 
@@ -4763,7 +4880,13 @@ def test_summarize_checks_scores_only_the_tasks_that_need_a_script(tmp_path: Pat
     (scripts / "shaky-train.py").write_text(_REPRODUCERS["shaky-train.py"])
     tasks = [_task("good"), _task("shaky"), _task("prose", needs_script=False)]
 
-    results = check_tasks(tasks, scripts_root=scripts, python=_fake_venv(tmp_path).joinpath("bin", "python"), jobs=1)
+    results = check_tasks(
+        tasks,
+        scripts_root=scripts,
+        python=_fake_venv(tmp_path).joinpath("bin", "python"),
+        splits=["train", "valid"],
+        jobs=1,
+    )
     summary = summarize_checks(results, tasks)
 
     assert (summary.n_splits, summary.n_code_splits, summary.n_non_code_splits) == (6, 4, 2)
@@ -4831,17 +4954,17 @@ def test_harvest_keeps_only_the_reproducers_the_tasks_declare(tmp_path: Path) ->
     """What the generator leaves behind is not automatically ground truth worth keeping."""
     staged = tmp_path / "staged"
     staged.mkdir()
-    for name in ("code-train.py", "code-valid.py", "prose-train.py", "leftover.py"):
+    for name in ("code-train.py", "code-valid.py", "code-test.py", "prose-train.py", "leftover.py"):
         (staged / name).write_text("pass\n")
     scripts_root = tmp_path / "project" / "tasks"
     tasks = [_task("code"), _task("prose", needs_script=False), _task("nocode")]
 
     harvest = harvest_scripts(tasks, staged, scripts_root)
 
-    assert sorted(p.name for p in harvest.scripts) == ["code-train.py", "code-valid.py"]
-    assert sorted(p.name for p in scripts_root.iterdir()) == ["code-train.py", "code-valid.py"]
+    assert sorted(p.name for p in harvest.scripts) == ["code-test.py", "code-train.py", "code-valid.py"]
+    assert sorted(p.name for p in scripts_root.iterdir()) == ["code-test.py", "code-train.py", "code-valid.py"]
     # A split that expected a script and got none is a reported gap, not a silent pass.
-    assert harvest.missing == (("nocode", "train"), ("nocode", "valid"))
+    assert harvest.missing == (("nocode", "train"), ("nocode", "valid"), ("nocode", "test"))
     # Neither a script for a prose task nor a file matching no task is kept.
     assert harvest.unexpected == ("leftover.py", "prose-train.py")
 
@@ -4857,7 +4980,7 @@ def test_harvest_leaves_no_directory_behind_when_there_is_nothing_to_keep(tmp_pa
     harvest = harvest_scripts([_task("code")], tmp_path / "staged-that-never-existed", scripts_root)
 
     assert harvest.scripts == ()
-    assert harvest.missing == (("code", "train"), ("code", "valid"))
+    assert harvest.missing == (("code", "train"), ("code", "valid"), ("code", "test"))
     assert not scripts_root.exists()
 
 

@@ -10,7 +10,7 @@ from pathlib import Path
 from acumen.agents import AgentProvider, provider_for_model
 from acumen.config import Config
 from acumen.env import AuthMode, Target
-from acumen.paths import SPLITS, RunKey, Split, arm_name, is_complete, run_dir
+from acumen.paths import BENCH_SPLITS, SPLITS, RunKey, Split, arm_name, is_complete, run_dir
 from acumen.prices import PriceTable
 from acumen.runner import RunOutcome, run_once
 from acumen.skills import Skill
@@ -83,13 +83,14 @@ def build_matrix(
     tasks: Sequence[Task],
     *,
     skill: str | None = None,
-    splits: Iterable[Split] = SPLITS,
+    splits: Iterable[Split] = BENCH_SPLITS,
     task_ids: Sequence[str] | None = None,
 ) -> list[PlannedRun]:
     """Expand config and tasks into the full list of runs for one arm.
 
-    A pass is models x tasks x replicates x splits. Both splits always run; only
-    train results are ever shown to the improver, and that is enforced downstream.
+    A pass is models x tasks x replicates x splits. The default benches train and valid; the
+    held-out ``test`` split is only ever run when asked for explicitly. Only train results are
+    ever shown to the improver, and that is enforced downstream.
 
     Parameters
     ----------
