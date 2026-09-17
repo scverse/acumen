@@ -473,6 +473,68 @@ def test_cmd_fit_does_not_resume_past_a_completed_perfect_epoch(
     assert "validation success already reached 100%" in out
 
 
+def test_cmd_fit_builds_the_report_at_the_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], model: str, make_result
+) -> None:
+    """A finished fit writes report.html without being asked, so the comparison is one command."""
+    import acumen.cli as cli
+    from acumen.training import EpochRow
+
+    assert main(["init", "--dir", str(tmp_path)]) == 0
+    make_result(tmp_path / "runs", RunKey(arm="noskill", split="valid", model=model, task_id="example_task", rep=1))
+
+    rows = [
+        EpochRow(
+            epoch=1,
+            version="v1",
+            parent="noskill",
+            n_train=1,
+            n_valid=1,
+            train_success=0.0,
+            valid_success=1.0,
+            train_cost=0.1,
+            valid_cost=0.1,
+            train_success_by_model={},
+            valid_success_by_model={},
+            train_cost_by_model={},
+            valid_cost_by_model={},
+        )
+    ]
+    monkeypatch.setattr(cli, "_prepare_pass", lambda cfg, args: ({}, "session", None, None))
+    monkeypatch.setattr(cli, "completed_epochs", lambda skills_root, *, valid_complete: 3)
+    monkeypatch.setattr(cli, "_run_one_epoch", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_run_test_phase", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "build_training_rows", lambda runs_root, cfg: rows)
+    monkeypatch.setattr(cli, "write_training_csv", lambda rows, out: Path(out).write_text("version\n"))
+    monkeypatch.chdir(tmp_path)  # the report lands in the working directory
+
+    rc = main(
+        [
+            "fit",
+            "--max-epochs",
+            "10",
+            "--config",
+            str(tmp_path / "config.yaml"),
+            "--tasks",
+            str(tmp_path / "tasks.yaml"),
+            "--runs",
+            str(tmp_path / "runs"),
+            "--skills",
+            str(tmp_path / "skills"),
+            "--wiki",
+            str(tmp_path / "wiki"),
+            "--out",
+            str(tmp_path / "training.csv"),
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert (tmp_path / "report.html").is_file()
+    assert "report →" in out
+    assert "full breakdown" not in out  # the old "run acumen report yourself" nudge is gone
+
+
 def test_codex_trace_regex_matches_tracing_but_not_sandbox_errors() -> None:
     from acumen.agents import _CODEX_TRACE_RE
 

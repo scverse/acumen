@@ -1291,7 +1291,16 @@ def _cmd_fit(args: argparse.Namespace) -> int:
     else:
         print("\nfit complete.")
     print(f"training curve → {args.out.resolve()}")
-    print("next: `acumen report` for the full breakdown")
+
+    # A fit's whole point is the comparison, so build the report without being asked. It is a
+    # summary of what already ran, so a failure here must not fail the fit itself.
+    report_out = Path("report.html")
+    skills_root = args.skills if args.skills.is_dir() else None
+    try:
+        build_report(args.runs, report_out, tasks, skills_root=skills_root)
+        print(f"report → {report_out.resolve()}")
+    except ReportError as err:
+        print(f"note: report skipped — {err}", file=sys.stderr)
     return 0
 
 
@@ -1367,7 +1376,7 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
             "and split, so it was not kept",
             file=sys.stderr,
         )
-    print("\nnext: review the tasks, then `acumen check`, then `acumen epoch`")
+    print("\nnext: review the tasks, then `acumen check`, then `acumen fit`")
     return 0
 
 
