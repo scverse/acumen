@@ -43,6 +43,9 @@ max_usd: 3.0                          # budget cap (USD) for benchmark agents; d
 
 meta_model: claude-opus-5             # model for the meta-agent commands (draft, improve, tasks, ship, check)
 
+# bench_auth: auto                    # credential for benchmark agents: auto|session|api (CLI --auth/--bench-auth override)
+# meta_auth: auto                     # credential for the meta-agent: auto|session|api (CLI --auth/--meta-auth override)
+
 # skill_name: your_skill              # name for the built skill; defaults to the repo's name
 """
 

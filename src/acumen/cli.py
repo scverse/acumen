@@ -32,7 +32,7 @@ from acumen.check import (
     select_tasks,
     summarize_checks,
 )
-from acumen.config import Config, ConfigError, load_config
+from acumen.config import AUTH_CHOICES, Config, ConfigError, load_config
 from acumen.env import DEFAULT_CACHE_ROOT, AuthMode, EnvError, prepare_target, resolve_auth_mode
 from acumen.epoch import EpochPlan, completed_epochs, resolve_epoch
 from acumen.grade import INVALID_REASONS
@@ -91,7 +91,7 @@ def _add_bench_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="print the matrix and exit without running agents, over the same arms the real pass would cover",
     )
-    _add_auth_arg(parser)
+    _add_auth_arg(parser, default=None)
 
 
 def _add_log_args(parser: argparse.ArgumentParser) -> None:
@@ -113,27 +113,64 @@ def _add_feedback_arg(parser: argparse.ArgumentParser, *, extra: str = "") -> No
     parser.add_argument("--feedback", help=(help_text + extra) or None)
 
 
-def _add_auth_arg(parser: argparse.ArgumentParser) -> None:
+def _add_auth_arg(parser: argparse.ArgumentParser, *, default: str | None = "auto") -> None:
     """Add the ``--auth`` flag to a command that spawns agents.
 
     Every agentic command defaults to the provider subscription ("session") when a login is
     present and falls back to the API key otherwise — ``bench`` included, since it prices runs
     from their token counts rather than from a billed figure only the API reports.
+
+    ``default=None`` marks the flag *unset* so the command can fall back to the matching
+    ``config.yaml`` auth field (``bench_auth``/``meta_auth``) before landing on ``"auto"``; see
+    :func:`_effective_auth`. Commands with no config fallback keep the literal ``"auto"`` default.
     """
     parser.add_argument(
         "--auth",
-        choices=("auto", "session", "api"),
-        default="auto",
+        choices=AUTH_CHOICES,
+        default=default,
         help="which credential to bill: 'session' (Claude/Codex subscription), 'api' (provider API), "
         "or 'auto' (default: session if you're logged in, else the API)",
     )
 
 
-def _print_auth(mode: AuthMode, provider: AgentProvider = "claude") -> None:
-    """Report which credential the run will bill, so the choice is never silent."""
+def _add_role_auth_args(parser: argparse.ArgumentParser) -> None:
+    """Add ``--auth`` plus the per-role ``--bench-auth``/``--meta-auth`` overrides.
+
+    For ``fit``/``epoch``, which run both benchmark agents and the meta-agent. ``--auth`` is the
+    shared default for both roles; a role flag overrides it for that role only. All three default
+    to ``None`` (unset) so :func:`_resolve_pass_auth` can apply the precedence chain
+    (role flag → ``--auth`` → config → ``"auto"``).
+    """
+    _add_auth_arg(parser, default=None)
+    parser.add_argument(
+        "--bench-auth",
+        choices=AUTH_CHOICES,
+        default=None,
+        help="credential for the benchmark agents, overriding --auth (default: --auth, else config bench_auth)",
+    )
+    parser.add_argument(
+        "--meta-auth",
+        choices=AUTH_CHOICES,
+        default=None,
+        help="credential for the meta-agent (improve + wiki), overriding --auth "
+        "(default: --auth, else config meta_auth)",
+    )
+
+
+def _effective_auth(cli_value: str | None, cfg_value: str | None) -> str:
+    """Resolve an auth *request* string: the CLI flag wins, then config, then ``"auto"``."""
+    return cli_value or cfg_value or "auto"
+
+
+def _print_auth(mode: AuthMode, provider: AgentProvider = "claude", role: str | None = None) -> None:
+    """Report which credential the run will bill, so the choice is never silent.
+
+    ``role`` (``"bench"``/``"meta"``) tags the line when a single pass bills two roles differently.
+    """
     product = "Claude" if provider == "claude" else "Codex"
     label = f"{product} subscription (session)" if mode == "session" else f"{product} API key"
-    print(f"auth: {label}", flush=True)
+    tag = f"{role} · " if role is not None else ""
+    print(f"auth: {tag}{label}", flush=True)
 
 
 def _warn_codex_accounting(provider: AgentProvider) -> None:
@@ -580,21 +617,56 @@ def _print_skill_loading(outcomes: Sequence[RunOutcome], arm: _Arm, skill_name: 
         print(f"warning: {skill_name} loaded in {loaded} baseline runs", file=sys.stderr)
 
 
-def _resolve_bench_auth(models: set[str], auth: str) -> dict[AgentProvider, AuthMode]:
-    """Resolve one auth mode per provider present, checking each CLI and printing the choice."""
+def _session_billing_note() -> None:
+    """Explain that a session-billed cost is a notional API-rate figure, not metered spend."""
+    print(
+        "note: cost_usd for session-billed runs is what they would have cost at API "
+        "rates, not metered spend; each run records its auth_mode",
+        file=sys.stderr,
+    )
+
+
+def _resolve_bench_auth(
+    models: set[str], auth: str, *, role: str | None = None, note: bool = True
+) -> dict[AgentProvider, AuthMode]:
+    """Resolve one auth mode per provider present, checking each CLI and printing the choice.
+
+    ``role`` tags the printed lines; ``note=False`` defers the session-billing note to the caller
+    (so a two-role pass prints it once across both roles).
+    """
     providers = {provider_for_model(model) for model in models}
     auth_modes = {provider: resolve_auth_mode(auth, provider=provider) for provider in providers}
     for provider in sorted(providers):
         check_agent_cli(provider)
-        _print_auth(auth_modes[provider], provider)
+        _print_auth(auth_modes[provider], provider, role)
         _warn_codex_accounting(provider)
-    if "session" in auth_modes.values():
-        print(
-            "note: cost_usd for session-billed runs is what they would have cost at API "
-            "rates, not metered spend; each run records its auth_mode",
-            file=sys.stderr,
-        )
+    if note and "session" in auth_modes.values():
+        _session_billing_note()
     return auth_modes
+
+
+def _resolve_pass_auth(cfg: Config, args: argparse.Namespace) -> tuple[dict[AgentProvider, AuthMode], AuthMode]:
+    """Resolve the benchmark (per-provider) and meta-agent auth for a ``fit``/``epoch`` pass.
+
+    The two roles resolve independently so they can bill different credentials even on the same
+    provider. Per role the request is: the role flag (``--bench-auth``/``--meta-auth``), else the
+    shared ``--auth``, else the config default (``bench_auth``/``meta_auth``), else ``"auto"``.
+    """
+    bench_request = _effective_auth(args.bench_auth or args.auth, cfg.bench_auth)
+    meta_request = _effective_auth(args.meta_auth or args.auth, cfg.meta_auth)
+
+    auth_modes = _resolve_bench_auth(set(cfg.models), bench_request, role="bench", note=False)
+    meta_provider = provider_for_model(cfg.meta_model)
+    fresh_provider = meta_provider not in auth_modes
+    if fresh_provider:
+        check_agent_cli(meta_provider)
+    meta_auth = resolve_auth_mode(meta_request, provider=meta_provider)
+    _print_auth(meta_auth, meta_provider, "meta")
+    if fresh_provider:
+        _warn_codex_accounting(meta_provider)
+    if "session" in (*auth_modes.values(), meta_auth):
+        _session_billing_note()
+    return auth_modes, meta_auth
 
 
 def _execute_arms(
@@ -740,7 +812,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
         return 0
 
     # One resolved mode per provider in the matrix, so a mixed pass bills each side correctly.
-    auth_modes = _resolve_bench_auth({item.model for item in todo}, args.auth)
+    auth_modes = _resolve_bench_auth({item.model for item in todo}, _effective_auth(args.auth, cfg.bench_auth))
     # Before the target is built and before any agent runs: an unreachable pricing page
     # must cost nothing, and a pass must never be priced by a table it cannot date.
     try:
@@ -818,7 +890,7 @@ def _cmd_improve(args: argparse.Namespace) -> int:
 
     provider = provider_for_model(cfg.meta_model)
     check_agent_cli(provider)
-    auth_mode = resolve_auth_mode(args.auth, provider=provider)
+    auth_mode = resolve_auth_mode(_effective_auth(args.auth, cfg.meta_auth), provider=provider)
     _print_auth(auth_mode, provider)
     _warn_codex_accounting(provider)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
@@ -948,7 +1020,7 @@ def _cmd_wiki(args: argparse.Namespace) -> int:
 
     provider = provider_for_model(cfg.meta_model)
     check_agent_cli(provider)
-    auth_mode = resolve_auth_mode(args.auth, provider=provider)
+    auth_mode = resolve_auth_mode(_effective_auth(args.auth, cfg.meta_auth), provider=provider)
     _print_auth(auth_mode, provider)
     _warn_codex_accounting(provider)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
@@ -979,8 +1051,7 @@ def _prepare_pass(cfg: Config, args: argparse.Namespace):
     than per epoch. Raises :class:`PriceFeedError` if rates cannot be established (benchmark cost is
     frozen into every result, so a pass must not run without them).
     """
-    auth_modes = _resolve_bench_auth(set(cfg.models) | {cfg.meta_model}, args.auth)
-    meta_auth = auth_modes[provider_for_model(cfg.meta_model)]
+    auth_modes, meta_auth = _resolve_pass_auth(cfg, args)
     prices = _bench_prices(cfg)
     _warn_unpriced(set(cfg.models) | {cfg.meta_model}, prices)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
@@ -1325,7 +1396,7 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
 
     provider = provider_for_model(cfg.meta_model)
     check_agent_cli(provider)
-    auth_mode = resolve_auth_mode(args.auth, provider=provider)
+    auth_mode = resolve_auth_mode(_effective_auth(args.auth, cfg.meta_auth), provider=provider)
     _print_auth(auth_mode, provider)
     _warn_codex_accounting(provider)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
@@ -1893,7 +1964,7 @@ def build_parser() -> argparse.ArgumentParser:
     improve.add_argument("--max-usd", type=float, help="cap spend for the improving agent (default: unbounded)")
     improve.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     improve.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
-    _add_auth_arg(improve)
+    _add_auth_arg(improve, default=None)
     _add_feedback_arg(
         improve,
         extra=" (e.g. what to fix or emphasise; do NOT paste valid-split answers — that defeats the held-out split)",
@@ -1920,7 +1991,7 @@ def build_parser() -> argparse.ArgumentParser:
     wiki.add_argument("--max-concurrency", type=int, help="override config max_concurrency")
     wiki.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     wiki.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
-    _add_auth_arg(wiki)
+    _add_auth_arg(wiki, default=None)
     _add_log_args(wiki)
     wiki.set_defaults(func=_cmd_wiki)
 
@@ -1943,7 +2014,7 @@ def build_parser() -> argparse.ArgumentParser:
     epoch.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     epoch.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     epoch.add_argument("--verbose", action="store_true", help="use the full scrolling logs instead of progress bars")
-    _add_auth_arg(epoch)
+    _add_role_auth_args(epoch)
     _add_feedback_arg(epoch, extra=" (passed to the improver; do NOT paste valid-split answers)")
     _add_log_args(epoch)
     epoch.set_defaults(func=_cmd_epoch)
@@ -1977,7 +2048,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     fit.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     fit.add_argument("--verbose", action="store_true", help="use the full scrolling logs instead of progress bars")
-    _add_auth_arg(fit)
+    _add_role_auth_args(fit)
     _add_feedback_arg(fit, extra=" (passed to the improver; do NOT paste valid-split answers)")
     _add_log_args(fit)
     fit.set_defaults(func=_cmd_fit)
@@ -1997,7 +2068,7 @@ def build_parser() -> argparse.ArgumentParser:
     tasks_cmd.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     tasks_cmd.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     tasks_cmd.add_argument("--force", action="store_true", help="overwrite an existing tasks file")
-    _add_auth_arg(tasks_cmd)
+    _add_auth_arg(tasks_cmd, default=None)
     _add_feedback_arg(tasks_cmd, extra=" (e.g. which functionality to skip or focus on)")
     _add_log_args(tasks_cmd)
     tasks_cmd.set_defaults(func=_cmd_tasks)

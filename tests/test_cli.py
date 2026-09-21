@@ -603,6 +603,58 @@ def test_drain_stderr_does_not_echo_codex_transcript_to_console() -> None:
     assert any("import decoupler as dc" in line for line in sink)  # still recorded in the sink
 
 
+def _auth_requests(monkeypatch: pytest.MonkeyPatch, cfg, **flags: str | None) -> dict[str, str]:
+    """Run _resolve_pass_auth with credential probing stubbed out; return the request per role.
+
+    resolve_auth_mode is replaced with a recorder so the test observes the *request string* each
+    role resolved to (the thing the precedence chain decides), without needing real logins.
+    """
+    from types import SimpleNamespace
+
+    import acumen.cli as cli
+
+    captured: list[str] = []
+
+    def fake_resolve(requested: str, *, provider: str = "claude") -> str:
+        captured.append(requested)
+        return "session" if requested in ("session", "auto") else "api"
+
+    monkeypatch.setattr(cli, "resolve_auth_mode", fake_resolve)
+    monkeypatch.setattr(cli, "check_agent_cli", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli, "_warn_codex_accounting", lambda *_a, **_k: None)
+
+    args = SimpleNamespace(auth=flags.get("auth"), bench_auth=flags.get("bench_auth"), meta_auth=flags.get("meta_auth"))
+    cli._resolve_pass_auth(cfg, args)
+    # Single Claude provider on each side ⇒ bench request first, then meta.
+    return {"bench": captured[0], "meta": captured[1]}
+
+
+def test_resolve_pass_auth_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Per role: --bench-auth/--meta-auth beat --auth, which beats config, which beats 'auto'."""
+    from acumen.config import parse_config
+
+    plain = parse_config({"repo": "https://example.com/pkg"})
+
+    # Nothing set anywhere ⇒ both roles request 'auto'.
+    assert _auth_requests(monkeypatch, plain) == {"bench": "auto", "meta": "auto"}
+
+    # A shared --auth applies to both roles.
+    assert _auth_requests(monkeypatch, plain, auth="api") == {"bench": "api", "meta": "api"}
+
+    # Role flags split the two roles and override --auth.
+    assert _auth_requests(monkeypatch, plain, auth="api", bench_auth="api", meta_auth="session") == {
+        "bench": "api",
+        "meta": "session",
+    }
+
+    # Config supplies the per-role default when no CLI flag is given …
+    from_cfg = parse_config({"repo": "https://example.com/pkg", "bench_auth": "api", "meta_auth": "session"})
+    assert _auth_requests(monkeypatch, from_cfg) == {"bench": "api", "meta": "session"}
+
+    # … but an explicit --auth on the CLI overrides the config defaults.
+    assert _auth_requests(monkeypatch, from_cfg, auth="session") == {"bench": "session", "meta": "session"}
+
+
 def test_init_writes_files_the_loaders_accept(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     assert main(["init", "--dir", str(tmp_path)]) == 0
 

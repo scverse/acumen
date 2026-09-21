@@ -259,6 +259,19 @@ def test_config_dependency_selection() -> None:
         parse_config({"repo": "https://example.com/pkg", "dependency_groups": "full"})
 
 
+def test_config_auth_defaults_and_validation() -> None:
+    cfg = parse_config({"repo": "https://example.com/pkg"})
+    assert cfg.bench_auth is None
+    assert cfg.meta_auth is None
+
+    cfg2 = parse_config({"repo": "https://example.com/pkg", "bench_auth": "api", "meta_auth": "session"})
+    assert cfg2.bench_auth == "api"
+    assert cfg2.meta_auth == "session"
+
+    with pytest.raises(ConfigError, match="must be one of"):
+        parse_config({"repo": "https://example.com/pkg", "meta_auth": "subscription"})
+
+
 # --- target dependency selection -------------------------------------------------------
 
 
