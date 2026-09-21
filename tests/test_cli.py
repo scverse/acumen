@@ -573,6 +573,36 @@ def test_drain_stderr_hides_codex_tracing_but_keeps_it_for_sandbox_detection() -
     assert not any("Reading additional input" in line for line in sink)  # stdin notice dropped entirely
 
 
+def test_drain_stderr_does_not_echo_codex_transcript_to_console() -> None:
+    """The agent's rendered transcript (messages, commands, file bodies) never reaches the console.
+
+    Codex mirrors its transcript to stderr even under ``--json``; echoing it corrupted the ``\\r``
+    progress bar. The lines stay in the sink (they are captured in the run log anyway), but the
+    console callback is only invoked for genuine sandbox failures.
+    """
+    import asyncio
+
+    from acumen.agents import _drain_stderr
+
+    async def drive() -> tuple[list[str], list[str]]:
+        reader = asyncio.StreamReader()
+        for chunk in (
+            b"import decoupler as dc\n",
+            b"acts = dc.mt.ulm(data=adata, net=net)\n",
+            b"exec bash -lc 'python script.py'\n",
+        ):
+            reader.feed_data(chunk)
+        reader.feed_eof()
+        shown: list[str] = []
+        sink: list[str] = []
+        await _drain_stderr(reader, shown.append, sink)
+        return shown, sink
+
+    shown, sink = asyncio.run(drive())
+    assert shown == []  # nothing from the transcript hits the console
+    assert any("import decoupler as dc" in line for line in sink)  # still recorded in the sink
+
+
 def test_init_writes_files_the_loaders_accept(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     assert main(["init", "--dir", str(tmp_path)]) == 0
 

@@ -17,7 +17,13 @@ import pytest
 
 from acumen.config import parse_config
 from acumen.env import READY_MARKER, cache_key, prepare_target
-from acumen.scrub import build_filtered_source, find_guidance, find_source_fetch, scrub_venv
+from acumen.scrub import (
+    build_filtered_source,
+    find_guidance,
+    find_skill_access,
+    find_source_fetch,
+    scrub_venv,
+)
 
 SITE = "lib/python3.12/site-packages"
 
@@ -256,3 +262,35 @@ def test_find_source_fetch_local_target_has_no_repo_needles() -> None:
     assert find_source_fetch("Bash", install, repo=None, pkg_name=_PKG) is not None
     # Nothing to match on at all → allowed.
     assert find_source_fetch("Bash", {"command": "cat notes.txt"}, repo=None, pkg_name=None) is None
+
+
+def test_find_skill_access_flags_guidance_and_the_original_tree(tmp_path: Path) -> None:
+    """The skill guard hides SKILL.md by name, guidance dirs, and any path into the raw checkout."""
+    src = (tmp_path / "src").resolve()
+    src.mkdir()
+    # A SKILL.md anywhere is flagged by name …
+    assert find_skill_access("Read", {"file_path": str(tmp_path / "elsewhere" / "SKILL.md")}, src) is not None
+    # … as is a path through a guidance directory …
+    assert find_skill_access("Read", {"file_path": str(tmp_path / ".claude" / "notes.md")}, src) is not None
+    # … and any read that reaches back into the unfiltered checkout.
+    assert find_skill_access("Read", {"file_path": str(src / "decoupler" / "core.py")}, src) is not None
+    # Ordinary work elsewhere is fine.
+    assert find_skill_access("Read", {"file_path": str(tmp_path / "work" / "notes.md")}, src) is None
+
+
+def test_find_skill_access_exempts_the_agents_own_work_tree(tmp_path: Path) -> None:
+    """The improver must write its own ``work/vN/SKILL.md``; an exempt root wins over the name match."""
+    src = (tmp_path / "src").resolve()
+    src.mkdir()
+    work = (tmp_path / "work").resolve()
+    staged_skill = work / "v1" / "SKILL.md"
+
+    # Without the exemption the guard denies the agent its own output (the original bug) …
+    assert find_skill_access("Write", {"file_path": str(staged_skill)}, src) is not None
+    # … and with it, the write is allowed, whether named by a structured key …
+    assert find_skill_access("Write", {"file_path": str(staged_skill)}, src, (work,)) is None
+    # … or in a shell command that also names a guidance path inside the exempt tree.
+    cmd = {"command": f"mv {work}/v1/SKILL.draft.md {work}/v1/SKILL.md"}
+    assert find_skill_access("Bash", cmd, src, (work,)) is None
+    # The exemption is scoped: a real SKILL.md outside the work tree is still denied.
+    assert find_skill_access("Read", {"file_path": str(src / "SKILL.md")}, src, (work,)) is not None

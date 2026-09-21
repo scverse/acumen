@@ -380,7 +380,7 @@ async def improve_skill(
             # Belt-and-braces over the structural isolation: refuse any call that reaches a
             # held-out valid result, or an unfiltered source artifact. Built only for Claude.
             claude_hooks=(
-                {"PreToolUse": [make_valid_guard(runs_root), make_skill_guard(target.src_dir)]}
+                {"PreToolUse": [make_valid_guard(runs_root), make_skill_guard(target.src_dir, exempt=(work,))]}
                 if provider == "claude"
                 else None
             ),

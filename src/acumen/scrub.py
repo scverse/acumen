@@ -227,11 +227,30 @@ def build_filtered_source(src: Path, dest: Path) -> Path:
     return dest
 
 
-def _artifact_hit(candidate: str, original_src: Path) -> str | None:
-    """Return ``candidate`` if it resolves to a skill/guidance artifact or the original tree."""
+def _within(path: Path, root: Path) -> bool:
+    """Whether ``path`` is ``root`` or nested under it. Both are expected already resolved."""
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _artifact_hit(candidate: str, original_src: Path, exempt: Sequence[Path] = ()) -> str | None:
+    """Return ``candidate`` if it resolves to a skill/guidance artifact or the original tree.
+
+    ``exempt`` names the agent's own writable work tree. A path under one of those roots is never
+    an artifact to hide, *even when it is named* ``SKILL.md``: that is exactly what the improver
+    must write into its staging directory (and the seeded parent skill it edits, and the skill
+    body a wiki run reads) — all of which live under the agent's ``work`` dir. Without this the
+    guard, whose job is to hide the *target's* shipped guidance, would also deny the agent the one
+    file it exists to produce. Exemption is checked first, so it wins over the name/dir matches.
+    """
     try:
         resolved = Path(candidate).expanduser().resolve()
     except (OSError, RuntimeError, ValueError):
+        return None
+    if any(_within(resolved, root) for root in exempt):
         return None
     if resolved.name in GUIDANCE_FILES:
         return candidate
@@ -239,14 +258,14 @@ def _artifact_hit(candidate: str, original_src: Path) -> str | None:
         return candidate
     # The unfiltered source tree is off-limits — the agent must read the filtered copy, so any
     # path back into the original checkout (which still holds the stripped artifacts) is denied.
-    try:
-        resolved.relative_to(original_src)
-    except ValueError:
-        return None
-    return candidate
+    if _within(resolved, original_src):
+        return candidate
+    return None
 
 
-def find_skill_access(tool_name: str, tool_input: dict[str, Any], original_src: Path) -> str | None:
+def find_skill_access(
+    tool_name: str, tool_input: dict[str, Any], original_src: Path, exempt: Sequence[Path] = ()
+) -> str | None:
     """Return the first path in a tool call that reaches a skill/guidance artifact, else ``None``.
 
     Pure and side-effect free, so the enforcement can be exercised directly without standing up
@@ -262,6 +281,10 @@ def find_skill_access(tool_name: str, tool_input: dict[str, Any], original_src: 
         The tool's arguments.
     original_src
         The real (unfiltered) source checkout, resolved by the caller.
+    exempt
+        The agent's own writable work roots, resolved by the caller. Paths under any of them are
+        never flagged, so the agent can write and read its own staging skill (see
+        :func:`_artifact_hit`).
 
     Returns
     -------
@@ -270,7 +293,7 @@ def find_skill_access(tool_name: str, tool_input: dict[str, Any], original_src: 
     for key in _PATH_KEYS:
         value = tool_input.get(key)
         if isinstance(value, str):
-            hit = _artifact_hit(value, original_src)
+            hit = _artifact_hit(value, original_src, exempt)
             if hit is not None:
                 return hit
     command = tool_input.get("command")
@@ -279,7 +302,7 @@ def find_skill_access(tool_name: str, tool_input: dict[str, Any], original_src: 
             token = raw.rstrip(",;")
             if not token:
                 continue
-            hit = _artifact_hit(token, original_src)
+            hit = _artifact_hit(token, original_src, exempt)
             if hit is not None:
                 return hit
     return None
@@ -413,23 +436,29 @@ def make_source_guard(repo: str | None, pkg_name: str | None) -> HookMatcher:
     return HookMatcher(matcher=None, hooks=[guard])
 
 
-def make_skill_guard(original_src: Path) -> HookMatcher:
+def make_skill_guard(original_src: Path, exempt: Sequence[Path] = ()) -> HookMatcher:
     """Build the ``PreToolUse`` hook that denies an agent any existing skill/guidance.
 
     ``matcher=None`` fires the hook for every tool. Paths are resolved against the real source
     checkout, so the guard holds regardless of the agent's ``cwd``.
+
+    ``exempt`` names the agent's own writable work tree (its ``work`` dir). Paths under it are
+    never denied — the guard hides the *target's* shipped guidance, not the skill the agent is
+    itself writing or editing there, which is legitimately named ``SKILL.md``.
     """
     # Imported here, not at module scope: the Claude SDK is an optional dependency and a
     # Codex-only install never builds an SDK hook.
     from claude_agent_sdk import HookMatcher
 
     root = original_src.resolve()
+    exempt_roots = tuple(dict.fromkeys(path.resolve() for path in exempt))
 
     async def guard(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
         hit = find_skill_access(
             input_data.get("tool_name", ""),
             input_data.get("tool_input", {}) or {},
             root,
+            exempt_roots,
         )
         if hit is None:
             return {}

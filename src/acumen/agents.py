@@ -1053,6 +1053,15 @@ async def _drain_stderr(
             sink.append(text)
         if _CODEX_TRACE_RE.match(text):
             continue
+        # Everything else Codex renders to stderr is its human-readable transcript — the agent's
+        # messages, the commands it runs, the source of the files it writes. All of it is already
+        # on the ``--json`` stdout stream (recorded to the run log), so echoing it here only
+        # duplicates the transcript and, worse, interleaves with the ``\r`` progress bar on the
+        # shared TTY and corrupts it. The one thing worth surfacing live is a genuine sandbox/
+        # harness failure — bare (no ``codex_`` prefix) and matched by :data:`_SANDBOX_FAILURES`.
+        # Forward only that; the rest stays in ``sink`` for detection and the saved log.
+        if _sandbox_failure((text,)) is None:
+            continue
         if callback is not None:
             callback(text)
         else:

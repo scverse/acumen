@@ -384,7 +384,9 @@ async def _update_one_task(
             write_dirs=(work,),
             # A skill the target itself ships must not colour the notes.
             discover_skills=False,
-            claude_hooks={"PreToolUse": [make_skill_guard(target.src_dir)]} if provider == "claude" else None,
+            claude_hooks={"PreToolUse": [make_skill_guard(target.src_dir, exempt=(work,))]}
+            if provider == "claude"
+            else None,
             # Wiki agents read staged copies; deny the live runs tree and the raw checkout.
             deny_paths=(runs_root.resolve(), target.src_dir.resolve()),
         )

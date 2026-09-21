@@ -315,7 +315,9 @@ async def generate_tasks(
             # Belt-and-braces over the filtered copy: deny any call that reaches an existing
             # skill/guidance artifact or the original unfiltered source, wherever pointed. Built
             # only for Claude — the hook is an SDK object, and Codex gets ``deny_paths`` below.
-            claude_hooks={"PreToolUse": [make_skill_guard(target.src_dir)]} if provider == "claude" else None,
+            claude_hooks={"PreToolUse": [make_skill_guard(target.src_dir, exempt=(work,))]}
+            if provider == "claude"
+            else None,
             # Codex reads the filtered copy and is denied the original checkout.
             deny_paths=(target.src_dir.resolve(),),
         )
