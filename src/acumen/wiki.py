@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 import tempfile
 from collections.abc import Callable, Sequence
@@ -46,10 +47,12 @@ from acumen.paths import (
     Split,
     arm_name,
     parse_run_dir,
+    skill_from_arm,
 )
 from acumen.prices import PriceTable, price_usage, pricer, resolve_cost
 from acumen.procs import label_env, reap
 from acumen.prompts import wiki_prompt
+from acumen.scriptdiff import analyze_scripts
 from acumen.scrub import build_filtered_source, make_skill_guard
 from acumen.skills import content_files
 from acumen.tasks import Task
@@ -60,6 +63,11 @@ WIKI_DIRNAME = "wiki"
 #: Per-task files the wiki holds.
 OBSERVATIONS_FILE = "observations.md"
 HYPOTHESIS_FILE = "hypothesis.md"
+
+#: Per-task file holding the deterministic pass/fail *code* discriminators, one block per arm.
+#: Written by acumen (not the wiki agent) from :mod:`acumen.scriptdiff`; a permanent, versioned
+#: sibling of the prose files that both the wiki agent and the improver read.
+DISCRIMINATORS_FILE = "discriminators.md"
 
 #: Per-task marker listing the arms already recorded, one per line. Internal bookkeeping that
 #: makes the append idempotent: an arm already listed here is skipped on a re-run.
@@ -286,6 +294,161 @@ def _overlong_entries(text: str, version: str, *, kind: str) -> list[str]:
     return warnings
 
 
+#: A well-formed gap tag on a hypothesis entry.
+_GAP_RE = re.compile(r"\[gap:\s*(?:description-fixable|body-fixable|not-skill-fixable)\s*\]")
+
+
+def _missing_gap_tags(text: str, version: str) -> list[str]:
+    """Return a warning per THIS-version hypothesis entry that lacks a valid ``[gap: …]`` tag.
+
+    Groups the file into bullet entries (an entry may wrap onto indented continuation lines) and
+    warns — never fails — when an entry for ``version`` carries no recognised gap tag, so a
+    forgotten tag is visible to the operator without blocking the epoch.
+    """
+    tag = f"[{version}]"
+    warnings: list[str] = []
+    entry: list[str] = []
+
+    def flush() -> None:
+        if entry and not _GAP_RE.search(" ".join(entry)):
+            warnings.append(f"hypothesis entry {entry[0][:60]!r} for {tag} lacks a [gap: …] tag")
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            flush()
+            entry = [stripped] if tag in stripped else []
+        elif entry:
+            entry.append(stripped)
+    flush()
+    return warnings
+
+
+# ── Train-split regressions ──────────────────────────────────────────────────────────────
+
+#: Wiki-root file, regenerated every epoch, flagging tasks whose TRAIN pass-rate dropped from one
+#: skill version to the next. Deterministic and acumen-authored, so the per-task prose files stay
+#: the agent's; the improver reads it to prioritise undoing a change that made a task worse.
+REGRESSIONS_FILE = "REGRESSIONS.md"
+
+#: A later version must fall at least this far below the previous one (as a pass-rate fraction) for
+#: the drop to be flagged, so a single replicate flipping does not read as a regression.
+MIN_REGRESSION_DROP = 0.25
+
+
+@dataclass(frozen=True)
+class Regression:
+    """One task's train pass-rate falling from ``prev_version`` to ``version``."""
+
+    task_id: str
+    version: str
+    prev_version: str
+    passed: int
+    total: int
+    prev_passed: int
+    prev_total: int
+
+    @property
+    def rate(self) -> float:
+        """The regressed version's train pass-rate."""
+        return self.passed / self.total
+
+    @property
+    def prev_rate(self) -> float:
+        """The earlier version's train pass-rate."""
+        return self.prev_passed / self.prev_total
+
+
+def _benched_train_arms(runs_root: Path) -> list[str]:
+    """Return the arms that have a ``train`` subtree, ordered ``noskill`` then ``skill_v1``…
+
+    Non-arm directories under ``runs/`` are skipped rather than erroring, so a stray directory
+    never breaks regression detection.
+    """
+    arms: list[str] = []
+    if not runs_root.is_dir():
+        return arms
+    for child in runs_root.iterdir():
+        if not (child / "train").is_dir():
+            continue
+        try:
+            skill_from_arm(child.name)
+        except Exception:  # noqa: BLE001 - a directory that is not an arm name is simply not one
+            continue
+        arms.append(child.name)
+
+    def order(arm: str) -> tuple[int, int]:
+        version = skill_from_arm(arm)
+        return (0, 0) if version is None else (1, int(version[1:]))
+
+    return sorted(arms, key=order)
+
+
+def compute_train_regressions(
+    runs_root: Path, tasks: Sequence[Task], *, min_drop: float = MIN_REGRESSION_DROP
+) -> list[Regression]:
+    """Flag each task whose train pass-rate fell by at least ``min_drop`` between consecutive arms.
+
+    Each version is compared only to the immediately preceding benched version that has runs for
+    the task, so a regression points at the single change that introduced it. Reads only the
+    ``train`` split, like the wiki itself.
+    """
+    arms = _benched_train_arms(runs_root)
+    regressions: list[Regression] = []
+    for task in tasks:
+        series: list[tuple[str, int, int]] = []
+        for arm in arms:
+            runs = collect_arm_runs(runs_root, arm, tasks, split="train", task_id=task.id)
+            if runs:
+                series.append((arm, sum(1 for run in runs if run.success), len(runs)))
+        for (prev_arm, prev_passed, prev_total), (arm, passed, total) in zip(series, series[1:], strict=False):
+            if passed / total + min_drop <= prev_passed / prev_total:
+                regressions.append(
+                    Regression(
+                        task_id=task.id,
+                        version=skill_from_arm(arm) or arm,
+                        prev_version=skill_from_arm(prev_arm) or prev_arm,
+                        passed=passed,
+                        total=total,
+                        prev_passed=prev_passed,
+                        prev_total=prev_total,
+                    )
+                )
+    return regressions
+
+
+def format_regressions(regressions: Sequence[Regression]) -> str:
+    """Render the ``REGRESSIONS.md`` body for the improver."""
+    if not regressions:
+        return "# Train regressions\n\nNone — no task's train pass-rate dropped from one skill version to the next.\n"
+    lines = [
+        "# Train regressions",
+        "",
+        "Tasks whose TRAIN pass-rate fell from one skill version to the next. A drop means a change "
+        "in that version made the task WORSE. Before adding anything, identify the change responsible "
+        "and reverse it unless you have a concrete reason it should stay.",
+        "",
+    ]
+    for reg in sorted(regressions, key=lambda r: (r.task_id, r.version)):
+        lines.append(
+            f"- `{reg.task_id}`: {reg.prev_version} {reg.prev_passed}/{reg.prev_total} "
+            f"({reg.prev_rate:.0%}) → {reg.version} {reg.passed}/{reg.total} ({reg.rate:.0%})  REGRESSION"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def update_regressions(wiki_root: Path, runs_root: Path, tasks: Sequence[Task]) -> list[Regression]:
+    """Recompute train regressions and (over)write ``wiki/REGRESSIONS.md``; return the flags.
+
+    Regenerated wholesale each epoch so a regression that a later version repairs disappears from
+    the file rather than lingering. Written under ``wiki_root``, which the improver stages whole.
+    """
+    regressions = compute_train_regressions(runs_root, tasks)
+    wiki_root.mkdir(parents=True, exist_ok=True)
+    (wiki_root / REGRESSIONS_FILE).write_text(format_regressions(regressions))
+    return regressions
+
+
 # ── Orchestration ────────────────────────────────────────────────────────────────────────
 
 
@@ -338,6 +501,29 @@ async def _update_one_task(
         obs_path.write_text(existing_obs.read_text() if existing_obs.is_file() else "")
         hyp_path.write_text(existing_hyp.read_text() if existing_hyp.is_file() else "")
 
+        # Deterministic pass/fail *code* discriminators for this arm — acumen-computed, not written
+        # by the agent. Staged now (with any earlier arms' blocks) so the agent can ground its prose
+        # on it; appended to the persistent wiki file only after the agent succeeds (below), so a
+        # failed-and-retried run never double-appends. Code tasks only — a `needs_script: false`
+        # task has no scripts to diff.
+        existing_disc = task_dir / DISCRIMINATORS_FILE
+        prior_disc = existing_disc.read_text() if existing_disc.is_file() else ""
+        disc_block = (
+            analyze_scripts(
+                [run.directory / SCRIPT_FILE for run in runs if run.success],
+                [run.directory / SCRIPT_FILE for run in runs if not run.success],
+                version=version,
+                task_id=task.id,
+            )
+            if task.needs_script
+            else None
+        )
+        staged_disc = "\n\n".join(part for part in (prior_disc.strip(), (disc_block or "").strip()) if part)
+        disc_path: Path | None = None
+        if staged_disc:
+            disc_path = work / DISCRIMINATORS_FILE
+            disc_path.write_text(staged_disc + "\n")
+
         # The skill body under test, so hypotheses can point at what the skill actually said.
         # ``noskill`` has none.
         skill_body: Path | None = None
@@ -371,6 +557,7 @@ async def _update_one_task(
             observations_path=obs_path,
             hypothesis_path=hyp_path,
             skill_dir=skill_body,
+            discriminators_path=disc_path,
         )
         options = AgentOptions(
             cwd=work,
@@ -419,11 +606,17 @@ async def _update_one_task(
             raise WikiError(f"the wiki agent for {task.id} left {OBSERVATIONS_FILE} empty — nothing to record")
         existing_obs.write_text(new_obs if new_obs.endswith("\n") else new_obs + "\n")
         existing_hyp.write_text(new_hyp if new_hyp.endswith("\n") or not new_hyp else new_hyp + "\n")
+        # Append this arm's code-discriminator block to the persistent file now the agent succeeded,
+        # mirroring the prose files: on failure nothing is written and the `.arms` gate re-runs it.
+        if disc_block is not None:
+            merged = (prior_disc.rstrip() + "\n\n" if prior_disc.strip() else "") + disc_block
+            existing_disc.write_text(merged if merged.endswith("\n") else merged + "\n")
         mark_recorded(task_dir, arm)
 
         warnings = tuple(
             _overlong_entries(new_obs, version, kind="observations")
             + _overlong_entries(new_hyp, version, kind="hypothesis")
+            + _missing_gap_tags(new_hyp, version)
         )
         return TaskWikiResult(
             task_id=task.id,

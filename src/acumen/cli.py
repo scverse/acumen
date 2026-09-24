@@ -67,7 +67,7 @@ from acumen.training import (
     patience_exhausted,
     write_training_csv,
 )
-from acumen.wiki import WikiError, collect_arm_runs, update_wiki
+from acumen.wiki import WikiError, collect_arm_runs, update_regressions, update_wiki
 
 
 def _add_bench_args(parser: argparse.ArgumentParser) -> None:
@@ -1154,6 +1154,13 @@ def _run_one_epoch(
         stream=args.stream,
         mode=mode,
     )
+
+    # Recompute the deterministic train-regression flags from every benched train arm, so the
+    # improver (Step 3) sees any task a version made worse. Regenerated wholesale, so a repaired
+    # regression clears itself. Cheap and read-only over the runs tree.
+    regressions = update_regressions(args.wiki, runs_root, tasks)
+    if regressions and mode == "verbose":
+        print(f"  {len(regressions)} train regression(s) flagged → {args.wiki / 'REGRESSIONS.md'}", flush=True)
 
     # Step 3 — create or improve the skill (skipped when the version already exists: a resumed
     # epoch that crashed after improve).

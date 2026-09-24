@@ -158,7 +158,15 @@ You are producing version {new_version} — an improvement of version {parent_ve
   success) and `hypothesis.md` (why it did or did not work). Entries are tagged `[version][model]`
   and accumulate across versions — `noskill` is the baseline, then `v1`, `v2`, … READ THIS FIRST.
   It is the distilled signal of what the skill gets right and wrong; the trend across versions
-  tells you what past changes did.
+  tells you what past changes did. Each `hypothesis.md` line ends with a `[gap: <type>]` tag naming
+  the lever that can fix it — `description-fixable`, `body-fixable`, or `not-skill-fixable`.
+  - Each code task also has `discriminators.md` — a DETERMINISTIC per-version diff (computed by
+    acumen) of the calls and keyword arguments that appear in PASSING run scripts but not failing
+    ones, and vice versa. Use it to see exactly what separated pass from fail, and to correlate a
+    past skill edit with a change in what the passing runs did. It is correlational — verify against
+    the source before encoding a value.
+  - `{wiki_dir}/REGRESSIONS.md` — tasks whose TRAIN pass-rate FELL from one version to the next.
+    Read it before editing: a regression means an earlier change made that task worse.
 - `{transcripts_dir}` — the raw TRAIN-split transcripts behind the wiki, for the parent skill.
   Drill in here only when the wiki is not specific enough to act on.
 - `{src}` — the package source (filtered: any skill or agent-guidance files a package ships have
@@ -188,6 +196,19 @@ across the board, that is the biggest available win — and the only lever is th
 one model loads reliably and another almost never does, that gap is mostly the model's behaviour;
 do not contort the sentence chasing it.
 
+Use the `[gap: <type>]` tags to spend effort where a lever exists. Edit the body for
+`body-fixable` gaps and the description for `description-fixable` ones. A `not-skill-fixable` gap
+(ran out of turns, wrote no answer, an environment/data error, or a model ignoring an instruction
+the skill already states plainly) has NO lever here — do not grow the body chasing it; note in the
+rationale that it is out of scope.
+
+# Undo regressions first
+
+Before adding anything, read `{wiki_dir}/REGRESSIONS.md`. For every task listed there, find the
+change in the responsible version that caused the drop and REVERSE it, unless you have a concrete,
+evidence-backed reason it should stay. Recovering a regression is worth more than a new addition,
+and a value the wiki shows made a task worse must not be reintroduced.
+
 {craft}
 
 # What you must write
@@ -215,8 +236,12 @@ skill routes it to the right entry point and sequence of steps.
 
 - `{wiki_dir}` — the KNOWLEDGE WIKI: one directory per task, each with `observations.md` (what
   agents did WITHOUT any skill — the `noskill` baseline — across models and replicates, and how
-  often they got it right) and `hypothesis.md` (why they succeeded or failed). READ THIS FIRST: it
-  tells you exactly where an unaided agent goes wrong, which is precisely what your skill must fix.
+  often they got it right) and `hypothesis.md` (why they succeeded or failed; each line ends with a
+  `[gap: <type>]` tag naming the fixable lever). READ THIS FIRST: it tells you exactly where an
+  unaided agent goes wrong, which is precisely what your skill must fix. Each code task also has
+  `discriminators.md` — a DETERMINISTIC diff of the calls and keyword arguments that appear in the
+  passing baseline scripts but not the failing ones; it is the clearest signal of the step an
+  unaided agent misses. It is correlational — verify against the source before encoding a value.
 - `{transcripts_dir}` — the raw TRAIN-split transcripts behind the wiki. Drill in when the wiki is
   not specific enough.
 - `{src}` — the package source (filtered: any skill or agent-guidance files a package ships have
@@ -274,7 +299,7 @@ baseline). {skill_note}
   read every one.
 - The package source is at `{src}` and it is installed — run `{python}` if a fact helps you explain
   an outcome. Optional; do not go down a rabbit hole.
-{skill_body_note}
+{discriminators_note}{skill_body_note}
 # What you must write — APPEND, do not rewrite
 
 Two files already exist and may contain entries from earlier arms. LEAVE those untouched and ADD
@@ -290,7 +315,20 @@ your new entries at the end. `noskill` is the first arm; later arms are `v1`, `v
 
 2. `{hypothesis_path}` — add ONE line per model, in EXACTLY this format:
 
-   - [{version}][<model>]: <why it did or did not work — one or two short sentences>
+   - [{version}][<model>]: <why it did or did not work — one or two short sentences> [gap: <type>]
+
+   The `[gap: <type>]` suffix is REQUIRED and names the ONE lever that could fix the failures — it
+   tells the improver where to spend effort. Pick exactly one, from the run's LOADED status and its
+   failure reason (both in `INDEX.md`):
+   - `description-fixable` — the skill would have helped but often did NOT load (or the baseline
+     already got it right); the lever is the skill's `description`, not its body.
+   - `body-fixable` — the skill loaded but the agent still did the wrong thing the body could state
+     better (wrong route, wrong function, a value left to guesswork).
+   - `not-skill-fixable` — the failure is not about the skill's content at all: it ran out of turns
+     (`max_turns`), wrote no `answer.md` (`no_answer_file`), hit an environment/data error, or the
+     model ignored an instruction the skill already stated plainly.
+   For a passing entry, use the tag that best describes what carried it (usually `body-fixable`, or
+   `description-fixable` for a baseline that needed no skill).
 
 # BE BRIEF — this is the whole point
 
@@ -305,7 +343,7 @@ GOOD observation:
   - [{version}][claude-opus-5]: Loaded 3/3; agents used the right entry point and passed every run.
 GOOD hypothesis:
   - [{version}][claude-opus-5]: The skill named the correct function and output location, which is
-    the step agents otherwise guess wrong.
+    the step agents otherwise guess wrong. [gap: body-fixable]
 BAD (too verbose): a paragraph recounting each replicate's tool calls and reasoning.
 
 When you are done, `{observations_path}` and `{hypothesis_path}` each contain your new
@@ -952,6 +990,7 @@ def wiki_prompt(
     observations_path: Path,
     hypothesis_path: Path,
     skill_dir: Path | None = None,
+    discriminators_path: Path | None = None,
 ) -> str:
     """Build the prompt for one wiki agent (one task, one arm).
 
@@ -977,6 +1016,10 @@ def wiki_prompt(
         The two files to append to, pre-seeded with any earlier arms' entries.
     skill_dir
         The arm's skill content directory, or ``None`` for ``noskill``.
+    discriminators_path
+        The staged, acumen-computed code-discriminator file (calls/kwargs that separate passing
+        from failing runs), or ``None`` when there was no discriminating signal (a non-code task,
+        or all runs passed or all failed).
 
     Returns
     -------
@@ -990,6 +1033,17 @@ def wiki_prompt(
             f"The skill body under review is at `{skill_dir}`; read it so your hypothesis can cite what it said."
         )
         skill_body_note = f"- `{skill_dir}` — the `[{version}]` skill body the runs above were given.\n"
+    if discriminators_path is None:
+        discriminators_note = ""
+    else:
+        discriminators_note = (
+            f"- `{discriminators_path}` — a DETERMINISTIC diff (computed by acumen, not you) of the "
+            "calls and keyword arguments that appear in the PASSING scripts but not the failing ones "
+            "(and vice versa). Use it as your starting point for what actually separated pass from "
+            "fail — it is the exact signal that is easy to miss by eye. It is CORRELATIONAL, not "
+            "causal: confirm a candidate against the transcripts and source before you write it as "
+            "the reason.\n"
+        )
     return WIKI_PROMPT.format(
         package=package,
         version=version,
@@ -1001,6 +1055,7 @@ def wiki_prompt(
         hypothesis_path=hypothesis_path,
         skill_note=skill_note,
         skill_body_note=skill_body_note,
+        discriminators_note=discriminators_note,
     )
 
 

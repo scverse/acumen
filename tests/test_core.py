@@ -139,6 +139,7 @@ from acumen.runner import (
     run_once,
 )
 from acumen.sandbox import Sandbox
+from acumen.scriptdiff import analyze_scripts, extract_atoms
 from acumen.ship import _ship_env
 from acumen.skills import SkillError, load_skill, read_meta, skill_hash, write_meta
 from acumen.taskgen import dump_tasks, harvest_scripts
@@ -163,7 +164,17 @@ from acumen.trajectory import (
     write_trajectory_json,
 )
 from acumen.transcript import render_agent_transcript, render_codex_events, render_codex_transcript
-from acumen.wiki import WikiError, collect_arm_runs, mark_recorded, recorded_arms, stage_task_evidence
+from acumen.wiki import (
+    WikiError,
+    _missing_gap_tags,
+    collect_arm_runs,
+    compute_train_regressions,
+    format_regressions,
+    mark_recorded,
+    recorded_arms,
+    stage_task_evidence,
+    update_regressions,
+)
 
 # --- grading ---------------------------------------------------------------------------
 
@@ -3034,6 +3045,119 @@ def test_stage_task_evidence_marks_each_run(project: Path, make_result, tmp_path
     # One directory per run, so a reader who opens one isn't left guessing.
     run_dirs = [p for p in evidence.iterdir() if p.is_dir()]
     assert len(run_dirs) == 3
+
+
+# --- script discriminators (acumen.scriptdiff) -----------------------------------------
+
+
+def _write_scripts(directory: Path, prefix: str, sources: list[str]) -> list[Path]:
+    """Write each source to ``directory/<prefix><i>.py`` and return the paths."""
+    directory.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for i, src in enumerate(sources):
+        path = directory / f"{prefix}{i}.py"
+        path.write_text(src)
+        paths.append(path)
+    return paths
+
+
+def test_analyze_scripts_surfaces_discriminating_kwarg(tmp_path: Path) -> None:
+    """The exact kwarg value that separates pass from fail must appear on the right side."""
+    passers = _write_scripts(tmp_path, "p", ["dc.pp.filter_by_prop(x, min_prop=0.1)\n"] * 3)
+    failers = _write_scripts(tmp_path, "f", ["dc.pp.filter_by_prop(x, min_prop=0.2)\n"] * 4)
+
+    block = analyze_scripts(passers, failers, version="v2", task_id="psbulk")
+
+    assert block is not None
+    passer_part, failer_part = block.split("In failers, rare/absent in passers")
+    assert "min_prop=0.1" in passer_part and "3/3 pass, 0/4 fail" in passer_part
+    assert "min_prop=0.2" in failer_part
+    assert "[v2]" in block and "psbulk" in block
+
+
+def test_analyze_scripts_none_without_both_sides(tmp_path: Path) -> None:
+    """With only passers (or only failers) nothing discriminates, so there is no block."""
+    passers = _write_scripts(tmp_path, "p", ["dc.op.collectri()\n"] * 2)
+    assert analyze_scripts(passers, [], version="v1", task_id="t") is None
+
+
+def test_analyze_scripts_skips_unparseable(tmp_path: Path) -> None:
+    """A syntactically broken script is skipped and counted, never crashing the analysis."""
+    passers = _write_scripts(tmp_path, "p", ["dc.pp.filter_by_prop(x, min_prop=0.1)\n", "def (:\n"])
+    failers = _write_scripts(tmp_path, "f", ["dc.pp.filter_by_prop(x, min_prop=0.2)\n"])
+
+    block = analyze_scripts(passers, failers, version="v1", task_id="t")
+
+    assert block is not None
+    assert "1 script could not be read or parsed" in block
+    assert extract_atoms("def (:") is None
+
+
+def test_analyze_scripts_respects_char_cap(tmp_path: Path) -> None:
+    """A tight char cap truncates the block rather than letting it grow unbounded."""
+    passers = _write_scripts(tmp_path, "p", ["dc.op.collectri()\ndc.pp.filter_by_prop(x, min_prop=0.1)\n"] * 3)
+    failers = _write_scripts(tmp_path, "f", ["dc.op.dorothea()\ndc.pp.filter_by_prop(x, min_prop=0.2)\n"] * 3)
+
+    block = analyze_scripts(passers, failers, version="v1", task_id="t", max_chars=120)
+
+    assert block is not None and "truncated" in block
+    assert len(block) <= 120 + len("\n…(truncated)\n")
+
+
+# --- train regressions (acumen.wiki) ---------------------------------------------------
+
+
+def _train_arm(project: Path, make_result, arm: str, successes: list[bool]) -> None:
+    """Write one train run per entry of ``successes`` for ``arm`` on ``example_task``."""
+    runs = project / "runs"
+    for i, ok in enumerate(successes):
+        key = RunKey(arm=arm, split="train", model="model_a", task_id="example_task", rep=i + 1)
+        make_result(runs, key, success=ok, skill_loaded=arm != "noskill")
+
+
+def test_compute_train_regressions_flags_drop(project: Path, make_result) -> None:
+    """A version whose train pass-rate falls below the previous one is flagged, once, with counts."""
+    _train_arm(project, make_result, "noskill", [True, True])
+    _train_arm(project, make_result, "skill_v1", [True, True])
+    _train_arm(project, make_result, "skill_v2", [False, False])
+    tasks = load_tasks(project / "tasks.yaml")
+
+    regressions = compute_train_regressions(project / "runs", tasks)
+
+    assert len(regressions) == 1
+    reg = regressions[0]
+    assert reg.task_id == "example_task" and reg.version == "v2" and reg.prev_version == "v1"
+    assert reg.prev_rate == 1.0 and reg.rate == 0.0
+
+    body = format_regressions(regressions)
+    assert "example_task" in body and "REGRESSION" in body
+
+
+def test_compute_train_regressions_none_without_drop(project: Path, make_result) -> None:
+    """A non-decreasing pass-rate across versions produces no flag, and REGRESSIONS.md says so."""
+    _train_arm(project, make_result, "noskill", [False, True])
+    _train_arm(project, make_result, "skill_v1", [True, True])
+    tasks = load_tasks(project / "tasks.yaml")
+
+    assert compute_train_regressions(project / "runs", tasks) == []
+
+    wiki_root = project / "wiki"
+    assert update_regressions(wiki_root, project / "runs", tasks) == []
+    assert "None" in (wiki_root / "REGRESSIONS.md").read_text()
+
+
+# --- gap-tag soft warning (acumen.wiki) ------------------------------------------------
+
+
+def test_missing_gap_tags_warns_only_when_absent() -> None:
+    """A this-version hypothesis line without a valid [gap: …] tag warns; a tagged one does not."""
+    tagged = "- [v2][model_a]: the body named the right function. [gap: body-fixable]\n"
+    untagged = "- [v2][model_b]: never loaded the skill.\n"
+
+    assert _missing_gap_tags(tagged, "v2") == []
+    assert len(_missing_gap_tags(untagged, "v2")) == 1
+    # An older version's untagged entry is not this version's problem.
+    assert _missing_gap_tags("- [v1][model_a]: old entry.\n" + tagged, "v2") == []
 
 
 def test_recorded_arms_round_trip(tmp_path: Path) -> None:
