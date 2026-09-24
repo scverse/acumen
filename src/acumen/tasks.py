@@ -25,10 +25,11 @@ class TaskSplit:
 
 @dataclass(frozen=True)
 class Task:
-    """A single benchmark task, with a train/test pair and optional overrides."""
+    """A single benchmark task, with a train/valid/test triple and optional overrides."""
 
     id: str
     train: TaskSplit
+    valid: TaskSplit
     test: TaskSplit
     max_turns: int | None = None
     max_usd: float | None = None
@@ -36,14 +37,15 @@ class Task:
     #: Whether this task's answers are reproducible by running code. ``acumen check`` expects
     #: a reproducer script per split for such a task and reports a missing one as a gap; a task
     #: that needs none (a licence, a species name, a fact from the docs) sets this ``False``.
-    #: Task-level, not per-split: both splits of one task are the same analysis.
+    #: Task-level, not per-split: every split of one task is the same analysis.
     needs_script: bool = True
 
     def split(self, split: Split) -> TaskSplit:
-        """Return the ``train`` or ``test`` half of this task."""
-        if split not in ("train", "test"):
+        """Return the ``train``, ``valid`` or ``test`` half of this task."""
+        halves = {"train": self.train, "valid": self.valid, "test": self.test}
+        if split not in halves:
             raise TaskError(f"no such split: {split!r}")
-        return self.train if split == "train" else self.test
+        return halves[split]
 
 
 def _require_str(value: Any, where: str) -> str:
@@ -70,7 +72,7 @@ def _parse_task(raw: Any, index: int) -> Task:
     where = f"tasks[{index}]"
     if not isinstance(raw, dict):
         raise TaskError(f"{where} must be a mapping, got {type(raw).__name__}")
-    unknown = set(raw) - {"id", "train", "test", "max_turns", "max_usd", "model", "needs_script"}
+    unknown = set(raw) - {"id", "train", "valid", "test", "max_turns", "max_usd", "model", "needs_script"}
     if unknown:
         raise TaskError(f"{where} has unknown keys: {sorted(unknown)}")
     if "id" not in raw:
@@ -79,9 +81,9 @@ def _parse_task(raw: Any, index: int) -> Task:
     if not is_safe_component(task_id):
         raise TaskError(f"{where}.id {task_id!r} is not filesystem-safe — use only letters, digits, '.', '_', '-'")
     where = f"task {task_id!r}"
-    for key in ("train", "test"):
+    for key in ("train", "valid", "test"):
         if key not in raw:
-            raise TaskError(f"{where} is missing the '{key}' split — both splits are required")
+            raise TaskError(f"{where} is missing the '{key}' split — train, valid and test are all required")
     max_turns = raw.get("max_turns")
     if max_turns is not None and (not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns < 1):
         raise TaskError(f"{where}.max_turns must be a positive integer, got {max_turns!r}")
@@ -101,6 +103,7 @@ def _parse_task(raw: Any, index: int) -> Task:
     return Task(
         id=task_id,
         train=_parse_split(raw["train"], f"{where}.train"),
+        valid=_parse_split(raw["valid"], f"{where}.valid"),
         test=_parse_split(raw["test"], f"{where}.test"),
         max_turns=max_turns,
         max_usd=max_usd,

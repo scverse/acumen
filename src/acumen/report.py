@@ -8,7 +8,7 @@ few group-bys. Figures are matplotlib rendered to PNG and inlined as base64 data
 The report is regenerated (overwritten) at each skill version — it always reflects every
 run currently on disk across every arm.
 
-The visualisations show **test-split** performance — the held-out measure of whether a
+The visualisations show **valid-split** performance — the held-out measure of whether a
 skill helps. The full per-run table below them still lists both splits, so train runs
 remain inspectable.
 """
@@ -16,7 +16,6 @@ remain inspectable.
 from __future__ import annotations
 
 import base64
-import difflib
 import html
 import io
 import json
@@ -35,26 +34,30 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
-from matplotlib.colors import is_color_like
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm, is_color_like
 from matplotlib.legend_handler import HandlerPatch
 from matplotlib.lines import Line2D
 from matplotlib.patches import FancyArrowPatch, Patch
 
+# The split-diff renderer moved to :mod:`acumen.htmldiff` so the transcript can share it without
+# importing this module (and its matplotlib weight). ``_split_diff_rows`` is re-exported because
+# tests reach it through ``acumen.report``; ``_split_diff_table`` backs the skill diff below.
+from acumen.htmldiff import _split_diff_rows, _split_diff_table
+from acumen.markdown import render_markdown
 from acumen.paths import NOSKILL_ARM, RESULT_FILE, TRANSCRIPT_HTML, skill_from_arm
 from acumen.skills import SkillError, read_meta, skill_content, skill_dir
 from acumen.tasks import Task
+from acumen.theme import ACCENT, BAR, DIFF_CSS, INK, PAGE, PALETTE_ROOT_CSS, PLOT_BG
+
+__all__ = ["_split_diff_rows"]
 
 # ── Palette ──────────────────────────────────────────────────────────────────────────
-# A warm-neutral scheme fixed by the maintainer. The page and the plot area are both white,
-# so a figure sits on the page with no visible frame around it and the ink carries the
-# structure. Bars are coloured by model (see the sequential ramp below), with a grey bar
-# pooling every model; train/test is a texture, not a colour.
-INK = "#1c1813"  # axes, text, ticks
-PAGE = "#ffffff"  # page + figure background
-PLOT_BG = "#ffffff"  # the plot area itself; also the hairline between adjacent bars
-SURFACE = "#f7f3ec"  # the one tinted surface — the inline skill diffs, so code reads as a block
-BAR = "#565149"  # a neutral tone, used where model hue does not apply
-ACCENT = "#b2ac9e"  # the light warm tone, for table tints and notes
+# A warm-neutral scheme fixed by the maintainer, shared with the transcript renderer so both
+# pages read as one product (see :mod:`acumen.theme`). The page and the plot area are both white,
+# so a figure sits on the page with no visible frame around it and the ink carries the structure.
+# Bars are coloured by model (see the sequential ramp below), with a grey bar pooling every model;
+# train/test is a texture, not a colour.
 
 # The model is the hue, in two dimensions: the *provider* picks the hue family, and the tier
 # picks the step within it — darkest is most potent, each weaker tier a lighter step of the
@@ -91,9 +94,12 @@ _ALL_MODELS = "\x00all-models"  # sentinel model id; not a value any real id can
 _ALL_MODELS_LABEL = "all models"
 _ALL_MODELS_COLOR = "#9b968d"
 
-# Train vs test is a *texture*, not a colour — so it never competes with the model hue.
-_SPLIT_ORDER = ("train", "test")
-_SPLIT_HATCH = {"train": "////", "test": ""}
+# Train vs valid is a *texture*, not a colour — so it never competes with the model hue.
+_SPLIT_ORDER = ("train", "valid")
+_SPLIT_HATCH = {"train": "////", "valid": ""}
+# The line-chart analogue of the hatch above: on the training curve train and valid are told
+# apart by dash, leaving colour free to carry the model.
+_SPLIT_STYLE = {"train": "--", "valid": "-"}
 
 #: rcParams applied around every figure via :func:`matplotlib.pyplot.rc_context`, so the
 #: report's styling never leaks into a caller's global matplotlib state.
@@ -118,8 +124,8 @@ _RC = {
 }
 
 #: The split every figure reports on. Train runs feed the improver; the report measures
-#: held-out (test) performance.
-_REPORTED_SPLIT = "test"
+#: held-out (valid) performance.
+_REPORTED_SPLIT = "valid"
 
 
 #: Brand assets bundled with the package (see ``src/acumen/assets``). Inlined as ``data:``
@@ -216,13 +222,18 @@ def _fmt_seconds(value: float) -> str:
     return f"{value:.0f}s"
 
 
-def load_results(runs_root: Path) -> pd.DataFrame:
+def load_results(runs_root: Path, *, skip_invalid: bool = False) -> pd.DataFrame:
     """Load every ``result.json`` under ``runs_root`` into a DataFrame.
 
     Parameters
     ----------
     runs_root
         The ``runs/`` root directory.
+    skip_invalid
+        By default an infrastructure-invalid result (``valid: false`` — exhausted credit, a
+        refused host, a dropped connection) raises, because a *report* must never present one as
+        a measurement. Pass ``True`` to skip those rows instead: the training curve is built over
+        actual measurements while a broken/pending epoch's cells wait to be re-run on resume.
 
     Returns
     -------
@@ -233,7 +244,8 @@ def load_results(runs_root: Path) -> pd.DataFrame:
     Raises
     ------
     ReportError
-        If ``runs_root`` is missing or holds no readable results.
+        If ``runs_root`` is missing or holds no readable results, or (unless ``skip_invalid``)
+        any result is infrastructure-invalid.
     """
     if not runs_root.is_dir():
         raise ReportError(f"no runs directory: {runs_root}")
@@ -256,7 +268,7 @@ def load_results(runs_root: Path) -> pd.DataFrame:
         data["transcript_path"] = (result_path.parent / TRANSCRIPT_HTML).resolve()
         rows.append(data)
 
-    if invalid:
+    if invalid and not skip_invalid:
         sample = ", ".join(str(path) for path in invalid[:3])
         more = f" (+{len(invalid) - 3} more)" if len(invalid) > 3 else ""
         raise ReportError(
@@ -327,7 +339,7 @@ def _loaded_flags(df: pd.DataFrame) -> pd.Series:
 def arm_metrics(df: pd.DataFrame) -> pd.DataFrame:
     """Per-arm success rate and resource totals for the runs in ``df``.
 
-    The caller filters ``df`` first — to the test split, and optionally to one task. Each
+    The caller filters ``df`` first — to the valid split, and optionally to one task. Each
     row is one arm, in report order.
 
     The resource columns here are **totals** — the budget view, "what did this arm cost to
@@ -613,7 +625,7 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, st
         Results to plot — the full frame, or one task's slice.
     split_hue
         ``True`` for the per-task view (train + test as texture); ``False`` for the
-        overview (the reported test split only).
+        overview (the reported valid split only).
     colors
         Bar colour per model id, as returned by :func:`resolve_palette`. It may cover more
         models than ``df`` holds — one map resolved over the whole report is reused for
@@ -823,7 +835,9 @@ def _legend_arrow(*, width: float, height: float, **_unused: object) -> FancyArr
     )
 
 
-def tradeoff_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None) -> plt.Figure:
+def tradeoff_figure(
+    df: pd.DataFrame, *, colors: Mapping[str, str] | None = None, split: str = _REPORTED_SPLIT
+) -> plt.Figure:
     """Cost per run against success rate — where each skill version buys what, and at what price.
 
     The metrics grid reports every measure on its own axis, which answers "how much?" but never
@@ -860,7 +874,7 @@ def tradeoff_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None
     Parameters
     ----------
     df
-        Results from :func:`load_results`. Only the reported (test) split is plotted.
+        Results from :func:`load_results`. Only the reported (valid) split is plotted.
     colors
         Mark colour per model id, as returned by :func:`resolve_palette`; models missing from it
         fall back to their tier default, and ``None`` uses the defaults throughout.
@@ -876,10 +890,10 @@ def tradeoff_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None
     points = []
     for arm in arms:
         for model in [*models, _ALL_MODELS]:
-            cost, cost_err, present = _cell_value(df, arm, model, _REPORTED_SPLIT, "cost")
+            cost, cost_err, present = _cell_value(df, arm, model, split, "cost")
             if not present:
                 continue
-            rate, rate_err, _ = _cell_value(df, arm, model, _REPORTED_SPLIT, "rate")
+            rate, rate_err, _ = _cell_value(df, arm, model, split, "rate")
             points.append((arm, model, cost, cost_err, rate, rate_err))
 
     x_max = max((cost + err for _a, _m, cost, err, _r, _re in points), default=0.0) * 1.15 or 1.0
@@ -1047,6 +1061,107 @@ def tradeoff_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None
     return fig
 
 
+def _version_label(arm: str) -> str:
+    """Compact x-axis tick for the training curve — ``"No skill"`` then ``"v1"``, ``"v2"``, …"""
+    return "No skill" if arm == NOSKILL_ARM else (skill_from_arm(arm) or arm)
+
+
+def training_figure(df: pd.DataFrame, *, colors: Mapping[str, str] | None = None) -> plt.Figure:
+    """Success rate as the skill improves, version by version — the training curve.
+
+    The x-axis walks the arms in order (no skill, then v1, v2, …); the y-axis is the success
+    rate. Every model gets two lines, coloured by the model: a solid one over the valid tasks and
+    a dashed one over the train tasks, each arm measured on both splits. A grey pair pools every
+    model — the mean run at each version — and is drawn last so it stays legible where the model
+    lines overlap. A version with no runs on a split leaves a gap rather than a false zero, so the
+    newest version (valid only, never trained from) simply ends its train lines a step early.
+    """
+    arms = _arms_in_order(df)
+    models = _models_in_order(df)
+    resolved = colors or {}
+    colors = {model: resolved.get(model, _model_color(model)) for model in models}
+    colors[_ALL_MODELS] = _ALL_MODELS_COLOR
+    rows = _bar_rows(models)  # models, plus the pooled row when there is more than one
+    positions = list(range(len(arms)))
+
+    def rates(model: str, split: str) -> list[float]:
+        # NaN where a cell has no runs, so matplotlib breaks the line instead of inventing a zero.
+        return [
+            value if present else math.nan
+            for arm in arms
+            for value, _err, present in [_cell_value(df, arm, model, split, "rate")]
+        ]
+
+    with plt.rc_context(_RC):
+        width = 2.2 + 0.85 * len(arms) + 1.8  # plot columns + the two legends on the right
+        fig, ax = plt.subplots(figsize=(width, 4.2))
+
+        for model in rows:
+            pooled = model == _ALL_MODELS
+            for split in _SPLIT_ORDER:
+                ax.plot(
+                    positions,
+                    rates(model, split),
+                    color=colors[model],
+                    linestyle=_SPLIT_STYLE[split],
+                    marker="o",
+                    # The pooled pair is heavier and rides on top, with a surface ring on its
+                    # markers so it reads through the model lines it summarises.
+                    markersize=6 if pooled else 4,
+                    markeredgecolor=PLOT_BG,
+                    markeredgewidth=1.0 if pooled else 0.6,
+                    linewidth=2.6 if pooled else 1.6,
+                    zorder=4 if pooled else 3,
+                )
+
+        ax.set_xticks(positions)
+        ax.set_xticklabels([_version_label(arm) for arm in arms], fontsize=12)
+        ax.set_xlim(-0.3, len(arms) - 0.7)
+        ax.set_ylim(-0.02, 1.03)
+        ax.yaxis.set_major_formatter(mticker.PercentFormatter(1.0))
+        ax.tick_params(labelsize=12, length=0)
+        ax.set_ylabel("Success rate", fontsize=12)
+        ax.grid(axis="y", color=INK, alpha=0.14, linewidth=0.8)
+        ax.set_axisbelow(True)
+
+        model_handles = [
+            Line2D(
+                [],
+                [],
+                color=colors[m],
+                marker="o",
+                linestyle="none",
+                markersize=7,
+                markeredgecolor=PLOT_BG,
+                label=_row_label(m),
+            )
+            for m in rows
+        ]
+        fig.legend(
+            model_handles,
+            [_row_label(m) for m in rows],
+            title="model",
+            frameon=False,
+            loc="upper left",
+            bbox_to_anchor=(1.0, 0.98),
+            fontsize=10,
+            title_fontsize=11,
+        )
+        split_handles = [Line2D([], [], color=INK, linestyle=_SPLIT_STYLE[s], label=s) for s in _SPLIT_ORDER]
+        fig.legend(
+            split_handles,
+            list(_SPLIT_ORDER),
+            title="split",
+            frameon=False,
+            loc="upper left",
+            bbox_to_anchor=(1.0, 0.48),
+            fontsize=10,
+            title_fontsize=11,
+        )
+        fig.tight_layout()
+    return fig
+
+
 #: Pixel width every figure is rendered to, whatever its width in inches. Roughly twice the
 #: widest the text column ever gets, so the marks stay sharp on high-density screens and after
 #: the browser scales the image down to the column.
@@ -1118,19 +1233,21 @@ def _holm(pvalues: Sequence[float]) -> list[float]:
     return adjusted
 
 
-def _cluster_totals(df: pd.DataFrame, arms: Sequence[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Summed cost, successes and run counts per (task, arm) over the reported split.
+def _cluster_totals(
+    df: pd.DataFrame, arms: Sequence[str], *, split: str = _REPORTED_SPLIT
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Summed cost, successes and run counts per (task, arm) over one split.
 
     These are the sufficient statistics for the bootstrap: both metrics are ratios of sums, so a
     resample never has to touch an individual run again.
     """
-    test = df[df["split"] == _REPORTED_SPLIT]
-    clusters = sorted(test[_CLUSTER_COLUMN].unique())
+    reported = df[df["split"] == split]
+    clusters = sorted(reported[_CLUSTER_COLUMN].unique())
     shape = (len(clusters), len(arms))
     cost, successes, runs = np.zeros(shape), np.zeros(shape), np.zeros(shape)
     for ci, cluster in enumerate(clusters):
         for ai, arm in enumerate(arms):
-            rows = test[(test[_CLUSTER_COLUMN] == cluster) & (test["arm"] == arm)]
+            rows = reported[(reported[_CLUSTER_COLUMN] == cluster) & (reported["arm"] == arm)]
             run_cost = rows["cost_usd"]
             cost[ci, ai] = run_cost.sum() if run_cost.notna().all() else math.nan
             successes[ci, ai] = rows["success"].sum()
@@ -1227,7 +1344,13 @@ class SkillTests:
         return self.n_clusters >= _MIN_CLUSTERS and not self.comparisons.empty
 
 
-def skill_tests(df: pd.DataFrame, *, resamples: int = _BOOTSTRAP_RESAMPLES, seed: int = _BOOTSTRAP_SEED) -> SkillTests:
+def skill_tests(
+    df: pd.DataFrame,
+    *,
+    split: str = _REPORTED_SPLIT,
+    resamples: int = _BOOTSTRAP_RESAMPLES,
+    seed: int = _BOOTSTRAP_SEED,
+) -> SkillTests:
     """Test which skill versions beat which, on cost and success rate jointly.
 
     Deliberately reports no single combined score. Folding rate and cost into one number picks an
@@ -1244,13 +1367,16 @@ def skill_tests(df: pd.DataFrame, *, resamples: int = _BOOTSTRAP_RESAMPLES, seed
     Parameters
     ----------
     df
-        Results from :func:`load_results`. Only the reported (test) split is used.
+        Results from :func:`load_results`. Only the ``split`` below is used.
     resamples, seed
         Bootstrap size and its seed. The default seed is fixed so a rebuilt report reproduces
         its own p-values exactly.
+    split
+        Which split to test on. Defaults to the reported (valid) split; the held-out ``test``
+        section passes ``"test"``. Arms are drawn from the runs present in that split.
     """
-    arms = _arms_in_order(df)
-    cost, successes, runs = _cluster_totals(df, arms)
+    arms = _arms_in_order(df[df["split"] == split])
+    cost, successes, runs = _cluster_totals(df, arms, split=split)
     n_clusters = len(cost)
     baseline = arms[0] if arms else NOSKILL_ARM  # noskill sorts first when it is present
     empty = pd.DataFrame(columns=["challenger", "reference", "d_rate", "d_cost", "p", "p_adjusted"])
@@ -1324,7 +1450,7 @@ def _fmt_p(p: float) -> str:
 #: and the *lowest* cost, and a reader scanning the bold cells for the winner should not have to
 #: keep track of which column runs which way. The first few describe an arm on its own; the rest
 #: compare it with the baseline.
-_TEST_COLUMNS = (
+_VALID_COLUMNS = (
     ("Success rate", "rate", True, lambda v: f"{v:.1%}"),
     ("Cost / run", "cost", False, lambda v: f"${v:.3f}"),
     ("On frontier", "frontier", True, lambda v: f"{v:.1%}"),
@@ -1368,7 +1494,7 @@ def _tests_table_html(tests: SkillTests) -> str:
         )
 
     by_arm = {row.challenger: row for row in tests.comparisons.itertuples()}
-    compared = [field for _title, field, _highest, _fmt in _TEST_COLUMNS[_ARM_COLUMNS:]]
+    compared = [field for _title, field, _highest, _fmt in _VALID_COLUMNS[_ARM_COLUMNS:]]
     records = []
     for row in tests.arms.itertuples():
         match = by_arm.get(row.arm)
@@ -1380,21 +1506,21 @@ def _tests_table_html(tests: SkillTests) -> str:
         )
     best = [
         _best_cells([record[field] for record in records], highest=highest)
-        for _title, field, highest, _fmt in _TEST_COLUMNS
+        for _title, field, highest, _fmt in _VALID_COLUMNS
     ]
 
     body = []
     for index, (arm, record) in enumerate(zip(tests.arms["arm"], records, strict=True)):
         cells = [f"<td>{_skill_label(arm)}</td>"]
-        for column, (_title, field, _highest, fmt) in enumerate(_TEST_COLUMNS):
+        for column, (_title, field, _highest, fmt) in enumerate(_VALID_COLUMNS):
             value = record[field]
             text = "&mdash;" if value is None else fmt(value)
             cells.append(f"<td><strong>{text}</strong></td>" if index in best[column] else f"<td>{text}</td>")
         body.append(f"<tr>{''.join(cells)}</tr>")
 
-    own = "".join(f'<th rowspan="2">{title}</th>' for title, *_ in _TEST_COLUMNS[:_ARM_COLUMNS])
-    versus = "".join(f"<th>{title}</th>" for title, *_ in _TEST_COLUMNS[_ARM_COLUMNS:])
-    span = len(_TEST_COLUMNS) - _ARM_COLUMNS
+    own = "".join(f'<th rowspan="2">{title}</th>' for title, *_ in _VALID_COLUMNS[:_ARM_COLUMNS])
+    versus = "".join(f"<th>{title}</th>" for title, *_ in _VALID_COLUMNS[_ARM_COLUMNS:])
+    span = len(_VALID_COLUMNS) - _ARM_COLUMNS
     return f"""<div class="table-center"><table class="tests">
 <thead>
 <tr><th rowspan="2">Skill</th>{own}<th colspan="{span}">Compared with {_skill_label(tests.baseline)}</th></tr>
@@ -1402,6 +1528,33 @@ def _tests_table_html(tests: SkillTests) -> str:
 </thead>
 <tbody>{"".join(body)}</tbody>
 </table></div>"""
+
+
+def _paired_delta(loaded: pd.DataFrame, base_rate: pd.Series) -> tuple[float, float, float]:
+    """Success rate, matched baseline, and their difference over the ``loaded`` runs.
+
+    Every loaded run is paired with ``base_rate`` on its own ``(task_id, model)`` and the per-run
+    differences are averaged, so the delta measures the improvement on the tasks that loaded
+    rather than a comparison against the baseline's whole task mix. Runs with no baseline to pair
+    against are dropped; an empty or all-unpaired input returns NaNs. The returned ``rate`` and
+    ``baseline`` are means over the paired runs, so ``delta == rate - baseline`` always holds.
+    """
+    if loaded.empty:
+        return math.nan, math.nan, math.nan
+    matched = np.array(
+        [
+            base_rate.get((task, model), math.nan)
+            for task, model in zip(loaded["task_id"], loaded["model"], strict=True)
+        ],
+        dtype=float,
+    )
+    success = loaded["success"].to_numpy(dtype=float)
+    pair = ~np.isnan(matched)
+    if not pair.any():
+        return math.nan, math.nan, math.nan
+    rate = float(success[pair].mean())
+    baseline = float(matched[pair].mean())
+    return rate, baseline, rate - baseline
 
 
 def loaded_only_rates(df: pd.DataFrame) -> pd.DataFrame:
@@ -1413,59 +1566,47 @@ def loaded_only_rates(df: pd.DataFrame) -> pd.DataFrame:
     the thing to fix is the frontmatter ``description`` rather than the guidance — and the load
     rate varies enormously by model, so the dilution is uneven across the matrix.
 
-    This is the overview's comparison with those runs held out instead of counted against the
-    skill. It is deliberately *not* the headline number: conditioning on load is conditioning on
-    something the agent chose, so the loaded runs are not a random subset and this cannot prove
-    a skill works. It answers the narrower question — when the guidance did reach the agent, did
-    it help? — and separates a description problem from a content problem.
+    This is the overview's comparison with the non-loading runs held out instead of counted
+    against the skill. Each loaded run is paired with the baseline on its own task and model, and
+    those per-run differences are averaged, so the delta is a real effect and does not depend on
+    which tasks happened to load. It answers the narrower question of whether the guidance helped
+    where it reached the agent, and separates a description problem (the skill does not load) from
+    a content problem (it loads and does not help). It is still measured only on the tasks that
+    loaded, and it is a point estimate rather than a significance test, so on its own it cannot
+    prove a skill works.
 
-    Two pooled rows close each skill, and the pair is the point. ``all models`` pools every
-    model in the arm; ``models that loaded`` restricts **both sides** to the models that
-    contributed at least one loaded run. When they disagree, the gap is model mix rather than
-    skill effect — a model that fails every run (an outage, an unavailable id) sits in the
-    all-models baseline while contributing nothing to the loaded column, which on its own would
-    manufacture a gain out of an absence. Reporting only the matched row would hide that the
-    arm's headline moved; reporting only the raw row would credit the skill for it.
+    A pooled ``all models`` row closes each skill, pairing every loaded run in the arm with its
+    own (task, model) baseline. A model with no loaded runs contributes nothing to the pool, and
+    the pairing already leaves its baseline out, so no separate model-matched row is needed.
 
     Returns
     -------
-    One row per (arm, model) over the reported split, then the two pooled rows per arm.
-    Columns: ``arm``, ``model``, ``scope`` (``"model"``, ``"all"`` or ``"matched"``),
-    ``loaded``, ``runs``, ``load_rate``, ``baseline``, ``overall`` (the arm's rate over every
-    run, which is what the overview reports), ``rate`` (successes among loaded runs only), and
-    ``delta`` (``rate - baseline``). ``overall`` and ``rate`` are shown side by side because the
-    distance between them *is* the dilution the non-loading runs cause. ``rate`` is ``NaN``
-    where nothing loaded, and ``baseline`` is ``NaN`` where that model has no baseline runs.
+    One row per (arm, model) over the reported split, then a pooled ``all models`` row per arm.
+    Columns: ``arm``, ``model``, ``scope`` (``"model"`` or ``"all"``), ``loaded``, ``runs``,
+    ``load_rate``, ``baseline`` (mean baseline over the same (task, model) cells the loaded runs
+    cover), ``overall`` (the arm's rate over every run), ``rate`` (success over the loaded runs),
+    and ``delta`` (``rate - baseline``, the mean per-run improvement on the tasks that loaded).
+    ``rate``, ``baseline`` and ``delta`` are ``NaN`` where nothing loaded or nothing could be
+    paired against a baseline.
     """
-    test = df[df["split"] == _REPORTED_SPLIT]
-    arms = [arm for arm in _arms_in_order(test) if arm != NOSKILL_ARM]
-    base = test[test["arm"] == NOSKILL_ARM]
+    reported = df[df["split"] == _REPORTED_SPLIT]
+    arms = [arm for arm in _arms_in_order(reported) if arm != NOSKILL_ARM]
+    base = reported[reported["arm"] == NOSKILL_ARM]
+    # Baseline success on each (task, model). A loaded run is compared with the baseline on the
+    # very same task and model, so the delta is not swayed by which tasks happened to load.
+    base_rate = base.groupby(["task_id", "model"])["success"].mean() if not base.empty else pd.Series(dtype=float)
     records: list[dict[str, object]] = []
     for arm in arms:
-        subset = test[test["arm"] == arm]
-        contributing = {
-            model for model in subset["model"].unique() if _loaded_flags(subset[subset["model"] == model]).any()
-        }
-        plan: list[tuple[str, object, pd.DataFrame, pd.DataFrame]] = [
-            ("model", model, subset[subset["model"] == model], base[base["model"] == model])
-            for model in _models_in_order(subset)
+        subset = reported[reported["arm"] == arm]
+        plan: list[tuple[str, object, pd.DataFrame]] = [
+            ("model", model, subset[subset["model"] == model]) for model in _models_in_order(subset)
         ]
-        plan.append(("all", _ALL_MODELS, subset, base))
-        plan.append(
-            (
-                "matched",
-                _LOADED_MODELS,
-                subset[subset["model"].isin(contributing)],
-                base[base["model"].isin(contributing)],
-            )
-        )
-        for scope, model, runs, reference in plan:
+        plan.append(("all", _ALL_MODELS, subset))
+        for scope, model, runs in plan:
             if runs.empty:
                 continue
             loaded = runs[_loaded_flags(runs)]
-            rate = float(loaded["success"].mean()) if len(loaded) else math.nan
-            overall = float(runs["success"].mean())
-            baseline = float(reference["success"].mean()) if len(reference) else math.nan
+            rate, baseline, delta = _paired_delta(loaded, base_rate)
             records.append(
                 {
                     "arm": arm,
@@ -1475,11 +1616,9 @@ def loaded_only_rates(df: pd.DataFrame) -> pd.DataFrame:
                     "runs": len(runs),
                     "load_rate": len(loaded) / len(runs),
                     "baseline": baseline,
-                    # The arm as it ran (what the overview reports) beside the arm with the
-                    # non-loading runs held out. The gap between them is the dilution.
-                    "overall": overall,
+                    "overall": float(runs["success"].mean()),
                     "rate": rate,
-                    "delta": rate - baseline,
+                    "delta": delta,
                 }
             )
     return pd.DataFrame.from_records(records, columns=_LOADED_COLUMNS)
@@ -1499,68 +1638,170 @@ _LOADED_COLUMNS = (
     "delta",
 )
 
-#: Sentinel for the pooled row that restricts both sides to the models which loaded the skill,
-#: alongside :data:`_ALL_MODELS` for the row that pools the arm as it actually ran.
-_LOADED_MODELS = "\x00loaded-models"
-_LOADED_MODELS_LABEL = "models that loaded"
+#: The diverging colour scale for the loaded dotplot: loss red → light neutral → gain green, the
+#: same red/green a delta wears in the tables. Models are the *rows* here, not a colour, so this
+#: scale has the whole colour channel to itself. A numeric Δ rides every dot, so the red/green is
+#: never the sole carrier of the value — the label is the colourblind-safe reading of the sign.
+_DELTA_LOSS = "#a4553f"
+_DELTA_GAIN = "#3f6b4a"
+_DELTA_MID = "#efe9de"  # a light warm neutral, so a near-zero delta recedes toward the page
+_DELTA_CMAP = LinearSegmentedColormap.from_list("loaded-delta", [_DELTA_LOSS, _DELTA_MID, _DELTA_GAIN])
 
-#: Loaded runs below this count are reported without a direction. The rate is still shown —
-#: it is what was measured — but a delta off one or two runs is noise wearing a percentage,
-#: and colouring it green would read as a finding.
-_MIN_LOADED = 5
+#: Dot area (matplotlib scatter ``s``, in points²): proportional to the load rate (so the radius
+#: goes as its root), capped at :data:`_DOT_AREA_MAX` at a rate of 1 and floored at
+#: :data:`_DOT_AREA_MIN` so a small-but-nonzero rate is still a visible dot rather than a speck.
+_DOT_AREA_MAX = 1500.0
+_DOT_AREA_MIN = 90.0
+#: A cell where the skill never loaded draws a small hollow ring at this area. It reads as never
+#: measured, which is a different thing from a measured zero.
+_DOT_AREA_EMPTY = 70.0
+#: A filled dot at least this large backs its own Δ label, so the label sits inside it (white or
+#: ink by the fill's luminance). Smaller dots carry the label just beneath instead.
+_DOT_AREA_LABEL_INSIDE = 760.0
 
 
-def _loaded_table_html(df: pd.DataFrame) -> str:
-    """The loaded-only comparison: one row per model per skill, pooled row per skill."""
+def _signed_pct(value: float) -> str:
+    """A signed percentage for a delta.
+
+    ``"+33%"`` / ``"-17%"``, and ``"0%"`` when it rounds to nothing (never ``"-0%"``: the sign
+    would claim a direction the rounding just erased).
+    """
+    return "0%" if round(value, 2) == 0 else f"{value:+.0%}"
+
+
+def _dot_area(load_rate: float) -> float:
+    """Scatter area for a load rate — proportional, floored so a low rate stays visible."""
+    return max(_DOT_AREA_MIN, load_rate * _DOT_AREA_MAX)
+
+
+def _luminance(rgb: tuple[float, float, float]) -> float:
+    """Rough relative luminance of an RGB triple, for choosing ink vs. white text on a fill."""
+    r, g, b = rgb[:3]
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def loaded_dotplot_figure(df: pd.DataFrame) -> plt.Figure:
+    """The loaded-only comparison as a dot grid — one dot per (model, skill version).
+
+    Rows are the models, most-potent first, with a pooled *all models* row set off at the bottom.
+    Columns are the skill versions. Each dot's **colour** is the change in success rate against
+    the baseline on the same task and model, over the runs that loaded the skill (green better,
+    red worse, a light neutral at no change), and its **area** is the load rate, so a big green dot reads
+    "loaded often and helped" and a small one "rarely loaded". The numeric Δ rides every dot, so
+    the red/green never carries the value alone (the colourblind-safe reading is the label). A
+    hollow ring marks a cell where the skill never loaded, which reads as no evidence rather than
+    a measured zero.
+    """
     table = loaded_only_rates(df)
-    if table.empty:
-        return '<div class="note">No skill arm to compare — this report covers the baseline only.</div>'
+    table = table[table["scope"].isin(("model", "all"))]
+    arms = [arm for arm in _arms_in_order(df) if arm != NOSKILL_ARM]
+    present = {m for m in table["model"] if m != _ALL_MODELS}
+    models = [m for m in _models_in_order(df) if m in present]
+    # The pooled row restates the single model when there is only one, so it is left out then —
+    # the same rule the metrics grid uses for its pooled bar (see :func:`_bar_rows`).
+    has_pool = len(models) > 1
+    row_models = [*models, *([_ALL_MODELS] if has_pool else [])]
 
-    def pct(value: float) -> str:
-        return "&mdash;" if pd.isna(value) else f"{value:.0%}"
+    by_key = {(row.arm, row.model): row for row in table.itertuples()}
 
-    def signed(value: float) -> str:
-        # A difference that rounds to nothing is written "0%", never "-0%": the sign would
-        # claim a direction the rounding just erased.
-        return "0%" if round(value, 2) == 0 else f"{value:+.0%}"
+    n = len(models)
+    pool_y = n + 0.4  # an extra half-slot of air above the pooled row
+    y_of: dict[object, float] = {m: float(i) for i, m in enumerate(models)}
+    if has_pool:
+        y_of[_ALL_MODELS] = pool_y
+    y_bottom = pool_y if has_pool else n - 1
 
-    labels = {"all": _ALL_MODELS_LABEL, "matched": _LOADED_MODELS_LABEL}
-    thin = False
-    body = []
-    for row in table.itertuples():
-        pooled = row.scope != "model"
-        label = labels.get(row.scope) or _model_label(row.model)
-        if pd.isna(row.delta):
-            delta = "&mdash;"
-        elif row.loaded < _MIN_LOADED:
-            # Shown, but undressed: too few runs to read a direction from.
-            thin = True
-            delta = f"{signed(row.delta)}&#8203;<sup>†</sup>"
-        elif round(row.delta, 2) == 0:
-            delta = signed(row.delta)
-        else:
-            delta = f'<span class="{"gain" if row.delta > 0 else "loss"}">{signed(row.delta)}</span>'
-        cells = (
-            f"<td>{_skill_label(row.arm)}</td><td>{html.escape(label)}</td>"
-            f"<td>{row.loaded}/{row.runs}</td><td>{pct(row.load_rate)}</td>"
-            f"<td>{pct(row.baseline)}</td><td>{pct(row.overall)}</td>"
-            f"<td>{pct(row.rate)}</td><td>{delta}</td>"
+    deltas = table["delta"].dropna().abs()
+    reach = float(deltas.max()) if len(deltas) else 0.0
+    # Symmetric about zero so the neutral midpoint is a true no-change; rounded up to a tenth and
+    # floored at 0.1 so a tiny spread is not stretched into a full red/green swing.
+    m = max(0.1, math.ceil(reach * 10) / 10)
+    norm = TwoSlopeNorm(vmin=-m, vcenter=0.0, vmax=m)
+
+    with plt.rc_context(_RC):
+        # Kept close to square per cell and not much wider than it needs to be: the page scales the
+        # figure to one text column, so an over-wide figure just renders every label small.
+        width = 1.9 + 0.95 * len(arms) + 1.5  # plot columns + the size legend to the right
+        height = 0.9 + 0.85 * len(row_models) + 1.2  # rows (roomy, so full dots never touch) + bar
+        fig, ax = plt.subplots(figsize=(width, height))
+
+        for xi, arm in enumerate(arms):
+            for model in row_models:
+                row = by_key.get((arm, model))
+                if row is None:
+                    continue  # this model was not run in this arm: reserve the slot, draw nothing
+                y = y_of[model]
+                if pd.isna(row.delta) or row.load_rate == 0:
+                    ax.scatter(
+                        [xi], [y], s=_DOT_AREA_EMPTY, facecolors="none", edgecolors=INK, linewidths=1.0, zorder=3
+                    )
+                    ax.text(xi, y + 0.36, "—", ha="center", va="center", fontsize=11, color=BAR, zorder=4)
+                    continue
+                area = _dot_area(row.load_rate)
+                fill = _DELTA_CMAP(norm(row.delta))
+                ax.scatter([xi], [y], s=area, color=fill, edgecolors=PLOT_BG, linewidths=1.2, zorder=3)
+                text = _signed_pct(row.delta)
+                if area >= _DOT_AREA_LABEL_INSIDE:
+                    ink = "#ffffff" if _luminance(fill) < 0.55 else INK
+                    ax.text(
+                        xi, y, text, ha="center", va="center", fontsize=10.5, fontweight="bold", color=ink, zorder=4
+                    )
+                else:
+                    ax.text(xi, y + 0.40, text, ha="center", va="center", fontsize=10.5, color=INK, zorder=4)
+
+        ax.set_xticks(range(len(arms)))
+        ax.set_xticklabels([_skill_label(arm) for arm in arms], fontsize=12)
+        yticks = [*range(n), *([pool_y] if has_pool else [])]
+        ylabels = [*(_model_label(model) for model in models), *(["all models"] if has_pool else [])]
+        ax.set_yticks(yticks)
+        ax.set_yticklabels(ylabels, fontsize=12)
+        ax.set_xlim(-0.5, len(arms) - 0.5)
+        ax.set_ylim(-0.6, y_bottom + 0.6)
+        ax.invert_yaxis()  # first model (most potent) on top, pooled row at the bottom
+        if has_pool:
+            ax.axhline((n - 1 + pool_y) / 2, color=INK, alpha=0.16, linewidth=0.8)
+        ax.tick_params(length=0)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        sm = ScalarMappable(norm=norm, cmap=_DELTA_CMAP)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax, orientation="horizontal", fraction=0.05, pad=0.12, aspect=26)
+        cbar.set_ticks([-m, 0.0, m])
+        cbar.set_ticklabels([f"{-m:+.0%}", "0%", f"{m:+.0%}"])
+        cbar.ax.tick_params(labelsize=11, length=0)
+        cbar.set_label("Δ success rate when loaded (green better, red worse)", fontsize=12)
+        cbar.outline.set_visible(False)
+
+        # A compact size key: three matching dots, spaced just clear of one another.
+        size_rates = [0.33, 0.66, 1.0]
+        size_handles = [
+            Line2D(
+                [],
+                [],
+                marker="o",
+                linestyle="none",
+                markerfacecolor="#c9c2b4",
+                markeredgecolor=PLOT_BG,
+                markersize=2 * math.sqrt(_dot_area(r) / math.pi),
+            )
+            for r in size_rates
+        ]
+        fig.legend(
+            size_handles,
+            [f"{r:.0%}" for r in size_rates],
+            title="Load rate",
+            frameon=False,
+            loc="center left",
+            bbox_to_anchor=(1.0, 0.5),
+            labelspacing=2.4,
+            borderpad=1.0,
+            handletextpad=1.4,
+            fontsize=12,
+            title_fontsize=12,
         )
-        body.append(f'<tr class="{"pooled" if pooled else ""}">{cells}</tr>')
-
-    footnote = (
-        f'<p class="task-desc">† fewer than {_MIN_LOADED} loaded runs — the rate is what was '
-        "measured, but the difference is not readable at that count.</p>"
-        if thin
-        else ""
-    )
-    return f"""<div class="table-center"><table class="tests loaded">
-<thead><tr>
-<th>Skill</th><th>Model</th><th>Loaded</th><th>Load rate</th>
-<th>Baseline</th><th>All runs</th><th>When loaded</th><th>&Delta; loaded</th>
-</tr></thead>
-<tbody>{"".join(body)}</tbody>
-</table>{footnote}</div>"""
+        fig.tight_layout()
+    return fig
 
 
 @dataclass(frozen=True)
@@ -1742,7 +1983,7 @@ def _runs_table_html(df: pd.DataFrame, out_dir: Path) -> str:
 
 
 _STYLE = f"""
-:root {{ color-scheme: light; --ink: {INK}; --page: {PAGE}; --surface: {SURFACE}; --bar: {BAR}; }}
+{PALETTE_ROOT_CSS}
 * {{ box-sizing: border-box; }}
 html {{ scroll-behavior: smooth; }}
 body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin: 0; line-height: 1.5;
@@ -1777,14 +2018,10 @@ th, td {{ border: 1px solid {INK}22; padding: 0.3rem 0.55rem; text-align: right;
 th:first-child, td:first-child {{ text-align: left; }}
 thead th {{ background: {BAR}1a; }}
 tbody tr:nth-child(even) td {{ background: {INK}08; }}
-tr.fail td {{ background: {ACCENT}66; }}
-/* The loaded-only table names models in its second column, and closes each skill with a
-   pooled row summarising the ones above it. The delta's sign carries the direction; colour
-   only reinforces it, so the pair is never read by hue alone. */
-table.loaded td:nth-child(2) {{ text-align: left; }}
-table.loaded tr.pooled td {{ font-weight: 600; background: {BAR}1f; }}
-.gain {{ color: #3f6b4a; }}
-.loss {{ color: #a4553f; }}
+/* Outrank the zebra rule above: as ``tr.fail td`` it scores below ``tbody tr:nth-child(even)
+   td``, so a failed run on an even row keeps the stripe and never lights up. Matching that
+   selector's specificity (and sitting after it) lets the fail tint win on every row. */
+tbody tr.fail td {{ background: {ACCENT}66; }}
 /* Sorting affordances appear only once the script has wired the table up, so with JS off
    nothing invites a click that would do nothing. The arrow is padded for, not floated over
    the label, so the heading does not shift when the column becomes the sorted one. */
@@ -1800,30 +2037,27 @@ table.sortable thead th[aria-sort="descending"]::after {{ content: "\\2193"; opa
 .skill-miss {{ color: #a4432b; font-weight: 700; }}
 .note {{ background: {ACCENT}55; border-left: 3px solid var(--bar); padding: 0.5rem 0.8rem;
         margin: 0.5rem 0; border-radius: 3px; }}
-.rationale {{ margin: 0.3rem 0 0.8rem; white-space: pre-wrap; }}
-/* Split diff: old version left, new version right, one bordered box per changed file. */
-.diff {{ background: var(--surface); border: 1px solid {INK}22; border-radius: 4px;
-        overflow-x: auto; margin: 0.4rem 0 1.4rem; }}
-.diff-file {{ color: {INK}; font-weight: 700; padding: 0.4rem 0.8rem;
-        border-bottom: 1px solid {INK}22; font-size: 0.82rem;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
-table.diff-table {{ display: table; table-layout: fixed; width: 100%; min-width: 34rem; margin: 0;
-        border-collapse: collapse; overflow-x: visible; font-size: 0.82rem; line-height: 1.35;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
-table.diff-table td {{ border: 0; padding: 0 0.5rem; text-align: left; vertical-align: top;
-        white-space: pre-wrap; overflow-wrap: anywhere; background: none; }}
-table.diff-table td.ln {{ width: 2.8rem; text-align: right; user-select: none;
-        color: {INK}77; background: {INK}0a; }}
-table.diff-table tr.diff-head td {{ color: {BAR}; font-weight: 600; background: {INK}0a;
-        border-bottom: 1px solid {INK}22; }}
-table.diff-table tr.diff-gap td {{ color: {INK}77; text-align: center; background: {INK}0a;
-        border-top: 1px solid {INK}22; border-bottom: 1px solid {INK}22; }}
-table.diff-table td.diff-add {{ background: #4c7a3322; color: #2f5d1c; }}
-table.diff-table td.diff-del {{ background: #a4432b22; color: #8a2f1b; }}
-table.diff-table td.diff-none {{ background: {INK}0a; }}
-table.diff-table td.diff-ctx {{ color: {INK}bb; }}
-table.diff-table td.diff-add mark {{ background: #4c7a3355; color: inherit; }}
-table.diff-table td.diff-del mark {{ background: #a4432b55; color: inherit; }}
+/* The rationale/feedback is authored in markdown and rendered to HTML (see
+   acumen.markdown.render_markdown), so these scope its elements to the block rather than
+   leaning on the page's global rules. Headings render at <h3>+ and are toned down so they
+   never compete with the section's own "Skill vN" heading. */
+.rationale {{ margin: 0.3rem 0 0.8rem; }}
+.rationale > :first-child {{ margin-top: 0; }}
+.rationale > :last-child {{ margin-bottom: 0; }}
+.rationale p {{ margin: 0.3rem 0; }}
+.rationale h3, .rationale h4, .rationale h5, .rationale h6 {{
+        font-size: 0.95rem; font-weight: 700; margin: 0.7rem 0 0.3rem; }}
+.rationale ul, .rationale ol {{ margin: 0.3rem 0 0.6rem; padding-left: 1.4rem; }}
+.rationale li {{ margin: 0.15rem 0; }}
+.rationale code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.86em; background: var(--surface); border: 1px solid {INK}22;
+        border-radius: 3px; padding: 0.05rem 0.25rem; }}
+.rationale pre {{ background: var(--surface); border: 1px solid {INK}22; border-radius: 4px;
+        padding: 0.5rem 0.8rem; overflow-x: auto; margin: 0.4rem 0; }}
+.rationale pre code {{ background: none; border: 0; padding: 0; font-size: 0.82rem; }}
+/* Split diff: old version left, new version right, one bordered box per changed file.
+   Shared with the transcript renderer — see acumen.theme.DIFF_CSS. */
+{DIFF_CSS}
 section {{ margin-top: 2.5rem; scroll-margin-top: 1rem; }}
 @media (max-width: 720px) {{
   body {{ display: block; }}
@@ -1905,131 +2139,6 @@ def _task_desc_html(task: Task) -> str:
     return "".join(parts)
 
 
-#: Unchanged lines kept on either side of a change, as in ``diff -u``. Longer untouched runs
-#: collapse to a single marker row, so a version bump reads as only what actually moved.
-_DIFF_CONTEXT = 3
-
-#: Below this line-similarity the two sides of a replaced row are treated as unrelated text,
-#: so the row is tinted whole instead of being picked apart into confetti-sized highlights.
-_DIFF_INLINE_RATIO = 0.5
-
-
-@dataclass(frozen=True)
-class _DiffRow:
-    """One row of a split diff: the same logical line on each side, either side possibly absent.
-
-    ``kind`` is the change type from :class:`difflib.SequenceMatcher` (``equal``, ``replace``,
-    ``delete``, ``insert``), plus ``gap`` for the marker standing in for an elided run of
-    unchanged lines. A side is ``None`` where that version has no line there at all — a pure
-    insertion has no left-hand text — and renders as an inert filler cell.
-    """
-
-    kind: str
-    left_no: int | None
-    left: str | None
-    right_no: int | None
-    right: str | None
-
-
-def _equal_rows(before: list[str], after: list[str], i: int, j: int, count: int) -> list[_DiffRow]:
-    """``count`` rows of unchanged text, starting at line ``i`` on the left and ``j`` on the right."""
-    return [_DiffRow("equal", i + k + 1, before[i + k], j + k + 1, after[j + k]) for k in range(count)]
-
-
-def _split_diff_rows(before: list[str], after: list[str]) -> list[_DiffRow]:
-    """Align two versions of a file into side-by-side rows, old on the left, new on the right.
-
-    Changed runs pair off line by line, so a rewritten paragraph sits opposite its replacement
-    rather than being stacked below it; where one side runs out, the other continues against
-    filler. Unchanged stretches beyond :data:`_DIFF_CONTEXT` lines from any change collapse to
-    a gap row.
-    """
-    rows: list[_DiffRow] = []
-    opcodes = difflib.SequenceMatcher(a=before, b=after, autojunk=False).get_opcodes()
-    for index, (tag, i1, i2, j1, j2) in enumerate(opcodes):
-        if tag == "equal":
-            head = _DIFF_CONTEXT if index > 0 else 0
-            tail = _DIFF_CONTEXT if index < len(opcodes) - 1 else 0
-            if i2 - i1 > head + tail:
-                rows += _equal_rows(before, after, i1, j1, head)
-                rows.append(_DiffRow("gap", None, None, None, None))
-                rows += _equal_rows(before, after, i2 - tail, j2 - tail, tail)
-            else:
-                rows += _equal_rows(before, after, i1, j1, i2 - i1)
-            continue
-        left, right = before[i1:i2], after[j1:j2]
-        for k in range(max(len(left), len(right))):
-            has_left, has_right = k < len(left), k < len(right)
-            rows.append(
-                _DiffRow(
-                    tag,
-                    i1 + k + 1 if has_left else None,
-                    left[k] if has_left else None,
-                    j1 + k + 1 if has_right else None,
-                    right[k] if has_right else None,
-                )
-            )
-    return rows
-
-
-def _inline_pair(left: str, right: str) -> tuple[str, str]:
-    """Both sides of a replaced line, escaped, with the words that differ wrapped in ``<mark>``.
-
-    The comparison runs over words rather than characters, so a changed word lights up whole
-    instead of down to the letters it happens to share with its replacement. Lines too
-    dissimilar to be a rewrite of one another are left unmarked — highlighting nearly every
-    word says less than the row tint already does.
-    """
-    a, b = re.findall(r"\w+|\W", left), re.findall(r"\w+|\W", right)
-    matcher = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
-    if matcher.ratio() < _DIFF_INLINE_RATIO:
-        return html.escape(left), html.escape(right)
-    marked = ["", ""]
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        for side, tokens, start, end in ((0, a, i1, i2), (1, b, j1, j2)):
-            chunk = html.escape("".join(tokens[start:end]))
-            if chunk:
-                marked[side] += chunk if tag == "equal" else f"<mark>{chunk}</mark>"
-    return marked[0], marked[1]
-
-
-def _diff_cells(number: int | None, text: str | None, marked: str | None, cls: str) -> str:
-    """The line-number and content cell for one side of a row, or filler where that side is empty."""
-    if text is None:
-        return '<td class="ln"></td><td class="diff-none"></td>'
-    body = marked if marked is not None else html.escape(text)
-    return f'<td class="ln">{number}</td><td class="{cls}">{body or "&nbsp;"}</td>'
-
-
-def _split_diff_table(rel: str, before: list[str], after: list[str], labels: tuple[str, str]) -> str:
-    """One file's split diff as a table: line numbers and text for each version, side by side."""
-    body: list[str] = []
-    for row in _split_diff_rows(before, after):
-        if row.kind == "gap":
-            body.append('<tr class="diff-gap"><td colspan="4">&hellip;</td></tr>')
-            continue
-        left_mark = right_mark = None
-        if row.kind == "replace" and row.left is not None and row.right is not None:
-            left_mark, right_mark = _inline_pair(row.left, row.right)
-        left_cls = "diff-ctx" if row.kind == "equal" else "diff-del"
-        right_cls = "diff-ctx" if row.kind == "equal" else "diff-add"
-        body.append(
-            "<tr>"
-            + _diff_cells(row.left_no, row.left, left_mark, left_cls)
-            + _diff_cells(row.right_no, row.right, right_mark, right_cls)
-            + "</tr>"
-        )
-    head = (
-        f'<tr class="diff-head"><td class="ln"></td><td>{html.escape(labels[0])}</td>'
-        f'<td class="ln"></td><td>{html.escape(labels[1])}</td></tr>'
-    )
-    return (
-        f'<div class="diff"><div class="diff-file">{html.escape(rel)}</div>'
-        f'<table class="diff-table"><thead>{head}</thead>'
-        f"<tbody>{''.join(body)}</tbody></table></div>"
-    )
-
-
 def _skill_diff_html(parent: dict[str, str] | None, child: dict[str, str], labels: tuple[str, str]) -> str:
     """Split diff of a skill version's content against its parent, one table per changed file.
 
@@ -2093,8 +2202,8 @@ def _skills_section_html(df: pd.DataFrame, skills_root: Path | None) -> tuple[st
             f'<h3 id="{html.escape(anchor)}">Skill {html.escape(version)}</h3>'
             f'<p class="task-desc">{provenance}'
             f"{f' &middot; {html.escape(hash_short)}…' if hash_short else ''}</p>"
-            f'<p class="rationale">{html.escape(rationale)}</p>'
-            f"{f'<p class="rationale"><em>Maintainer feedback:</em> {html.escape(feedback)}</p>' if feedback else ''}"
+            f'<div class="rationale">{render_markdown(rationale)}</div>'
+            f"{f'<div class="rationale"><p><em>Maintainer feedback:</em></p>{render_markdown(feedback)}</div>' if feedback else ''}"
             f"{_skill_diff_html(parent_content, content, (parent_version or '', version))}"
         )
         toc.append(f'<li><a href="#{html.escape(anchor)}">Skill {html.escape(version)}</a></li>')
@@ -2147,7 +2256,55 @@ def render_report(
     colors = resolve_palette(_models_in_order(df), palette)
     overview_uri = figure_data_uri(metrics_figure(df, split_hue=False, colors=colors))
     tradeoff_uri = figure_data_uri(tradeoff_figure(df, colors=colors))
+    # The training curve needs at least one skill version to trace; a baseline-only report has
+    # nothing to plot across, so the whole subsection (and its TOC entry) is dropped.
+    has_versions = len([arm for arm in _arms_in_order(df) if arm != NOSKILL_ARM]) >= 1
+    if has_versions:
+        training_uri = figure_data_uri(training_figure(df, colors=colors))
+        training_block = (
+            '<h3 id="training">Success across versions</h3>'
+            '<p class="task-desc">Each line follows one model\'s success rate as the skill goes from'
+            " no skill through each version. Solid lines are the valid tasks and dashed lines are the"
+            " train tasks. The grey line is the mean across models and sits on top. The newest"
+            " version has only valid runs, so the train lines stop one step short.</p>"
+            '<figure><img alt="Success rate across versions, by model and split"'
+            f' src="{training_uri}"></figure>'
+        )
+        training_toc = '<li><a href="#training">Success across versions</a></li>\n'
+    else:
+        training_block = ""
+        training_toc = ""
+    # The loaded dotplot only exists once there is a skill arm to compare; a baseline-only report
+    # keeps the note the table used to show.
+    if loaded_only_rates(df).empty:
+        loaded_body = '<div class="note">No skill arm to compare — this report covers the baseline only.</div>'
+    else:
+        loaded_uri = figure_data_uri(loaded_dotplot_figure(df))
+        loaded_body = (
+            '<figure><img alt="Change in success rate when the skill loaded, by model and version"'
+            f' src="{loaded_uri}"></figure>'
+        )
     tests = skill_tests(df)
+    # The held-out test split is benched only at the end of a fit, on the best kept version and the
+    # baseline. It appears as its own section when those runs exist; otherwise it is omitted.
+    test_df = df[df["split"] == "test"]
+    if not test_df.empty and test_df["arm"].nunique() >= 2:
+        test_tradeoff_uri = figure_data_uri(tradeoff_figure(df, colors=colors, split="test"))
+        test_section = (
+            '<section id="test">\n<h2>Held-out test</h2>\n'
+            '<p class="task-desc">This is the truly held-out split. It is benched once at the very end'
+            " of a fit, on the best kept version and the baseline, and nothing in the loop ever sees it."
+            " Training learns from the train split and the best version is picked on valid, so the test"
+            " split is the first and only place the skill meets these tasks. Read it as the honest final"
+            " estimate of what the skill buys.</p>\n"
+            f'<figure><img alt="Cost per run against success rate on the held-out test split"'
+            f' src="{test_tradeoff_uri}"></figure>\n'
+            f"{_tests_table_html(skill_tests(df, split='test'))}\n</section>"
+        )
+        test_toc = '<li><a href="#test">Held-out test</a></li>\n'
+    else:
+        test_section = ""
+        test_toc = ""
     task_by_id = {t.id: t for t in tasks or []}
     skills_section, skills_toc = _skills_section_html(df, skills_root)
 
@@ -2170,9 +2327,10 @@ def render_report(
 <img class="toc-banner" src="{_asset_data_uri("banner.svg")}" alt="acumen">
 <div class="toc-title">acumen report</div>
 <ul>
-<li><a href="#overview">Overview</a><ul><li><a href="#tradeoff">Cost vs. success</a></li>
+<li><a href="#overview">Overview</a><ul>{training_toc}<li><a href="#tradeoff">Cost vs. success</a></li>
 <li><a href="#dominance">Is the difference real?</a></li>
 <li><a href="#loaded">Did it help when it actually loaded?</a></li></ul></li>
+{test_toc}
 <li><a href="#per-task">Per-task breakdown</a><ul>{"".join(toc_tasks)}</ul></li>
 {skills_toc}
 <li><a href="#runs">Runs</a></li>
@@ -2197,13 +2355,14 @@ def render_report(
 {toc}
 <main>
 <h1>acumen benchmark report</h1>
-<div class="meta">Generated {generated} &middot; {len(df)} runs &middot; test split shown
+<div class="meta">Generated {generated} &middot; {len(df)} runs &middot; figures show the valid split
  &middot; arms: {html.escape(arms)} &middot; tasks: {html.escape(tasks)}</div>
 {notes}
 <section id="overview">
 <h2>Overview</h2>
-<p class="task-desc">Per-run means over test runs; error bars are standard errors.</p>
+<p class="task-desc">Per-run means over the valid split; error bars are standard errors.</p>
 <figure><img alt="Success rate, tokens, cost and time per skill" src="{overview_uri}"></figure>
+{training_block}
 <h3 id="tradeoff">Cost vs. success</h3>
 <p class="task-desc">One mark per model and skill version, where colour is the model and the
  &#10005; is that model's no-skill baseline. Arrows join one model's own marks in version order,
@@ -2224,20 +2383,19 @@ def render_report(
  unit is the task rather than the run.</p>
 {_tests_table_html(tests)}
 <h3 id="loaded">Did it help when it actually loaded?</h3>
-<p class="task-desc">A skill-arm run where the skill never loaded is not evidence about the
- skill's body — the agent never read it, so the run measures the baseline with extra steps.
- Those runs are held out here instead of counted against the skill, which separates a
- <em>description</em> problem (the skill does not load) from a <em>content</em> problem (it
- loads and does not help). Load rate varies widely by model, so the dilution is uneven across
- the matrix. Two pooled rows close each skill, and the pair is the point: <em>all models</em>
- pools the arm as it actually ran, while <em>models that loaded</em> restricts both sides to the
- models that contributed a loaded run. Where the two disagree, the gap is model mix, not skill
- effect — a model that fails every run sits in the all-models baseline while contributing
- nothing to the loaded column. Read this as a diagnostic, not as the headline: conditioning on
- load conditions on something the agent chose, so the loaded runs are not a random subset and a
- gain here is not the same evidence as the test above.</p>
-{_loaded_table_html(df)}
+<p class="task-desc">If a skill never loads, the agent never reads it, so that run tells us nothing
+ about the skill itself and only measures the baseline. Setting those runs aside lets us see
+ whether the guidance helped in the runs where it did reach the agent. This helps tell apart a
+ skill that fails to load from one that loads but still doesn't help. In the plot below, every dot
+ is one model on one skill version. The colour shows the change in success rate against the
+ baseline, green for better and red for worse. The size shows how often the skill loaded, and a
+ hollow ring means it never did. Each loaded run is compared with the baseline on the very same
+ task and model, and those differences are averaged, so the number is a real effect and does not
+ depend on which tasks happened to load. It is still measured only on the tasks that loaded, and
+ it does not test whether a gain is more than noise. For that, look at the significance test above.</p>
+{loaded_body}
 </section>
+{test_section}
 <section id="per-task">
 <h2>Per-task breakdown</h2>
 {"".join(task_blocks)}

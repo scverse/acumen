@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
 import json
+import math
 import sys
 import tempfile
+import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
@@ -28,13 +32,13 @@ from acumen.check import (
     select_tasks,
     summarize_checks,
 )
-from acumen.config import Config, ConfigError, load_config
-from acumen.draft import DraftError, draft_skill
+from acumen.config import AUTH_CHOICES, Config, ConfigError, load_config
 from acumen.env import DEFAULT_CACHE_ROOT, AuthMode, EnvError, prepare_target, resolve_auth_mode
+from acumen.epoch import EpochPlan, completed_epochs, resolve_epoch
 from acumen.grade import INVALID_REASONS
 from acumen.improve import ImproveError, improve_skill
 from acumen.logs import LiveLog
-from acumen.paths import SPLITS, arm_name
+from acumen.paths import BENCH_SPLITS, SPLITS, Split, arm_name
 from acumen.pricefeed import (
     PRICE_SOURCES,
     PRICE_TIER,
@@ -51,9 +55,19 @@ from acumen.review import ReviewError, ReviewResult, ReviewStatus, ReviewVerdict
 from acumen.runner import RunOutcome, StderrFilter
 from acumen.scaffold import InitError, is_scaffold_tasks, scaffold
 from acumen.ship import ShipError, ship_skill
-from acumen.skills import Skill, SkillError, available_versions, latest_version, load_skill
+from acumen.skills import Skill, SkillError, available_versions, latest_version, load_skill, skill_dir
 from acumen.taskgen import TaskGenError, generate_tasks
 from acumen.tasks import Task, TaskError, load_tasks
+from acumen.training import (
+    EpochRow,
+    best_version,
+    build_training_rows,
+    epochs_since_best,
+    is_perfect,
+    patience_exhausted,
+    write_training_csv,
+)
+from acumen.wiki import WikiError, collect_arm_runs, update_regressions, update_wiki
 
 
 def _add_bench_args(parser: argparse.ArgumentParser) -> None:
@@ -77,7 +91,7 @@ def _add_bench_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="print the matrix and exit without running agents, over the same arms the real pass would cover",
     )
-    _add_auth_arg(parser)
+    _add_auth_arg(parser, default=None)
 
 
 def _add_log_args(parser: argparse.ArgumentParser) -> None:
@@ -99,27 +113,64 @@ def _add_feedback_arg(parser: argparse.ArgumentParser, *, extra: str = "") -> No
     parser.add_argument("--feedback", help=(help_text + extra) or None)
 
 
-def _add_auth_arg(parser: argparse.ArgumentParser) -> None:
+def _add_auth_arg(parser: argparse.ArgumentParser, *, default: str | None = "auto") -> None:
     """Add the ``--auth`` flag to a command that spawns agents.
 
     Every agentic command defaults to the provider subscription ("session") when a login is
     present and falls back to the API key otherwise — ``bench`` included, since it prices runs
     from their token counts rather than from a billed figure only the API reports.
+
+    ``default=None`` marks the flag *unset* so the command can fall back to the matching
+    ``config.yaml`` auth field (``bench_auth``/``meta_auth``) before landing on ``"auto"``; see
+    :func:`_effective_auth`. Commands with no config fallback keep the literal ``"auto"`` default.
     """
     parser.add_argument(
         "--auth",
-        choices=("auto", "session", "api"),
-        default="auto",
+        choices=AUTH_CHOICES,
+        default=default,
         help="which credential to bill: 'session' (Claude/Codex subscription), 'api' (provider API), "
         "or 'auto' (default: session if you're logged in, else the API)",
     )
 
 
-def _print_auth(mode: AuthMode, provider: AgentProvider = "claude") -> None:
-    """Report which credential the run will bill, so the choice is never silent."""
+def _add_role_auth_args(parser: argparse.ArgumentParser) -> None:
+    """Add ``--auth`` plus the per-role ``--bench-auth``/``--meta-auth`` overrides.
+
+    For ``fit``/``epoch``, which run both benchmark agents and the meta-agent. ``--auth`` is the
+    shared default for both roles; a role flag overrides it for that role only. All three default
+    to ``None`` (unset) so :func:`_resolve_pass_auth` can apply the precedence chain
+    (role flag → ``--auth`` → config → ``"auto"``).
+    """
+    _add_auth_arg(parser, default=None)
+    parser.add_argument(
+        "--bench-auth",
+        choices=AUTH_CHOICES,
+        default=None,
+        help="credential for the benchmark agents, overriding --auth (default: --auth, else config bench_auth)",
+    )
+    parser.add_argument(
+        "--meta-auth",
+        choices=AUTH_CHOICES,
+        default=None,
+        help="credential for the meta-agent (improve + wiki), overriding --auth "
+        "(default: --auth, else config meta_auth)",
+    )
+
+
+def _effective_auth(cli_value: str | None, cfg_value: str | None) -> str:
+    """Resolve an auth *request* string: the CLI flag wins, then config, then ``"auto"``."""
+    return cli_value or cfg_value or "auto"
+
+
+def _print_auth(mode: AuthMode, provider: AgentProvider = "claude", role: str | None = None) -> None:
+    """Report which credential the run will bill, so the choice is never silent.
+
+    ``role`` (``"bench"``/``"meta"``) tags the line when a single pass bills two roles differently.
+    """
     product = "Claude" if provider == "claude" else "Codex"
     label = f"{product} subscription (session)" if mode == "session" else f"{product} API key"
-    print(f"auth: {label}", flush=True)
+    tag = f"{role} · " if role is not None else ""
+    print(f"auth: {tag}{label}", flush=True)
 
 
 def _warn_codex_accounting(provider: AgentProvider) -> None:
@@ -285,6 +336,187 @@ def _fmt_cost(value: float | None) -> str:
     return f"${value:.2f}" if value is not None else "cost n/a"
 
 
+def _fmt_rate(value: float | None) -> str:
+    """Format a 0..1 success rate as a percentage, or ``n/a`` when unknown."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "n/a"
+    return f"{value:.0%}"
+
+
+def _epoch_bar(
+    done: int,
+    total: int,
+    row: EpochRow | None,
+    *,
+    best: str | None,
+    patience: int,
+    since_best: int,
+    fixed: bool,
+) -> str:
+    """A tqdm-style one-liner summarising an epoch: bar, version, train/valid success, patience."""
+    width = 14
+    filled = round(width * done / total) if total else width
+    bar = "█" * filled + "░" * (width - filled)
+    version = row.version if row is not None else "?"
+    train = _fmt_rate(row.train_success) if row is not None else "n/a"
+    valid = _fmt_rate(row.valid_success) if row is not None else "n/a"
+    parts = [f"Epoch {done}/{total} |{bar}| {version}", f"train {train}", f"valid {valid}"]
+    if row is not None and not (isinstance(row.valid_cost, float) and math.isnan(row.valid_cost)):
+        parts.append(f"${row.valid_cost:.2f}/run")
+    if not fixed and best is not None:
+        parts.append(f"(best {best}, patience {min(since_best, patience)}/{patience})")
+    return "  ".join(parts)
+
+
+# Progress rendering for `epoch`/`fit`. Three modes, resolved once per command:
+#   "bars"    — tqdm-style single line rewritten in place with \r (a live terminal)
+#   "plain"   — throttled fresh lines, no \r (output redirected to a file / CI)
+#   "verbose" — today's per-run scrolling logs, via _Progress (opt-in with --verbose)
+_BAR_WIDTH = 14
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _progress_mode(args: argparse.Namespace) -> str:
+    """Pick the progress style: explicit --verbose wins, else live bars on a TTY, else plain."""
+    if getattr(args, "verbose", False):
+        return "verbose"
+    if sys.stdout.isatty() and not getattr(args, "stream", False):
+        return "bars"
+    return "plain"
+
+
+def _epoch_header(mode: str, n: int, total: int) -> None:
+    """Print the marker that starts an epoch — a heavy banner in verbose, a compact line else."""
+    if mode == "verbose":
+        print(f"\n{'═' * 78}\nEPOCH {n}/{total}\n{'═' * 78}", flush=True)
+    else:
+        print(f"\nEpoch {n}/{total}", flush=True)
+
+
+def _progress_bar(done: int, total: int, width: int = _BAR_WIDTH) -> str:
+    filled = width if not total else max(0, min(width, round(width * done / total)))
+    return "█" * filled + "░" * (width - filled)
+
+
+class _PhaseBar:
+    r"""A tqdm-style bar for one bench or wiki phase of an epoch.
+
+    Exposes the ``on_start``/``on_done(RunOutcome)`` callbacks ``run_matrix`` expects (bench) and
+    ``on_wiki_task(TaskWikiResult)`` for the wiki pass. In ``bars`` mode it rewrites one line with
+    ``\r``; in ``plain`` mode it prints throttled fresh lines so redirected logs stay readable.
+    (``verbose`` keeps :class:`_Progress` and never builds this, so only those two modes reach here.)
+    """
+
+    _THROTTLE_S = 5.0
+
+    def __init__(self, label: str, total: int, mode: str, *, track_success: bool = True) -> None:
+        self.label = label
+        self.total = total
+        self.mode = mode
+        self.track_success = track_success
+        self.done = 0
+        self.passed = 0
+        self.cost = 0.0
+        self._t0 = time.monotonic()
+        self._last_print = 0.0
+        if mode == "bars":
+            print("\r" + self._line(), end="", flush=True)
+
+    @property
+    def _elapsed(self) -> float:
+        return time.monotonic() - self._t0
+
+    def set_total(self, total: int) -> None:
+        """Set the denominator once it is known (the wiki pass reports it via ``on_plan``)."""
+        self.total = total
+        if self.mode == "bars":
+            print("\r" + self._line(), end="", flush=True)
+
+    def on_start(self, item) -> None:
+        """Present so it can be handed to ``run_matrix``; the bar only renders on completion."""
+
+    def on_done(self, outcome: RunOutcome) -> None:
+        payload = outcome.payload
+        priced = payload.get("cost_available", True) and payload.get("cost_usd") is not None
+        self._surface_error(outcome)
+        self._tick(success=outcome.success, cost=float(payload["cost_usd"]) if priced else None)
+
+    def on_wiki_task(self, result) -> None:
+        self._tick(success=None, cost=result.cost_usd)
+
+    def _tick(self, *, success: bool | None, cost: float | None) -> None:
+        self.done += 1
+        if success:
+            self.passed += 1
+        if cost is not None:
+            self.cost += cost
+        if self.mode == "bars":
+            print("\r" + self._line(), end="", flush=True)
+        elif self.done < self.total and self._elapsed - self._last_print >= self._THROTTLE_S:
+            self._last_print = self._elapsed
+            print("  " + self._line(), flush=True)
+
+    def _line(self) -> str:
+        pct = round(100 * self.done / self.total) if self.total else 100
+        parts = [f"{self.label:>14} {pct:>3}%|{_progress_bar(self.done, self.total)}| {self.done}/{self.total}"]
+        parts.append(f"[{_fmt_secs(self._elapsed)}]")
+        if self.track_success:
+            parts.append(f"success {_fmt_rate(self.passed / self.done if self.done else None)} (mean)")
+        parts.append(f"{_fmt_cost(self.cost)} total")
+        return "  ".join(parts)
+
+    def _surface_error(self, outcome: RunOutcome) -> None:
+        """Let genuine harness failures through even in bars mode; ordinary test fails just lower the rate."""
+        detail = outcome.payload.get("error")
+        if outcome.reason == "provider_exhausted":
+            msg = f"provider usage/credit exhausted: {detail or 'no provider detail'}"
+        elif outcome.reason == "sandbox_blocked":
+            msg = f"agent sandbox refused an outbound host (harness bug): {detail or 'no sandbox detail'}"
+        else:
+            return
+        print(f"{chr(10) if self.mode == 'bars' else ''}error: {msg}", file=sys.stderr, flush=True)
+
+    def finish(self) -> None:
+        """Leave the completed bar on screen (bars) or print the final line (plain)."""
+        print(("\r" if self.mode == "bars" else "  ") + self._line(), flush=True)
+
+
+class _Spinner:
+    """An indeterminate elapsed-time spinner for the single-agent improve step (no sub-progress).
+
+    In ``bars`` mode a daemon thread rewrites the line while ``improve_skill`` blocks the main
+    thread; other modes just print a start line. Use as a context manager around the blocking call.
+    """
+
+    def __init__(self, label: str, mode: str) -> None:
+        self.label = label
+        self.mode = mode
+        self._t0 = time.monotonic()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> _Spinner:
+        if self.mode == "bars":
+            self._thread = threading.Thread(target=self._spin, daemon=True)
+            self._thread.start()
+        else:
+            print(f"  {self.label} ...", flush=True)
+        return self
+
+    def _spin(self) -> None:
+        for frame in itertools.cycle(_SPINNER_FRAMES):
+            if self._stop.is_set():
+                break
+            print(f"\r  {self.label} {frame} {_fmt_secs(time.monotonic() - self._t0)}", end="", flush=True)
+            self._stop.wait(0.1)
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+            print("\r\033[K", end="", flush=True)  # clear the spinner line for the done line
+
+
 @dataclass(frozen=True)
 class _Arm:
     """One arm of a pass: its version, its loaded skill, and its matrix."""
@@ -317,7 +549,7 @@ def _resolve_arms(cfg: Config, tasks: Sequence[Task], args: argparse.Namespace) 
     arms = []
     for version in versions:
         skill = None if version is None else load_skill(args.skills, version, expect_name=cfg.skill_name)
-        planned = build_matrix(cfg, tasks, skill=version, splits=args.split or SPLITS, task_ids=args.task)
+        planned = build_matrix(cfg, tasks, skill=version, splits=args.split or BENCH_SPLITS, task_ids=args.task)
         todo = pending(planned, args.runs, resume=not args.no_resume)
         arms.append(_Arm(version=version, skill=skill, planned=planned, todo=todo))
     return arms
@@ -366,11 +598,16 @@ def _print_run_summary(outcomes: Sequence[RunOutcome], elapsed: float, *, label:
     print(f"\n{prefix}{passed}/{len(outcomes)} passed in {_fmt_secs(elapsed)}  ({cost_summary}, {breakdown})")
 
 
-def _print_skill_loading(outcomes: Sequence[RunOutcome], arm: _Arm, skill_name: str) -> None:
-    """Say whether the skill reached the agent — the comparison means nothing otherwise."""
+def _print_skill_loading(outcomes: Sequence[RunOutcome], arm: _Arm, skill_name: str, *, quiet: bool = False) -> None:
+    """Say whether the skill reached the agent — the comparison means nothing otherwise.
+
+    ``quiet`` drops the routine "loaded in N/M" line (the bars keep phase output compact) but
+    still raises the warnings, which signal a broken comparison and must never be swallowed.
+    """
     loaded = sum(1 for o in outcomes if o.payload.get("skill_loaded"))
     if arm.skill is not None:
-        print(f"skill loaded in {loaded}/{len(outcomes)} runs")
+        if not quiet:
+            print(f"skill loaded in {loaded}/{len(outcomes)} runs")
         if loaded == 0:
             print(
                 f"warning: {arm.name} never loaded the skill — that arm is not measuring the skill",
@@ -378,6 +615,181 @@ def _print_skill_loading(outcomes: Sequence[RunOutcome], arm: _Arm, skill_name: 
             )
     elif loaded:
         print(f"warning: {skill_name} loaded in {loaded} baseline runs", file=sys.stderr)
+
+
+def _session_billing_note() -> None:
+    """Explain that a session-billed cost is a notional API-rate figure, not metered spend."""
+    print(
+        "note: cost_usd for session-billed runs is what they would have cost at API "
+        "rates, not metered spend; each run records its auth_mode",
+        file=sys.stderr,
+    )
+
+
+def _resolve_bench_auth(
+    models: set[str], auth: str, *, role: str | None = None, note: bool = True
+) -> dict[AgentProvider, AuthMode]:
+    """Resolve one auth mode per provider present, checking each CLI and printing the choice.
+
+    ``role`` tags the printed lines; ``note=False`` defers the session-billing note to the caller
+    (so a two-role pass prints it once across both roles).
+    """
+    providers = {provider_for_model(model) for model in models}
+    auth_modes = {provider: resolve_auth_mode(auth, provider=provider) for provider in providers}
+    for provider in sorted(providers):
+        check_agent_cli(provider)
+        _print_auth(auth_modes[provider], provider, role)
+        _warn_codex_accounting(provider)
+    if note and "session" in auth_modes.values():
+        _session_billing_note()
+    return auth_modes
+
+
+def _resolve_pass_auth(cfg: Config, args: argparse.Namespace) -> tuple[dict[AgentProvider, AuthMode], AuthMode]:
+    """Resolve the benchmark (per-provider) and meta-agent auth for a ``fit``/``epoch`` pass.
+
+    The two roles resolve independently so they can bill different credentials even on the same
+    provider. Per role the request is: the role flag (``--bench-auth``/``--meta-auth``), else the
+    shared ``--auth``, else the config default (``bench_auth``/``meta_auth``), else ``"auto"``.
+    """
+    bench_request = _effective_auth(args.bench_auth or args.auth, cfg.bench_auth)
+    meta_request = _effective_auth(args.meta_auth or args.auth, cfg.meta_auth)
+
+    auth_modes = _resolve_bench_auth(set(cfg.models), bench_request, role="bench", note=False)
+    meta_provider = provider_for_model(cfg.meta_model)
+    fresh_provider = meta_provider not in auth_modes
+    if fresh_provider:
+        check_agent_cli(meta_provider)
+    meta_auth = resolve_auth_mode(meta_request, provider=meta_provider)
+    _print_auth(meta_auth, meta_provider, "meta")
+    if fresh_provider:
+        _warn_codex_accounting(meta_provider)
+    if "session" in (*auth_modes.values(), meta_auth):
+        _session_billing_note()
+    return auth_modes, meta_auth
+
+
+def _execute_arms(
+    arms: Sequence[_Arm],
+    *,
+    cfg: Config,
+    target,
+    runs_root: Path,
+    auth_modes: dict[AgentProvider, AuthMode],
+    prices: PriceTable,
+    keep_sandboxes: bool,
+    progress: _Progress | _PhaseBar | None = None,
+    quiet: bool = False,
+) -> list[RunOutcome]:
+    """Run each arm's pending runs sequentially, sharing one progress counter across them.
+
+    Arms run one after another: every run in a matrix shares one skill, and a sequential pass
+    keeps each arm's tally readable while the progress counter spans the whole thing. ``quiet``
+    (epoch/fit bar mode) suppresses the per-arm banner and tally so the phase bar is the only
+    output; harness warnings still surface. Raises :class:`BenchmarkInvalidError` if a harness
+    failure decides the pass.
+    """
+    running = [arm for arm in arms if arm.todo]
+    todo = [item for arm in running for item in arm.todo]
+    if not todo:
+        return []
+    progress = progress or _Progress(len(todo))
+    collected: list[RunOutcome] = []
+    for arm in running:
+        if len(running) > 1 and not quiet:
+            print(f"\n=== arm {arm.name}: {len(arm.todo)} runs ===", flush=True)
+        started = time.monotonic()
+        outcomes = asyncio.run(
+            run_matrix(
+                arm.todo,
+                target=target,
+                runs_root=runs_root,
+                max_concurrency=cfg.max_concurrency,
+                auth_modes=auth_modes,
+                skill=arm.skill,
+                skill_name=cfg.skill_name,
+                keep_sandbox=keep_sandboxes,
+                stderr=StderrFilter(),
+                on_start=progress.on_start,
+                on_done=progress.on_done,
+                env_passthrough=cfg.env_passthrough,
+                prices=prices,
+            )
+        )
+        collected.extend(outcomes)
+        if not quiet:
+            _print_run_summary(outcomes, time.monotonic() - started, label=arm.name if len(running) > 1 else "")
+        _print_skill_loading(outcomes, arm, cfg.skill_name, quiet=quiet)
+    return collected
+
+
+def _build_arms(
+    specs: Sequence[tuple[str | None, Sequence[Split]]],
+    *,
+    cfg: Config,
+    tasks: Sequence[Task],
+    runs_root: Path,
+    skills_root: Path,
+    resume: bool = True,
+    task_ids: Sequence[str] | None = None,
+) -> list[_Arm]:
+    """Build arms for an explicit list of ``(version, splits)`` specs (for the epoch orchestrator)."""
+    arms = []
+    for version, splits in specs:
+        skill = None if version is None else load_skill(skills_root, version, expect_name=cfg.skill_name)
+        planned = build_matrix(cfg, tasks, skill=version, splits=splits, task_ids=task_ids)
+        todo = pending(planned, runs_root, resume=resume)
+        arms.append(_Arm(version=version, skill=skill, planned=planned, todo=todo))
+    return arms
+
+
+def _run_test_phase(
+    best: str,
+    *,
+    cfg: Config,
+    tasks: Sequence[Task],
+    runs_root: Path,
+    skills_root: Path,
+    target,
+    auth_modes: dict[AgentProvider, AuthMode],
+    prices: PriceTable,
+    mode: str,
+) -> None:
+    """Bench the held-out test split once, on the best kept version and the baseline.
+
+    Nothing in the fit loop ever benches ``test`` (epochs run only train and valid, and the wiki
+    and improver read train alone), so this final pass is the skill's first and only contact with
+    it. Runs resume via ``pending``, so re-running an already-tested fit does nothing.
+    """
+    specs: list[tuple[str | None, Sequence[Split]]] = [(best, ["test"]), (None, ["test"])]
+    arms = _build_arms(specs, cfg=cfg, tasks=tasks, runs_root=runs_root, skills_root=skills_root)
+    todo = sum(len(arm.todo) for arm in arms)
+    if not todo:
+        return
+    if mode == "verbose":
+        print(f"\nheld-out test: benching [{best}] and [{arm_name(None)}] on the test split ...", flush=True)
+        _print_plan(arms)
+    bar = None if mode == "verbose" else _PhaseBar("held-out test", todo, mode)
+    _execute_arms(
+        arms,
+        cfg=cfg,
+        target=target,
+        runs_root=runs_root,
+        auth_modes=auth_modes,
+        prices=prices,
+        keep_sandboxes=False,
+        progress=bar,
+        quiet=mode != "verbose",
+    )
+    if bar is not None:
+        bar.finish()
+
+
+def _invalid_bench_note() -> None:
+    print(
+        "Fix or replenish that credential, then rerun the same command; invalid and cancelled cells remain pending.",
+        file=sys.stderr,
+    )
 
 
 def _cmd_bench(args: argparse.Namespace) -> int:
@@ -400,18 +812,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
         return 0
 
     # One resolved mode per provider in the matrix, so a mixed pass bills each side correctly.
-    providers = {provider_for_model(item.model) for item in todo}
-    auth_modes = {provider: resolve_auth_mode(args.auth, provider=provider) for provider in providers}
-    for provider in sorted(providers):
-        check_agent_cli(provider)
-        _print_auth(auth_modes[provider], provider)
-        _warn_codex_accounting(provider)
-    if "session" in auth_modes.values():
-        print(
-            "note: cost_usd for session-billed runs is what they would have cost at API "
-            "rates, not metered spend; each run records its auth_mode",
-            file=sys.stderr,
-        )
+    auth_modes = _resolve_bench_auth({item.model for item in todo}, _effective_auth(args.auth, cfg.bench_auth))
     # Before the target is built and before any agent runs: an unreachable pricing page
     # must cost nothing, and a pass must never be priced by a table it cannot date.
     try:
@@ -430,103 +831,28 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
     print(f"target ready: {target.fingerprint} @ {target.commit[:8]} (venv {target.venv_dir})", flush=True)
 
-    # Arms run one after another: every run in a matrix shares one skill, and a sequential
-    # pass keeps each arm's tally readable while the progress counter spans the whole thing.
     running = [arm for arm in arms if arm.todo]
     print(f"running {len(todo)} runs, up to {cfg.max_concurrency} at a time:", flush=True)
     progress = _Progress(len(todo))
-    collected: list[RunOutcome] = []
     try:
-        for arm in running:
-            if len(running) > 1:
-                print(f"\n=== arm {arm.name}: {len(arm.todo)} runs ===", flush=True)
-            started = time.monotonic()
-            outcomes = asyncio.run(
-                run_matrix(
-                    arm.todo,
-                    target=target,
-                    runs_root=args.runs,
-                    max_concurrency=cfg.max_concurrency,
-                    auth_modes=auth_modes,
-                    skill=arm.skill,
-                    skill_name=cfg.skill_name,
-                    keep_sandbox=args.keep_sandboxes,
-                    stderr=StderrFilter(),
-                    on_start=progress.on_start,
-                    on_done=progress.on_done,
-                    env_passthrough=cfg.env_passthrough,
-                    prices=prices,
-                )
-            )
-            collected.extend(outcomes)
-            _print_run_summary(outcomes, time.monotonic() - started, label=arm.name if len(running) > 1 else "")
-            _print_skill_loading(outcomes, arm, cfg.skill_name)
+        collected = _execute_arms(
+            arms,
+            cfg=cfg,
+            target=target,
+            runs_root=args.runs,
+            auth_modes=auth_modes,
+            prices=prices,
+            keep_sandboxes=args.keep_sandboxes,
+            progress=progress,
+        )
     except BenchmarkInvalidError as err:
         print(f"\nerror: {err}", file=sys.stderr)
-        print(
-            "Fix or replenish that credential, then rerun the same command; invalid and "
-            "cancelled cells remain pending.",
-            file=sys.stderr,
-        )
+        _invalid_bench_note()
         return 2
 
     if len(running) > 1:
         _print_run_summary(collected, progress.elapsed, label=f"all {len(running)} arms")
     print(f"runs written to {args.runs.resolve()}")
-    return 0
-
-
-def _cmd_draft(args: argparse.Namespace) -> int:
-    cfg = load_config(args.config)
-    if args.model:
-        cfg = replace(cfg, meta_model=args.model)
-
-    existing = available_versions(args.skills)
-    if existing and not args.force:
-        print(
-            f"skills already exist ({', '.join(existing)}) — drafting would add "
-            f"another version. Pass --force to draft anyway, or use `acumen improve` "
-            f"to build on {existing[-1]}.",
-            file=sys.stderr,
-        )
-        return 2
-
-    provider = provider_for_model(cfg.meta_model)
-    check_agent_cli(provider)
-    auth_mode = resolve_auth_mode(args.auth, provider=provider)
-    _print_auth(auth_mode, provider)
-    _warn_codex_accounting(provider)
-    print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
-    target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
-    print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
-    print(f"drafting with {cfg.meta_model} (this reads the package source) ...", flush=True)
-
-    log = LiveLog.open(args.log_dir, "draft", stream=args.stream)
-    print(f"log → {log.jsonl_path}", flush=True)
-    with log:
-        result = asyncio.run(
-            draft_skill(
-                cfg=cfg,
-                prices=_agent_prices(cfg, model=cfg.meta_model),
-                target=target,
-                skills_root=args.skills,
-                auth_mode=auth_mode,
-                max_turns=args.max_turns,
-                max_usd=args.max_usd,
-                feedback=args.feedback,
-                log=log,
-            )
-        )
-    skill = result.skill
-    files = sorted(p.relative_to(skill.directory).as_posix() for p in skill.directory.rglob("*") if p.is_file())
-    print(f"\nwrote {skill.directory}")
-    print(f"  name:        {skill.name}")
-    print(f"  description: {skill.description}")
-    print(f"  hash:        {skill.hash}")
-    print(f"  files:       {', '.join(files)}")
-    print(f"  cost:        {_fmt_cost(result.cost_usd)} over {result.turns} turns")
-    _print_log_result(log)
-    print(f"\nnext: acumen bench --skill {skill.version}")
     return 0
 
 
@@ -536,22 +862,35 @@ def _cmd_improve(args: argparse.Namespace) -> int:
     if args.model:
         cfg = replace(cfg, meta_model=args.model)
 
-    versions = available_versions(args.skills)
-    if not versions:
+    # Parent is an explicit --from, else the latest version, else None (create the first skill
+    # from the noskill wiki). improve_skill resolves and validates the parent itself.
+    parent = args.from_version or latest_version(args.skills)
+    parent_skill = None if parent is None else load_skill(args.skills, parent, expect_name=cfg.skill_name)
+    # Fail before the costly target prep if there is nothing to learn from: the improver needs the
+    # parent arm's train runs (and the wiki built from them).
+    parent_arm = arm_name(parent)
+    if not collect_arm_runs(args.runs, parent_arm, tasks, split="train"):
+        hint = (
+            "acumen bench --no-skill --split train"
+            if parent is None
+            else f"acumen bench --skill {parent} --split train"
+        )
         print(
-            f"no skill versions under {args.skills} — run `acumen draft` first, then bench it",
+            f"no train-split runs found for {parent_arm} under {args.runs / parent_arm / 'train'} — "
+            f"run `{hint}` and `acumen wiki` first",
             file=sys.stderr,
         )
         return 2
-    parent = args.from_version or latest_version(args.skills)
-    # Immutability guard: the improved version is always the next unused directory,
-    # so an existing version is never in the write path. Say the parent plainly up front.
-    skill = load_skill(args.skills, parent, expect_name=cfg.skill_name)
-    print(f"improving {skill.version} ({skill.name}, {skill.hash[:19]}…) with {cfg.meta_model}")
+    if parent_skill is None:
+        print(f"no skill versions under {args.skills} — creating the first skill from the wiki with {cfg.meta_model}")
+    else:
+        print(
+            f"improving {parent_skill.version} ({parent_skill.name}, {parent_skill.hash[:19]}…) with {cfg.meta_model}"
+        )
 
     provider = provider_for_model(cfg.meta_model)
     check_agent_cli(provider)
-    auth_mode = resolve_auth_mode(args.auth, provider=provider)
+    auth_mode = resolve_auth_mode(_effective_auth(args.auth, cfg.meta_auth), provider=provider)
     _print_auth(auth_mode, provider)
     _warn_codex_accounting(provider)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
@@ -568,6 +907,7 @@ def _cmd_improve(args: argparse.Namespace) -> int:
                 target=target,
                 skills_root=args.skills,
                 runs_root=args.runs,
+                wiki_root=args.wiki,
                 tasks=tasks,
                 auth_mode=auth_mode,
                 parent_version=parent,
@@ -579,20 +919,466 @@ def _cmd_improve(args: argparse.Namespace) -> int:
         )
     new = result.skill
     files = sorted(p.relative_to(new.directory).as_posix() for p in new.directory.rglob("*") if p.is_file())
-    print(f"\nwrote {new.directory}  (parent {result.parent})")
+    parent_label = result.parent or "noskill"
+    print(f"\nwrote {new.directory}  (parent {parent_label})")
     print(f"  name:        {new.name}")
     print(f"  description: {new.description}")
     print(f"  hash:        {new.hash}")
     print(f"  files:       {', '.join(files)}")
     print(f"  evidence:    {result.n_train_runs} train runs ({result.n_train_failures} failing)")
     print(f"  cost:        {_fmt_cost(result.cost_usd)} over {result.turns} turns")
-    if new.hash == skill.hash:
+    if parent_skill is not None and new.hash == parent_skill.hash:
         print(
             "warning: the new version is byte-identical to its parent — the improver changed nothing",
             file=sys.stderr,
         )
     _print_log_result(log)
     print(f"\nnext: acumen bench --skill {new.version} && acumen report")
+    return 0
+
+
+def _wiki_version(args: argparse.Namespace) -> str:
+    """Resolve the version label a wiki update records, from ``--skill``/``--no-skill``/default."""
+    if args.skill is not None:
+        return args.skill if args.skill.startswith("v") else f"v{args.skill}"
+    if args.no_skill:
+        return arm_name(None)
+    return latest_version(args.skills) or arm_name(None)
+
+
+def _print_wiki_task(result) -> None:
+    """Print one task's wiki-update outcome as it lands, with any brevity warnings."""
+    print(f"  wiki [{result.version}] {result.task_id}: {_fmt_cost(result.cost_usd)} over {result.turns} turns")
+    for warning in result.warnings:
+        print(f"    warning: {warning}", file=sys.stderr)
+
+
+def _run_wiki(
+    *,
+    cfg: Config,
+    tasks: Sequence[Task],
+    target,
+    version: str,
+    runs_root: Path,
+    wiki_root: Path,
+    skills_root: Path,
+    prices: PriceTable,
+    auth_mode: AuthMode,
+    log_dir: Path,
+    stream: bool,
+    mode: str = "verbose",
+):
+    """Update the wiki for one arm and report progress; returns the task results.
+
+    ``mode`` (``verbose``/``bars``/``plain``) picks the reporting style — a per-task tally in
+    verbose, a single progress bar otherwise. The bar's denominator is the count of tasks the
+    pass will actually run, reported once via ``update_wiki``'s ``on_plan`` callback.
+    """
+    bar = None if mode == "verbose" else _PhaseBar("wiki", 0, mode, track_success=False)
+    if mode == "verbose":
+        print(f"updating wiki for [{version}] with {cfg.meta_model} (one agent per task) ...", flush=True)
+    results = asyncio.run(
+        update_wiki(
+            cfg=cfg,
+            target=target,
+            runs_root=runs_root,
+            wiki_root=wiki_root,
+            skills_root=skills_root,
+            tasks=tasks,
+            version=version,
+            prices=prices,
+            auth_mode=auth_mode,
+            max_concurrency=cfg.max_concurrency,
+            log_dir=log_dir,
+            stream=stream,
+            on_plan=(bar.set_total if bar is not None else None),
+            on_task_done=(_print_wiki_task if bar is None else bar.on_wiki_task),
+        )
+    )
+    if bar is not None:
+        bar.finish()
+    elif not results:
+        print(f"  wiki already had [{version}] for every task — nothing to do")
+    else:
+        total = sum(r.cost_usd or 0.0 for r in results)
+        print(f"wiki: updated {len(results)} task(s) for [{version}]  ({_fmt_cost(total)})")
+    return results
+
+
+def _cmd_wiki(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    tasks = load_tasks(args.tasks)
+    if args.max_concurrency:
+        cfg = replace(cfg, max_concurrency=args.max_concurrency)
+    if args.model:
+        cfg = replace(cfg, meta_model=args.model)
+
+    version = _wiki_version(args)
+    if version != arm_name(None):
+        # Validate a named skill version exists before the costly target prep.
+        load_skill(args.skills, version, expect_name=cfg.skill_name)
+
+    provider = provider_for_model(cfg.meta_model)
+    check_agent_cli(provider)
+    auth_mode = resolve_auth_mode(_effective_auth(args.auth, cfg.meta_auth), provider=provider)
+    _print_auth(auth_mode, provider)
+    _warn_codex_accounting(provider)
+    print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
+    target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
+    print(f"target ready: {target.fingerprint} @ {target.commit[:8]}", flush=True)
+
+    _run_wiki(
+        cfg=cfg,
+        tasks=tasks,
+        target=target,
+        version=version,
+        runs_root=args.runs,
+        wiki_root=args.wiki,
+        skills_root=args.skills,
+        prices=_agent_prices(cfg, model=cfg.meta_model),
+        auth_mode=auth_mode,
+        log_dir=args.log_dir,
+        stream=args.stream,
+    )
+    print(f"\nwiki written to {args.wiki.resolve()}")
+    return 0
+
+
+def _prepare_pass(cfg: Config, args: argparse.Namespace):
+    """Resolve auth, freeze prices, and build the target once for a pass that spends on benches.
+
+    Shared by ``epoch`` and ``fit`` so a multi-epoch run prepares the target and rates once rather
+    than per epoch. Raises :class:`PriceFeedError` if rates cannot be established (benchmark cost is
+    frozen into every result, so a pass must not run without them).
+    """
+    auth_modes, meta_auth = _resolve_pass_auth(cfg, args)
+    prices = _bench_prices(cfg)
+    _warn_unpriced(set(cfg.models) | {cfg.meta_model}, prices)
+    print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
+    target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
+    print(f"target ready: {target.fingerprint} @ {target.commit[:8]} (venv {target.venv_dir})", flush=True)
+    return auth_modes, meta_auth, prices, target
+
+
+def _valid_complete_fn(cfg: Config, tasks: list[Task], runs_root: Path) -> Callable[[str], bool]:
+    """Build the "does this version have a complete ``valid`` bench?" predicate.
+
+    Shared by epoch resolution (``resolve_epoch``/``completed_epochs``) so the two never
+    disagree on what "done" means.
+    """
+
+    def valid_complete(version: str) -> bool:
+        planned = build_matrix(cfg, tasks, skill=version, splits=["valid"])
+        return not pending(planned, runs_root, resume=True)
+
+    return valid_complete
+
+
+def _run_one_epoch(
+    args: argparse.Namespace,
+    *,
+    cfg: Config,
+    tasks: list[Task],
+    target,
+    prices: PriceTable,
+    auth_modes: dict[AgentProvider, AuthMode],
+    meta_auth: AuthMode,
+    mode: str = "verbose",
+) -> EpochPlan:
+    """Run one training epoch on an already-prepared pass, returning the resolved plan.
+
+    The four steps: bench the parent arm on train (the first epoch also benches the noskill
+    baseline on valid), distil that arm into the wiki, create or improve the skill (skipped when
+    the version already exists — a resumed epoch), then bench the new version on valid.
+
+    Auth, prices, and the target are passed in, not re-derived, so ``fit`` runs many epochs against
+    one prepared target. Raises :class:`BenchmarkInvalidError` if a harness failure decides a bench;
+    the caller reports it.
+    """
+    runs_root = args.runs
+
+    valid_complete = _valid_complete_fn(cfg, tasks, runs_root)
+    plan = resolve_epoch(args.skills, valid_complete=valid_complete)
+    parent_label = plan.parent_version or arm_name(None)
+    tail = " (resuming)" if plan.resumed else ""
+    print(f"epoch: learning from [{parent_label}] → producing {plan.new_version}{tail}")
+
+    def bench_phase(specs, *, label: str, verbose_banner: str) -> None:
+        """Run one bench step: a numbered banner + plan + tally in verbose, a phase bar otherwise."""
+        if mode == "verbose":
+            print(verbose_banner, flush=True)
+        bench_arms = _build_arms(specs, cfg=cfg, tasks=tasks, runs_root=runs_root, skills_root=args.skills)
+        if mode == "verbose":
+            _print_plan(bench_arms)
+        bar = None if mode == "verbose" else _PhaseBar(label, sum(len(a.todo) for a in bench_arms), mode)
+        _execute_arms(
+            bench_arms,
+            cfg=cfg,
+            target=target,
+            runs_root=runs_root,
+            auth_modes=auth_modes,
+            prices=prices,
+            keep_sandboxes=False,
+            progress=bar,
+            quiet=mode != "verbose",
+        )
+        if bar is not None:
+            bar.finish()
+
+    # Step 1 — bench the parent arm on the training signal. The first epoch also benches the
+    # noskill baseline on valid, so the report has an in-epoch baseline to compare against.
+    if plan.first:
+        train_specs: list[tuple[str | None, Sequence[Split]]] = [(None, ["train", "valid"])]
+    else:
+        train_specs = [(plan.parent_version, ["train"])]
+    bench_phase(
+        train_specs,
+        label="bench baseline" if plan.first else "bench train",
+        verbose_banner=f"\n[1/4] benchmarking [{parent_label}] on the training signal ...",
+    )
+
+    # Step 2 — distil that arm into the wiki (idempotent: recorded arms are skipped).
+    if mode == "verbose":
+        print(f"\n[2/4] updating the wiki for [{parent_label}] ...", flush=True)
+    _run_wiki(
+        cfg=cfg,
+        tasks=tasks,
+        target=target,
+        version=parent_label,
+        runs_root=runs_root,
+        wiki_root=args.wiki,
+        skills_root=args.skills,
+        prices=prices,
+        auth_mode=meta_auth,
+        log_dir=args.log_dir,
+        stream=args.stream,
+        mode=mode,
+    )
+
+    # Recompute the deterministic train-regression flags from every benched train arm, so the
+    # improver (Step 3) sees any task a version made worse. Regenerated wholesale, so a repaired
+    # regression clears itself. Cheap and read-only over the runs tree.
+    regressions = update_regressions(args.wiki, runs_root, tasks)
+    if regressions and mode == "verbose":
+        print(f"  {len(regressions)} train regression(s) flagged → {args.wiki / 'REGRESSIONS.md'}", flush=True)
+
+    # Step 3 — create or improve the skill (skipped when the version already exists: a resumed
+    # epoch that crashed after improve).
+    if skill_dir(args.skills, plan.new_version).exists():
+        resumed_msg = f"{plan.new_version} already exists — skipping improve (resumed epoch)"
+        print(f"\n[3/4] {resumed_msg}" if mode == "verbose" else f"  {resumed_msg}", flush=True)
+    else:
+        verb = "creating" if plan.first else "improving"
+        log = LiveLog.open(args.log_dir, "improve", stream=args.stream)
+        if mode == "verbose":
+            print(f"\n[3/4] {verb} the skill → {plan.new_version} with {cfg.meta_model} ...", flush=True)
+            print(f"log → {log.jsonl_path}", flush=True)
+        spinner = nullcontext() if mode == "verbose" else _Spinner(f"inferring skill → {plan.new_version}", mode)
+        improve_started = time.monotonic()
+        with log, spinner:
+            result = asyncio.run(
+                improve_skill(
+                    cfg=cfg,
+                    prices=prices,
+                    target=target,
+                    skills_root=args.skills,
+                    runs_root=runs_root,
+                    wiki_root=args.wiki,
+                    tasks=tasks,
+                    auth_mode=meta_auth,
+                    parent_version=plan.parent_version,
+                    feedback=args.feedback,
+                    log=log,
+                )
+            )
+        improve_elapsed = _fmt_secs(time.monotonic() - improve_started)
+        new = result.skill
+        if mode == "verbose":
+            print(f"wrote {new.directory}  (parent {result.parent or 'noskill'})")
+            print(f"  description: {new.description}")
+            print(f"  cost:        {_fmt_cost(result.cost_usd)} over {result.turns} turns in {improve_elapsed}")
+            _print_log_result(log)
+        else:
+            print(
+                f"  inferring skill → {new.version} done  "
+                f"({improve_elapsed}, {_fmt_cost(result.cost_usd)}, {result.turns} turns)",
+                flush=True,
+            )
+
+    # Step 4 — bench the new version on the held-out valid signal (completes it if unfinished).
+    bench_phase(
+        [(plan.new_version, ["valid"])],
+        label="bench valid",
+        verbose_banner=f"\n[4/4] benchmarking {plan.new_version} on the held-out valid signal ...",
+    )
+    return plan
+
+
+def _cmd_epoch(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    tasks = load_tasks(args.tasks)
+    if args.max_concurrency:
+        cfg = replace(cfg, max_concurrency=args.max_concurrency)
+    if args.replicates:
+        cfg = replace(cfg, n_replicates=args.replicates)
+    if args.model:
+        cfg = replace(cfg, meta_model=args.model)
+
+    try:
+        auth_modes, meta_auth, prices, target = _prepare_pass(cfg, args)
+    except PriceFeedError as err:
+        print(f"error: {err}", file=sys.stderr)
+        print("Retry when the pricing pages are reachable, or pin rates in config.yaml.", file=sys.stderr)
+        return 2
+
+    try:
+        plan = _run_one_epoch(
+            args,
+            cfg=cfg,
+            tasks=tasks,
+            target=target,
+            prices=prices,
+            auth_modes=auth_modes,
+            meta_auth=meta_auth,
+            mode=_progress_mode(args),
+        )
+    except BenchmarkInvalidError as err:
+        print(f"\nerror: {err}", file=sys.stderr)
+        _invalid_bench_note()
+        return 2
+
+    print(f"\nepoch complete: {plan.new_version} produced and benched on valid.")
+    print("next: `acumen report` to see it, or `acumen epoch` again for another round")
+    return 0
+
+
+def _cmd_fit(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    tasks = load_tasks(args.tasks)
+    if args.max_concurrency:
+        cfg = replace(cfg, max_concurrency=args.max_concurrency)
+    if args.replicates:
+        cfg = replace(cfg, n_replicates=args.replicates)
+    if args.model:
+        cfg = replace(cfg, meta_model=args.model)
+
+    fixed = args.epochs is not None
+    # A GLOBAL target across invocations, not a per-run count: --epochs/--max-epochs is the total
+    # number of epochs to end up with. It is taken from this invocation's flag and not persisted,
+    # so re-run with the same flag to keep continuing toward the same target.
+    total = args.epochs if fixed else args.max_epochs
+    if total < 1:
+        print("error: nothing to run — --epochs/--max-epochs must be >= 1", file=sys.stderr)
+        return 2
+
+    try:
+        auth_modes, meta_auth, prices, target = _prepare_pass(cfg, args)
+    except PriceFeedError as err:
+        print(f"error: {err}", file=sys.stderr)
+        print("Retry when the pricing pages are reachable, or pin rates in config.yaml.", file=sys.stderr)
+        return 2
+
+    # How many epochs are already fully done on disk — the loop resumes from the next one.
+    completed = completed_epochs(args.skills, valid_complete=_valid_complete_fn(cfg, tasks, args.runs))
+    remaining = max(0, total - completed)
+    prior = [row for row in build_training_rows(args.runs, cfg) if row.epoch <= completed] if completed else []
+    stopping = "early stopping disabled" if fixed else f"early stopping with patience {args.patience}"
+    if completed:
+        print(f"fit: target {total} epoch(s) total ({stopping}); {completed} done, {remaining} to go")
+        # Show the progress of the epochs already finished (skip any in-progress/partial version).
+        prior_best = best_version(prior)
+        print(f"\nresuming: {completed} epoch(s) already complete (target {total})")
+        for index, row in enumerate(prior):
+            since = epochs_since_best([r.valid_success for r in prior[: index + 1]])
+            print(
+                _epoch_bar(
+                    row.epoch, total, row, best=prior_best, patience=args.patience, since_best=since, fixed=fixed
+                )
+            )
+    else:
+        print(f"fit: target {total} epoch(s) total ({stopping})")
+
+    # A finished epoch that already hit 100% means there is nothing left to gain — do not resume
+    # into more epochs. Mirrors the in-loop is_perfect stop, which never sees a prior epoch.
+    already_perfect = next((row for row in prior if is_perfect(row.valid_success)), None)
+    if already_perfect is not None:
+        print(f"\nearly stop: validation success already reached 100% at {already_perfect.version}.")
+    elif remaining == 0:
+        print(f"\nnothing to do: already at {completed} epoch(s) (target {total}).")
+
+    mode = _progress_mode(args)
+    epochs = range(completed + 1, total + 1) if already_perfect is None else range(0)
+    for epoch_no in epochs:
+        _epoch_header(mode, epoch_no, total)
+        try:
+            plan = _run_one_epoch(
+                args,
+                cfg=cfg,
+                tasks=tasks,
+                target=target,
+                prices=prices,
+                auth_modes=auth_modes,
+                meta_auth=meta_auth,
+                mode=mode,
+            )
+        except BenchmarkInvalidError as err:
+            print(f"\nerror: {err}", file=sys.stderr)
+            _invalid_bench_note()
+            return 2
+
+        # Rebuild the whole training curve from runs/ each epoch, so the CSV is always consistent
+        # with what exists and a resumed fit produces the same table.
+        rows = build_training_rows(args.runs, cfg)
+        write_training_csv(rows, args.out)
+        current = next((row for row in rows if row.version == plan.new_version), None)
+        valids = [row.valid_success for row in rows]
+        best = best_version(rows)
+        since = epochs_since_best(valids)
+        print(_epoch_bar(epoch_no, total, current, best=best, patience=args.patience, since_best=since, fixed=fixed))
+
+        # A perfect validation score leaves nothing to gain — stop even under a fixed --epochs.
+        if current is not None and is_perfect(current.valid_success):
+            print(f"\nearly stop: validation success reached 100% at {current.version}.")
+            break
+
+        if not fixed and patience_exhausted(valids, args.patience):
+            print(f"\nearly stop: validation mean success did not improve in {args.patience} epoch(s).")
+            break
+
+    rows = build_training_rows(args.runs, cfg)
+    best = best_version(rows)
+    if best is not None:
+        try:
+            _run_test_phase(
+                best,
+                cfg=cfg,
+                tasks=tasks,
+                runs_root=args.runs,
+                skills_root=args.skills,
+                target=target,
+                auth_modes=auth_modes,
+                prices=prices,
+                mode=mode,
+            )
+        except BenchmarkInvalidError as err:
+            print(f"\nerror: {err}", file=sys.stderr)
+            _invalid_bench_note()
+            return 2
+        best_row = next(row for row in rows if row.version == best)
+        print(f"\nfit complete: best version {best} (valid {_fmt_rate(best_row.valid_success)}).")
+    else:
+        print("\nfit complete.")
+    print(f"training curve → {args.out.resolve()}")
+
+    # A fit's whole point is the comparison, so build the report without being asked. It is a
+    # summary of what already ran, so a failure here must not fail the fit itself.
+    report_out = Path("report.html")
+    skills_root = args.skills if args.skills.is_dir() else None
+    try:
+        build_report(args.runs, report_out, tasks, skills_root=skills_root)
+        print(f"report → {report_out.resolve()}")
+    except ReportError as err:
+        print(f"note: report skipped — {err}", file=sys.stderr)
     return 0
 
 
@@ -617,7 +1403,7 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
 
     provider = provider_for_model(cfg.meta_model)
     check_agent_cli(provider)
-    auth_mode = resolve_auth_mode(args.auth, provider=provider)
+    auth_mode = resolve_auth_mode(_effective_auth(args.auth, cfg.meta_auth), provider=provider)
     _print_auth(auth_mode, provider)
     _warn_codex_accounting(provider)
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
@@ -668,7 +1454,7 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
             "and split, so it was not kept",
             file=sys.stderr,
         )
-    print("\nnext: review the tasks, then `acumen check`, `acumen draft` and `acumen bench`")
+    print("\nnext: review the tasks, then `acumen check`, then `acumen fit`")
     return 0
 
 
@@ -1082,7 +1868,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
     written = scaffold(args.directory, force=args.force)
     for path in written:
         print(f"wrote {path}")
-    print("\nnext: edit config.yaml (repo) and tasks.yaml, then `acumen draft`")
+    print("\nnext: edit config.yaml (repo) and tasks.yaml, then `acumen fit`")
     return 0
 
 
@@ -1167,38 +1953,112 @@ def build_parser() -> argparse.ArgumentParser:
     _add_bench_args(bench)
     bench.set_defaults(func=_cmd_bench)
 
-    draft = sub.add_parser("draft", help="draft a skill from the target package's source")
-    draft.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
-    draft.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
-    draft.add_argument("--model", help="override config meta_model")
-    draft.add_argument("--max-turns", type=int, help="cap turns for the drafting agent (default: unbounded)")
-    draft.add_argument("--max-usd", type=float, help="cap spend for the drafting agent (default: unbounded)")
-    draft.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
-    draft.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
-    draft.add_argument("--force", action="store_true", help="draft another version even if some already exist")
-    _add_auth_arg(draft)
-    _add_feedback_arg(draft, extra=" (e.g. package context, what the skill should emphasise)")
-    _add_log_args(draft)
-    draft.set_defaults(func=_cmd_draft)
-
-    improve = sub.add_parser("improve", help="improve the current skill into a new version from its train results")
+    improve = sub.add_parser(
+        "improve",
+        help="create or improve the skill from the knowledge wiki",
+        description="Read the knowledge wiki (per-task observations/hypotheses distilled from train "
+        "runs) and the filtered package source, then create the first skill (when none exist) or "
+        "improve the latest into the next version. The held-out valid split is never reachable.",
+    )
     improve.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
     improve.add_argument("--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml")
     improve.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
     improve.add_argument("--runs", type=Path, default=Path("runs"), help="root of the run tree")
+    improve.add_argument("--wiki", type=Path, default=Path("wiki"), help="root of the knowledge wiki")
     improve.add_argument("--from", dest="from_version", metavar="VERSION", help="version to improve (default: latest)")
     improve.add_argument("--model", help="override config meta_model")
     improve.add_argument("--max-turns", type=int, help="cap turns for the improving agent (default: unbounded)")
     improve.add_argument("--max-usd", type=float, help="cap spend for the improving agent (default: unbounded)")
     improve.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     improve.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
-    _add_auth_arg(improve)
+    _add_auth_arg(improve, default=None)
     _add_feedback_arg(
         improve,
-        extra=" (e.g. what to fix or emphasise; do NOT paste test-split answers — that defeats the held-out split)",
+        extra=" (e.g. what to fix or emphasise; do NOT paste valid-split answers — that defeats the held-out split)",
     )
     _add_log_args(improve)
     improve.set_defaults(func=_cmd_improve)
+
+    wiki = sub.add_parser(
+        "wiki",
+        help="distil an arm's train runs into the knowledge wiki (one agent per task)",
+        description="For each task, read that arm's train-split runs across models and replicates "
+        "and append a terse [version][model] block to wiki/<task>/observations.md and hypothesis.md. "
+        "Cumulative and idempotent: an arm already recorded for a task is skipped.",
+    )
+    wiki.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
+    wiki.add_argument("--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml")
+    wiki.add_argument("--runs", type=Path, default=Path("runs"), help="root of the run tree")
+    wiki.add_argument("--wiki", type=Path, default=Path("wiki"), help="root of the knowledge wiki")
+    wiki.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
+    wiki_arm = wiki.add_mutually_exclusive_group()
+    wiki_arm.add_argument("--no-skill", action="store_true", help="record the baseline (noskill) arm")
+    wiki_arm.add_argument("--skill", metavar="VERSION", help="record one skill version, e.g. v1 (default: latest)")
+    wiki.add_argument("--model", help="override config meta_model")
+    wiki.add_argument("--max-concurrency", type=int, help="override config max_concurrency")
+    wiki.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
+    wiki.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
+    _add_auth_arg(wiki, default=None)
+    _add_log_args(wiki)
+    wiki.set_defaults(func=_cmd_wiki)
+
+    epoch = sub.add_parser(
+        "epoch",
+        help="run one training epoch: bench train, update wiki, improve, bench valid",
+        description="One training epoch end to end: bench the current arm on the training signal, "
+        "distil it into the wiki, create/improve the skill, then bench the new version on the "
+        "held-out valid signal. Fully resumable — re-run to continue a crashed epoch or start the "
+        "next one.",
+    )
+    epoch.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
+    epoch.add_argument("--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml")
+    epoch.add_argument("--runs", type=Path, default=Path("runs"), help="root of the run tree")
+    epoch.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
+    epoch.add_argument("--wiki", type=Path, default=Path("wiki"), help="root of the knowledge wiki")
+    epoch.add_argument("--model", help="override config meta_model")
+    epoch.add_argument("--max-concurrency", type=int, help="override config max_concurrency")
+    epoch.add_argument("--replicates", type=int, help="override config n_replicates")
+    epoch.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
+    epoch.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
+    epoch.add_argument("--verbose", action="store_true", help="use the full scrolling logs instead of progress bars")
+    _add_role_auth_args(epoch)
+    _add_feedback_arg(epoch, extra=" (passed to the improver; do NOT paste valid-split answers)")
+    _add_log_args(epoch)
+    epoch.set_defaults(func=_cmd_epoch)
+
+    fit = sub.add_parser(
+        "fit",
+        help="run many training epochs with early stopping (like training a model)",
+        description="Run `acumen epoch` back to back until validation stops improving (patience) or "
+        "a hard cap is hit, writing a per-epoch training curve to training.csv and a progress line "
+        "each epoch. Fully resumable — re-run to continue.",
+    )
+    fit.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
+    fit.add_argument("--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml")
+    fit.add_argument("--runs", type=Path, default=Path("runs"), help="root of the run tree")
+    fit.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
+    fit.add_argument("--wiki", type=Path, default=Path("wiki"), help="root of the knowledge wiki")
+    fit.add_argument("--out", type=Path, default=Path("training.csv"), help="training-curve CSV to write")
+    fit.add_argument(
+        "--patience", type=int, default=2, help="stop after this many epochs with no validation gain (default: 2)"
+    )
+    fit.add_argument("--max-epochs", type=int, default=10, help="hard cap on epochs (default: 10)")
+    fit.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="run exactly this many epochs (disables early stopping and ignores --max-epochs)",
+    )
+    fit.add_argument("--model", help="override config meta_model")
+    fit.add_argument("--max-concurrency", type=int, help="override config max_concurrency")
+    fit.add_argument("--replicates", type=int, help="override config n_replicates")
+    fit.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
+    fit.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
+    fit.add_argument("--verbose", action="store_true", help="use the full scrolling logs instead of progress bars")
+    _add_role_auth_args(fit)
+    _add_feedback_arg(fit, extra=" (passed to the improver; do NOT paste valid-split answers)")
+    _add_log_args(fit)
+    fit.set_defaults(func=_cmd_fit)
 
     tasks_cmd = sub.add_parser("tasks", help="autonomously generate a tasks.yaml from the target package")
     tasks_cmd.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
@@ -1215,7 +2075,7 @@ def build_parser() -> argparse.ArgumentParser:
     tasks_cmd.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     tasks_cmd.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     tasks_cmd.add_argument("--force", action="store_true", help="overwrite an existing tasks file")
-    _add_auth_arg(tasks_cmd)
+    _add_auth_arg(tasks_cmd, default=None)
     _add_feedback_arg(tasks_cmd, extra=" (e.g. which functionality to skip or focus on)")
     _add_log_args(tasks_cmd)
     tasks_cmd.set_defaults(func=_cmd_tasks)
@@ -1325,8 +2185,8 @@ def main(argv: list[str] | None = None) -> int:
         AgentError,
         PriceFeedError,
         SkillError,
-        DraftError,
         ImproveError,
+        WikiError,
         TaskGenError,
         ReviewError,
         ShipError,
