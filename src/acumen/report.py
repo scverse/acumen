@@ -21,7 +21,7 @@ import io
 import json
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -310,6 +310,29 @@ def load_results(runs_root: Path, *, skip_invalid: bool = False) -> pd.DataFrame
 def _arms_in_order(df: pd.DataFrame) -> list[str]:
     """Arms present in ``df``, noskill first then ascending skill versions."""
     return sorted(df["arm"].unique(), key=_arm_sort_key)
+
+
+def first_best(pairs: Iterable[tuple[str, float | None]]) -> str | None:
+    """The key of the highest score, the first one on a tie; ``None``/``nan`` scores are skipped.
+
+    The single "best version" rule: ``fit`` picks the version to test with it and the report picks
+    the version its held-out section shows, so the two can never disagree.
+    """
+    best: str | None = None
+    best_value: float | None = None
+    for key, score in pairs:
+        if score is None or (isinstance(score, float) and math.isnan(score)):
+            continue
+        if best_value is None or score > best_value:
+            best_value, best = score, key
+    return best
+
+
+def best_skill_arm(df: pd.DataFrame) -> str | None:
+    """The skill arm with the highest mean success on the reported (valid) split, or ``None``."""
+    reported = df[(df["split"] == _REPORTED_SPLIT) & (df["arm"] != NOSKILL_ARM)]
+    means = reported.groupby("arm")["success"].mean()
+    return first_best((arm, float(means[arm])) for arm in _arms_in_order(reported))
 
 
 def _rate_and_error(successes: pd.Series) -> tuple[float, float]:
@@ -2285,22 +2308,38 @@ def render_report(
             f' src="{loaded_uri}"></figure>'
         )
     tests = skill_tests(df)
-    # The held-out test split is benched only at the end of a fit, on the best kept version and the
-    # baseline. It appears as its own section when those runs exist; otherwise it is omitted.
-    test_df = df[df["split"] == "test"]
-    if not test_df.empty and test_df["arm"].nunique() >= 2:
-        test_tradeoff_uri = figure_data_uri(tradeoff_figure(df, colors=colors, split="test"))
-        test_section = (
+    # The held-out test split is benched only at the end of a fit, on the best version (highest
+    # valid success, as ``fit`` picks it) and the baseline. Only those two arms are shown: an earlier
+    # best's test runs, left on disk by an older fit or one that later found a better version, are stale.
+    all_test = df[df["split"] == "test"]
+    best = best_skill_arm(df)
+    if best is not None and not all_test.empty:
+        version = html.escape(skill_from_arm(best) or best)
+        intro = (
             '<section id="test">\n<h2>Held-out test</h2>\n'
             '<p class="task-desc">This is the truly held-out split. It is benched once at the very end'
             " of a fit, on the best kept version and the baseline, and nothing in the loop ever sees it."
             " Training learns from the train split and the best version is picked on valid, so the test"
             " split is the first and only place the skill meets these tasks. Read it as the honest final"
             " estimate of what the skill buys.</p>\n"
-            f'<figure><img alt="Cost per run against success rate on the held-out test split"'
-            f' src="{test_tradeoff_uri}"></figure>\n'
-            f"{_tests_table_html(skill_tests(df, split='test'))}\n</section>"
+            f'<p class="task-desc">Skill version used for the held-out test: <b>{version}</b>, the best on'
+            f" validation and the version to ship (<code>acumen ship --skill {version}</code>).</p>\n"
         )
+        test_df = all_test[all_test["arm"].isin([NOSKILL_ARM, best])]
+        if best in set(test_df["arm"]):
+            test_tradeoff_uri = figure_data_uri(tradeoff_figure(test_df, colors=colors, split="test"))
+            body = (
+                f'<figure><img alt="Cost per run against success rate on the held-out test split"'
+                f' src="{test_tradeoff_uri}"></figure>\n'
+                f"{_tests_table_html(skill_tests(test_df, split='test'))}"
+            )
+        else:
+            body = (
+                f'<div class="note">The best version {version} has not been benched on the test split yet'
+                " (the test runs on disk are for another version). Rerun <code>acumen fit</code> to"
+                " bench it.</div>"
+            )
+        test_section = f"{intro}{body}\n</section>"
         test_toc = '<li><a href="#test">Held-out test</a></li>\n'
     else:
         test_section = ""

@@ -759,7 +759,11 @@ def _run_test_phase(
 
     Nothing in the fit loop ever benches ``test`` (epochs run only train and valid, and the wiki
     and improver read train alone), so this final pass is the skill's first and only contact with
-    it. Runs resume via ``pending``, so re-running an already-tested fit does nothing.
+    it. ``best`` is the best version over every epoch on disk (not the last one), whether the fit
+    ran a fixed count or early stopping. Runs resume via ``pending``, so re-running an
+    already-tested fit does nothing, while a resumed fit that found a new best benches just that
+    version (the baseline's test runs are reused). An earlier best's test runs stay on disk; the
+    report shows only the current best.
     """
     specs: list[tuple[str | None, Sequence[Split]]] = [(best, ["test"]), (None, ["test"])]
     arms = _build_arms(specs, cfg=cfg, tasks=tasks, runs_root=runs_root, skills_root=skills_root)
@@ -1301,13 +1305,21 @@ def _cmd_fit(args: argparse.Namespace) -> int:
     # A finished epoch that already hit 100% means there is nothing left to gain — do not resume
     # into more epochs. Mirrors the in-loop is_perfect stop, which never sees a prior epoch.
     already_perfect = next((row for row in prior if is_perfect(row.valid_success)), None)
+    # Likewise a resumed patience fit whose finished epochs already exhausted patience (e.g. after
+    # an earlier fixed --epochs run) must not start another epoch: the in-loop check only runs
+    # after an epoch completes.
+    already_patient = not fixed and bool(prior) and patience_exhausted([r.valid_success for r in prior], args.patience)
     if already_perfect is not None:
         print(f"\nearly stop: validation success already reached 100% at {already_perfect.version}.")
     elif remaining == 0:
         print(f"\nnothing to do: already at {completed} epoch(s) (target {total}).")
+    elif already_patient:
+        print(f"\nearly stop: validation mean success did not improve in {args.patience} epoch(s).")
 
+    prior_best = best_version(prior)
     mode = _progress_mode(args)
-    epochs = range(completed + 1, total + 1) if already_perfect is None else range(0)
+    stop_now = already_perfect is not None or already_patient
+    epochs = range(0) if stop_now else range(completed + 1, total + 1)
     for epoch_no in epochs:
         _epoch_header(mode, epoch_no, total)
         try:
@@ -1348,6 +1360,8 @@ def _cmd_fit(args: argparse.Namespace) -> int:
     rows = build_training_rows(args.runs, cfg)
     best = best_version(rows)
     if best is not None:
+        if prior_best is not None and best != prior_best:
+            print(f"\nheld-out test: best improved {prior_best} → {best}; benching {best} on the test split")
         try:
             _run_test_phase(
                 best,

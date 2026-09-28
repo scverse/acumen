@@ -106,7 +106,9 @@ from acumen.report import (
     _split_diff_rows,
     _tests_table_html,
     arm_metrics,
+    best_skill_arm,
     build_report,
+    first_best,
     load_results,
     loaded_dotplot_figure,
     loaded_only_rates,
@@ -4735,6 +4737,50 @@ def test_render_report_shows_the_test_section_only_with_test_runs(
     rendered = render_report(load_results(runs_root), tmp_path)
     assert 'id="test"' in rendered
     assert 'href="#test"' in rendered  # the TOC entry
+
+
+def test_first_best_keeps_the_first_on_a_tie_and_skips_nan() -> None:
+    """One rule picks the best version for both fit and the report: strict max, first on a tie."""
+    assert first_best([("v1", 0.5), ("v2", 0.7), ("v3", 0.7)]) == "v2"
+    assert first_best([("v1", float("nan")), ("v2", 0.1)]) == "v2"
+    assert first_best([("v1", None), ("v2", float("nan"))]) is None
+
+
+def test_render_report_tests_only_the_best_version_and_names_it(
+    runs_root: Path, model: str, make_result, tmp_path: Path
+) -> None:
+    """An earlier best's test runs stay on disk but are stale: the held-out section shows only the
+    baseline and the version best on valid, and says which version that is."""
+    for arm, ok in (("skill_v1", False), ("skill_v2", True), ("skill_v3", False)):
+        make_result(runs_root, RunKey(arm=arm, split="valid", model=model, task_id="example_task", rep=1), success=ok)
+    for arm in ("noskill", "skill_v2", "skill_v3"):
+        make_result(runs_root, RunKey(arm=arm, split="test", model=model, task_id="example_task", rep=1))
+    df = load_results(runs_root)
+    assert best_skill_arm(df) == "skill_v2"
+
+    rendered = render_report(df, tmp_path)
+    section = rendered[rendered.index('<section id="test">') :]
+    section = section[: section.index("</section>")]
+    assert "Skill version used for the held-out test: <b>v2</b>" in section
+    assert "acumen ship --skill v2" in section
+    assert "has not been benched" not in section
+
+
+def test_render_report_notes_when_the_best_version_lacks_test_runs(
+    runs_root: Path, model: str, make_result, tmp_path: Path
+) -> None:
+    """Test runs for a superseded version must not pass for the final estimate: say the best is
+    untested instead of drawing them."""
+    for arm, ok in (("skill_v1", False), ("skill_v2", True)):
+        make_result(runs_root, RunKey(arm=arm, split="valid", model=model, task_id="example_task", rep=1), success=ok)
+    for arm in ("noskill", "skill_v1"):
+        make_result(runs_root, RunKey(arm=arm, split="test", model=model, task_id="example_task", rep=1))
+
+    rendered = render_report(load_results(runs_root), tmp_path)
+    section = rendered[rendered.index('<section id="test">') :]
+    section = section[: section.index("</section>")]
+    assert "The best version v2 has not been benched on the test split yet" in section
+    assert "held-out test split" not in section  # no figure drawn from the stale v1 runs
 
 
 # --- split diff ------------------------------------------------------------------------

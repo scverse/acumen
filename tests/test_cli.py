@@ -405,6 +405,99 @@ def test_cmd_fit_resumes_from_completed_epochs_toward_a_global_target(
     assert "Epoch 3/4" in out and "Epoch 4/4" in out
 
 
+def _resumed_fit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    prior: list[float],
+    new: list[float],
+    flags: list[str],
+) -> tuple[int, list[str], str]:
+    """Run `fit` over ``prior`` finished epochs (their valid scores); each new epoch scores the next
+    of ``new``. Returns how many epochs ran, the versions sent to the test phase, and stdout."""
+    import types
+
+    import acumen.cli as cli
+    from acumen.training import EpochRow
+
+    assert main(["init", "--dir", str(tmp_path)]) == 0
+
+    def row(epoch: int, valid: float) -> EpochRow:
+        return EpochRow(
+            epoch=epoch,
+            version=f"v{epoch}",
+            parent="noskill" if epoch == 1 else f"v{epoch - 1}",
+            n_train=2,
+            n_valid=2,
+            train_success=0.5,
+            valid_success=valid,
+            train_cost=0.1,
+            valid_cost=0.1,
+            train_success_by_model={},
+            valid_success_by_model={},
+            train_cost_by_model={},
+            valid_cost_by_model={},
+        )
+
+    rows = [row(i + 1, v) for i, v in enumerate(prior)]
+    tested: list[str] = []
+
+    def fake_epoch(*a: object, **k: object) -> object:
+        epoch = len(rows) + 1
+        rows.append(row(epoch, new[epoch - len(prior) - 1]))
+        return types.SimpleNamespace(
+            new_version=f"v{epoch}", first=False, resumed=False, parent_version=f"v{epoch - 1}"
+        )
+
+    monkeypatch.setattr(cli, "_prepare_pass", lambda cfg, args: ({}, "session", None, None))
+    monkeypatch.setattr(cli, "completed_epochs", lambda skills_root, *, valid_complete: len(prior))
+    monkeypatch.setattr(cli, "_run_one_epoch", fake_epoch)
+    monkeypatch.setattr(cli, "_run_test_phase", lambda best, **k: tested.append(best))
+    monkeypatch.setattr(cli, "build_training_rows", lambda runs_root, cfg: list(rows))
+    monkeypatch.setattr(cli, "write_training_csv", lambda rows, out: Path(out).write_text("version\n"))
+
+    paths = ["--config", str(tmp_path / "config.yaml"), "--tasks", str(tmp_path / "tasks.yaml")]
+    paths += ["--runs", str(tmp_path / "runs"), "--skills", str(tmp_path / "skills")]
+    paths += ["--wiki", str(tmp_path / "wiki"), "--out", str(tmp_path / "training.csv")]
+    assert main(["fit", *flags, *paths]) == 0
+    return len(rows) - len(prior), tested, capsys.readouterr().out
+
+
+def test_cmd_fit_resume_checks_patience_before_a_new_epoch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finished epochs that already exhausted patience (e.g. from a fixed --epochs run) start no new
+    epoch, but the best version — not the last — still goes to the held-out test."""
+    ran, tested, out = _resumed_fit(tmp_path, monkeypatch, capsys, prior=[0.6, 0.7, 0.65, 0.6], new=[], flags=[])
+    assert ran == 0
+    assert "early stop: validation mean success did not improve in 2 epoch(s)." in out
+    assert tested == ["v2"]
+
+
+def test_cmd_fit_fixed_epochs_resume_ignores_patience(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A fixed --epochs target keeps going past exhausted patience, and still tests the best."""
+    ran, tested, _ = _resumed_fit(
+        tmp_path, monkeypatch, capsys, prior=[0.6, 0.7, 0.65, 0.6], new=[0.5, 0.55], flags=["--epochs", "6"]
+    )
+    assert ran == 2
+    assert tested == ["v2"]
+
+
+def test_cmd_fit_resume_that_finds_a_new_best_tests_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A resumed patience fit whose new epochs beat the earlier best benches the new best on test."""
+    ran, tested, out = _resumed_fit(
+        tmp_path, monkeypatch, capsys, prior=[0.6, 0.7, 0.65], new=[0.8, 0.75, 0.7], flags=[]
+    )
+    assert ran == 3  # v4 is the new best; v5 and v6 exhaust patience
+    assert tested == ["v4"]
+    assert "held-out test: best improved v2 → v4; benching v4 on the test split" in out
+
+
 def test_cmd_fit_does_not_resume_past_a_completed_perfect_epoch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

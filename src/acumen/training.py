@@ -22,7 +22,7 @@ from pathlib import Path
 import pandas as pd
 
 from acumen.config import Config
-from acumen.report import load_results
+from acumen.report import first_best, load_results
 
 #: Matches a skill arm directory name (``skill_v1``, ``skill_v2``, …).
 _SKILL_ARM = re.compile(r"^skill_v(\d+)$")
@@ -217,12 +217,4 @@ def is_perfect(score: float | None) -> bool:
 
 def best_version(rows: list[EpochRow]) -> str | None:
     """The version with the highest validation mean success (first on a tie), or ``None``."""
-    best: str | None = None
-    best_value: float | None = None
-    for row in rows:
-        score = row.valid_success
-        if isinstance(score, float) and math.isnan(score):
-            continue
-        if best_value is None or score > best_value:
-            best_value, best = score, row.version
-    return best
+    return first_best((row.version, row.valid_success) for row in rows)
