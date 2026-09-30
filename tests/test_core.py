@@ -10,6 +10,7 @@ import ast
 import asyncio
 import html
 import json
+import math
 import os
 import re
 import shlex
@@ -17,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import time
+import types
 import warnings
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -149,7 +151,8 @@ from acumen.tasks import Task, TaskError, TaskSplit, load_tasks, parse_tasks
 from acumen.training import (
     best_version,
     build_training_rows,
-    epochs_since_best,
+    epochs_since_improvement,
+    improvement_anchor,
     is_perfect,
     patience_exhausted,
     write_training_csv,
@@ -5495,19 +5498,47 @@ def test_meta_model_defaults_to_the_first_benchmark_model() -> None:
 # --- training curve (acumen fit) --------------------------------------------------------
 
 
-def test_epochs_since_best_and_patience_use_strict_best_so_far() -> None:
-    """Improvement is strict > best-so-far; ties/worse count as no-improvement."""
-    assert epochs_since_best([0.79]) == 0
-    assert epochs_since_best([0.79, 0.70]) == 1
-    assert epochs_since_best([0.79, 0.70, 0.75]) == 2  # best is still v1
+def test_epochs_since_improvement_and_patience_use_strict_best_so_far_without_min_delta() -> None:
+    """With min_delta 0, improvement is strict > best-so-far; ties/worse count as no-improvement."""
+    assert epochs_since_improvement([0.79]) == 0
+    assert epochs_since_improvement([0.79, 0.70]) == 1
+    assert epochs_since_improvement([0.79, 0.70, 0.75]) == 2  # best is still v1
     # A later tie does not reset the best (must strictly beat it).
-    assert epochs_since_best([0.8, 0.8]) == 1
+    assert epochs_since_improvement([0.8, 0.8]) == 1
 
     assert patience_exhausted([0.79], 2) is False
     assert patience_exhausted([0.79, 0.70], 2) is False
     assert patience_exhausted([0.79, 0.70, 0.75], 2) is True
     # v1-best -> v2-worse -> v3-worse-than-v1 stops at patience 2 (the user's example).
     assert patience_exhausted([0.79, 0.70, 0.75], 1) is True
+
+
+def test_min_delta_counts_patience_from_the_last_significant_improvement() -> None:
+    """Patience counts from the last gain of more than min_delta, while the best stays the argmax —
+    so the best can sit inside the patience window, after the epoch patience counts from."""
+    valids = [0.597222, 0.694444, 0.743056, 0.729167]  # a real run: v3 misses v2 + 5pp by 0.0014
+    assert improvement_anchor(valids, 0.05) == 1
+    assert patience_exhausted(valids[:3], 2, 0.05) is False
+    assert patience_exhausted(valids, 2, 0.05) is True
+    rows = [types.SimpleNamespace(version=f"v{i + 1}", valid_success=v) for i, v in enumerate(valids)]
+    assert best_version(rows) == "v3"  # type: ignore[arg-type]
+    # Without min_delta the same curve is still improving at v3.
+    assert patience_exhausted(valids, 2) is False
+
+    # Small gains add up: 0.66 is more than 5pp over the anchor 0.60, even though no single step is.
+    assert improvement_anchor([0.60, 0.63, 0.66], 0.05) == 2
+    # Strictly more than min_delta: an exact 5pp gain is not an improvement.
+    assert improvement_anchor([0.70, 0.75], 0.05) == 0
+    # With min_delta 0, equal scores — even ones differing only by float noise — never reset
+    # patience, while a real (tiny) gain still does.
+    assert improvement_anchor([0.8, 0.8], 0.0) == 0
+    assert improvement_anchor([0.3, 0.1 + 0.2], 0.0) == 0
+    assert improvement_anchor([0.5, 0.500001], 0.0) == 1
+    # Missing scores are skipped for the anchor but still advance the count.
+    assert improvement_anchor([math.nan, 0.5, math.nan], 0.05) == 1
+    assert epochs_since_improvement([math.nan, 0.5, math.nan], 0.05) == 1
+    assert improvement_anchor([math.nan]) is None
+    assert epochs_since_improvement([math.nan]) == 0
 
 
 def test_is_perfect_only_for_a_full_pass() -> None:

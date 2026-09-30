@@ -62,7 +62,8 @@ from acumen.training import (
     EpochRow,
     best_version,
     build_training_rows,
-    epochs_since_best,
+    epochs_since_improvement,
+    improvement_anchor,
     is_perfect,
     patience_exhausted,
     write_training_csv,
@@ -343,17 +344,26 @@ def _fmt_rate(value: float | None) -> str:
     return f"{value:.0%}"
 
 
+def _fmt_pp(value: float) -> str:
+    """Format an absolute 0..1 success-rate delta as percentage points, e.g. ``0.05`` -> ``5pp``."""
+    return f"{value * 100:g}pp"
+
+
 def _epoch_bar(
     done: int,
     total: int,
     row: EpochRow | None,
     *,
-    best: str | None,
+    rows: list[EpochRow],
     patience: int,
-    since_best: int,
+    min_delta: float,
     fixed: bool,
 ) -> str:
-    """A tqdm-style one-liner summarising an epoch: bar, version, train/valid success, patience."""
+    """A tqdm-style one-liner summarising an epoch: bar, version, train/valid success, patience.
+
+    ``rows`` is the training curve up to and including this epoch; patience counts from its last
+    significant improvement, named when it is not also the best version.
+    """
     width = 14
     filled = round(width * done / total) if total else width
     bar = "█" * filled + "░" * (width - filled)
@@ -363,8 +373,13 @@ def _epoch_bar(
     parts = [f"Epoch {done}/{total} |{bar}| {version}", f"train {train}", f"valid {valid}"]
     if row is not None and not (isinstance(row.valid_cost, float) and math.isnan(row.valid_cost)):
         parts.append(f"${row.valid_cost:.2f}/run")
+    best = best_version(rows)
     if not fixed and best is not None:
-        parts.append(f"(best {best}, patience {min(since_best, patience)}/{patience})")
+        valids = [r.valid_success for r in rows]
+        since = epochs_since_improvement(valids, min_delta)
+        anchor = rows[improvement_anchor(valids, min_delta)].version
+        suffix = f" since {anchor} +{_fmt_pp(min_delta)}" if anchor != best else ""
+        parts.append(f"(best {best}, patience {min(since, patience)}/{patience}{suffix})")
     return "  ".join(parts)
 
 
@@ -1256,6 +1271,19 @@ def _cmd_epoch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _patience_stop_msg(rows: list[EpochRow], patience: int, min_delta: float) -> str:
+    """The early-stop line: which improvement patience counted from, and the best to be tested."""
+    valids = [row.valid_success for row in rows]
+    anchor = rows[improvement_anchor(valids, min_delta)]
+    best = next(row for row in rows if row.version == best_version(rows))
+    gain = f"by more than {_fmt_pp(min_delta)} " if min_delta else ""
+    return (
+        f"\nearly stop: validation did not improve {gain}over {anchor.version} "
+        f"({_fmt_rate(anchor.valid_success)}) in {patience} epoch(s); "
+        f"best is {best.version} ({_fmt_rate(best.valid_success)})."
+    )
+
+
 def _cmd_fit(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     tasks = load_tasks(args.tasks)
@@ -1274,6 +1302,9 @@ def _cmd_fit(args: argparse.Namespace) -> int:
     if total < 1:
         print("error: nothing to run — --epochs/--max-epochs must be >= 1", file=sys.stderr)
         return 2
+    if args.min_delta < 0:
+        print("error: --min-delta must be >= 0", file=sys.stderr)
+        return 2
 
     try:
         auth_modes, meta_auth, prices, target = _prepare_pass(cfg, args)
@@ -1286,19 +1317,24 @@ def _cmd_fit(args: argparse.Namespace) -> int:
     completed = completed_epochs(args.skills, valid_complete=_valid_complete_fn(cfg, tasks, args.runs))
     remaining = max(0, total - completed)
     prior = [row for row in build_training_rows(args.runs, cfg) if row.epoch <= completed] if completed else []
-    stopping = "early stopping disabled" if fixed else f"early stopping with patience {args.patience}"
+    stopping = f"early stopping with patience {args.patience}, min-delta {_fmt_pp(args.min_delta)}"
+    if fixed:
+        stopping = "early stopping disabled"
     if completed:
         print(f"fit: target {total} epoch(s) total ({stopping}); {completed} done, {remaining} to go")
         # Show the progress of the epochs already finished (skip any in-progress/partial version).
-        prior_best = best_version(prior)
         print(f"\nresuming: {completed} epoch(s) already complete (target {total})")
         for index, row in enumerate(prior):
-            since = epochs_since_best([r.valid_success for r in prior[: index + 1]])
-            print(
-                _epoch_bar(
-                    row.epoch, total, row, best=prior_best, patience=args.patience, since_best=since, fixed=fixed
-                )
+            bar = _epoch_bar(
+                row.epoch,
+                total,
+                row,
+                rows=prior[: index + 1],
+                patience=args.patience,
+                min_delta=args.min_delta,
+                fixed=fixed,
             )
+            print(bar)
     else:
         print(f"fit: target {total} epoch(s) total ({stopping})")
 
@@ -1308,13 +1344,17 @@ def _cmd_fit(args: argparse.Namespace) -> int:
     # Likewise a resumed patience fit whose finished epochs already exhausted patience (e.g. after
     # an earlier fixed --epochs run) must not start another epoch: the in-loop check only runs
     # after an epoch completes.
-    already_patient = not fixed and bool(prior) and patience_exhausted([r.valid_success for r in prior], args.patience)
+    already_patient = (
+        not fixed
+        and bool(prior)
+        and patience_exhausted([r.valid_success for r in prior], args.patience, args.min_delta)
+    )
     if already_perfect is not None:
         print(f"\nearly stop: validation success already reached 100% at {already_perfect.version}.")
     elif remaining == 0:
         print(f"\nnothing to do: already at {completed} epoch(s) (target {total}).")
     elif already_patient:
-        print(f"\nearly stop: validation mean success did not improve in {args.patience} epoch(s).")
+        print(_patience_stop_msg(prior, args.patience, args.min_delta))
 
     prior_best = best_version(prior)
     mode = _progress_mode(args)
@@ -1344,17 +1384,19 @@ def _cmd_fit(args: argparse.Namespace) -> int:
         write_training_csv(rows, args.out)
         current = next((row for row in rows if row.version == plan.new_version), None)
         valids = [row.valid_success for row in rows]
-        best = best_version(rows)
-        since = epochs_since_best(valids)
-        print(_epoch_bar(epoch_no, total, current, best=best, patience=args.patience, since_best=since, fixed=fixed))
+        print(
+            _epoch_bar(
+                epoch_no, total, current, rows=rows, patience=args.patience, min_delta=args.min_delta, fixed=fixed
+            )
+        )
 
         # A perfect validation score leaves nothing to gain — stop even under a fixed --epochs.
         if current is not None and is_perfect(current.valid_success):
             print(f"\nearly stop: validation success reached 100% at {current.version}.")
             break
 
-        if not fixed and patience_exhausted(valids, args.patience):
-            print(f"\nearly stop: validation mean success did not improve in {args.patience} epoch(s).")
+        if not fixed and patience_exhausted(valids, args.patience, args.min_delta):
+            print(_patience_stop_msg(rows, args.patience, args.min_delta))
             break
 
     rows = build_training_rows(args.runs, cfg)
@@ -2055,6 +2097,13 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--out", type=Path, default=Path("training.csv"), help="training-curve CSV to write")
     fit.add_argument(
         "--patience", type=int, default=2, help="stop after this many epochs with no validation gain (default: 2)"
+    )
+    fit.add_argument(
+        "--min-delta",
+        type=float,
+        default=0.05,
+        help="an epoch counts as improvement only if validation mean success beats the last "
+        "improvement by more than this (absolute, 0..1; default: 0.05 = 5pp; 0 = any gain)",
     )
     fit.add_argument("--max-epochs", type=int, default=10, help="hard cap on epochs (default: 10)")
     fit.add_argument(

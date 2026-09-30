@@ -3,7 +3,7 @@
 ``acumen fit`` runs many epochs; this module turns the accumulated ``runs/`` tree into one row per
 epoch — one per produced skill version — carrying mean success and mean cost, overall and per
 model, for the train arm the epoch learned from and the valid arm it produced. It also holds the
-pure early-stopping rule (patience over validation mean success).
+pure early-stopping rule (patience with a min-delta over validation mean success).
 
 Everything here is rebuilt from disk each epoch rather than accumulated in memory, so a resumed
 ``fit`` yields exactly the same table. Each version ``vN`` is epoch N: the *valid* arm is
@@ -182,28 +182,43 @@ def write_training_csv(rows: list[EpochRow], path: Path) -> None:
 # ── Early stopping ───────────────────────────────────────────────────────────────────────
 
 
-def epochs_since_best(scores: list[float]) -> int:
-    """How many epochs have passed since the best validation score, counting from its first hit.
+def _missing(score: float | None) -> bool:
+    return score is None or (isinstance(score, float) and math.isnan(score))
 
-    The best is the *first* version achieving the maximum (strict ``>`` — a later tie does not
-    reset it), matching the rule that a new version must strictly beat the best-so-far to count as
-    improvement. ``nan`` scores are ignored when finding the best but still advance the count.
+
+def improvement_anchor(scores: list[float], min_delta: float = 0.0) -> int | None:
+    """Index of the last *significant* improvement in validation score, or ``None`` if all missing.
+
+    The anchor starts at the first scored epoch and moves only to a later epoch that beats the
+    anchor's score by strictly more than ``min_delta`` (absolute, in 0..1). Small gains therefore
+    do not reset patience, but gains that add up to more than ``min_delta`` over the anchor do.
+    ``min_delta=0`` is plain strict ``>`` improvement. The anchor is not necessarily the best
+    version — that is always the plain argmax (``best_version``), which may fall after it.
+    ``nan`` scores are skipped.
     """
-    best_index: int | None = None
-    best_value: float | None = None
+    anchor: int | None = None
     for index, score in enumerate(scores):
-        if score is None or (isinstance(score, float) and math.isnan(score)):
+        if _missing(score):
             continue
-        if best_value is None or score > best_value:
-            best_value, best_index = score, index
-    if best_index is None:
-        return 0
-    return (len(scores) - 1) - best_index
+        # The epsilon only ever raises the bar, so float rounding can neither make an exact k/n gain
+        # of min_delta (0.70 -> 0.75) count nor, with min_delta 0, let an equal score reset patience.
+        if anchor is None or score - scores[anchor] > min_delta + 1e-9:
+            anchor = index
+    return anchor
 
 
-def patience_exhausted(scores: list[float], patience: int) -> bool:
-    """Whether validation has failed to improve for ``patience`` consecutive epochs."""
-    return epochs_since_best(scores) >= patience
+def epochs_since_improvement(scores: list[float], min_delta: float = 0.0) -> int:
+    """How many epochs have passed since the last significant improvement (``improvement_anchor``).
+
+    ``nan`` scores still advance the count.
+    """
+    anchor = improvement_anchor(scores, min_delta)
+    return 0 if anchor is None else (len(scores) - 1) - anchor
+
+
+def patience_exhausted(scores: list[float], patience: int, min_delta: float = 0.0) -> bool:
+    """Whether validation has not improved by more than ``min_delta`` for ``patience`` epochs."""
+    return epochs_since_improvement(scores, min_delta) >= patience
 
 
 def is_perfect(score: float | None) -> bool:
@@ -212,7 +227,7 @@ def is_perfect(score: float | None) -> bool:
     A perfect score leaves nothing to gain, so ``fit`` stops on it regardless of the epoch cap.
     ``None``/``nan`` (an arm with no runs) is not perfect.
     """
-    return score is not None and not (isinstance(score, float) and math.isnan(score)) and score >= 1.0
+    return not _missing(score) and score >= 1.0
 
 
 def best_version(rows: list[EpochRow]) -> str | None:

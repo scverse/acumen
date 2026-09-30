@@ -65,16 +65,18 @@ def test_parser_requires_a_command() -> None:
 
 
 def test_fit_parser_defaults_and_overrides() -> None:
-    """`fit` defaults to patience 2 / max-epochs 10; `--epochs` is an explicit fixed count."""
+    """`fit` defaults to patience 2 / min-delta 5pp / max-epochs 10; `--epochs` is an explicit fixed count."""
     parser = build_parser()
 
     args = parser.parse_args(["fit"])
     assert args.func.__name__ == "_cmd_fit"
     assert args.patience == 2 and args.max_epochs == 10 and args.epochs is None
+    assert args.min_delta == 0.05
     assert args.out == Path("training.csv")
 
     args = parser.parse_args(["fit", "--epochs", "3", "--patience", "1", "--max-epochs", "5", "--out", "curve.csv"])
     assert args.epochs == 3 and args.patience == 1 and args.max_epochs == 5
+    assert parser.parse_args(["fit", "--min-delta", "0"]).min_delta == 0.0
     assert args.out == Path("curve.csv")
 
 
@@ -471,7 +473,9 @@ def test_cmd_fit_resume_checks_patience_before_a_new_epoch(
     epoch, but the best version — not the last — still goes to the held-out test."""
     ran, tested, out = _resumed_fit(tmp_path, monkeypatch, capsys, prior=[0.6, 0.7, 0.65, 0.6], new=[], flags=[])
     assert ran == 0
-    assert "early stop: validation mean success did not improve in 2 epoch(s)." in out
+    assert (
+        "early stop: validation did not improve by more than 5pp over v2 (70%) in 2 epoch(s); best is v2 (70%)." in out
+    )
     assert tested == ["v2"]
 
 
@@ -496,6 +500,42 @@ def test_cmd_fit_resume_that_finds_a_new_best_tests_it(
     assert ran == 3  # v4 is the new best; v5 and v6 exhaust patience
     assert tested == ["v4"]
     assert "held-out test: best improved v2 → v4; benching v4 on the test split" in out
+
+
+def test_cmd_fit_min_delta_stops_early_but_tests_the_best_inside_the_patience_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """v3 is the best but gains under 5pp over v2, so patience counts from v2 and stops after v4 —
+    and the held-out test benches v3, not v2 (where patience started) or v4 (where it ran out)."""
+    ran, tested, out = _resumed_fit(
+        tmp_path, monkeypatch, capsys, prior=[0.597222], new=[0.694444, 0.743056, 0.729167, 0.8], flags=[]
+    )
+    assert ran == 3
+    assert tested == ["v3"]
+    assert "(best v3, patience 2/2 since v2 +5pp)" in out
+    assert "over v2 (69%) in 2 epoch(s); best is v3 (74%)." in out
+
+
+def test_cmd_fit_min_delta_zero_counts_any_gain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--min-delta 0` restores strict best-so-far patience: v3's small gain keeps the fit going."""
+    ran, tested, _ = _resumed_fit(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        prior=[0.597222],
+        new=[0.694444, 0.743056, 0.729167, 0.72],
+        flags=["--min-delta", "0"],
+    )
+    assert ran == 4
+    assert tested == ["v3"]
+
+
+def test_cmd_fit_rejects_negative_min_delta(tmp_path: Path) -> None:
+    assert main(["init", "--dir", str(tmp_path)]) == 0
+    paths = ["--config", str(tmp_path / "config.yaml"), "--tasks", str(tmp_path / "tasks.yaml")]
+    assert main(["fit", "--min-delta", "-0.1", *paths]) == 2
 
 
 def test_cmd_fit_does_not_resume_past_a_completed_perfect_epoch(
