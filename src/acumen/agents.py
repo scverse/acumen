@@ -17,10 +17,12 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import re
 import shlex
 import shutil
 import signal
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Sequence
 from contextlib import aclosing, suppress
@@ -119,6 +121,13 @@ class AgentOptions:
     #: agent. The shipper sets it False: it is the one agent that runs in the operator's real
     #: environment on purpose, and it needs the git and ``gh`` credentials that live there.
     confine: bool = True
+    #: When set, install a ``PreToolUse`` source guard (:func:`acumen.scrub.make_source_guard` on
+    #: Claude, its Codex equivalent) that denies fetching the target's own repository or source
+    #: distribution. ``block_repo`` is the target's remote URL (``None`` for a local target, whose
+    #: source is not fetchable anyway); ``block_pkg`` is the installed package name. Set only for
+    #: benchmark runs; meta-agents and ``ship`` leave both ``None``.
+    block_repo: str | None = None
+    block_pkg: str | None = None
     stderr: Callable[[str], None] | None = None
     #: Prices one provider usage block in USD. Claude enforces ``max_usd`` itself against the
     #: figure it bills; Codex reports tokens and no dollar amount, so enforcing a budget there
@@ -247,21 +256,28 @@ def _claude_hooks(options: AgentOptions) -> dict[str, Any]:
     alongside containment.
     """
     hooks: dict[str, Any] = {key: list(value) for key, value in (options.claude_hooks or {}).items()}
-    if not options.confine:
-        return hooks
+    pre = list(hooks.get("PreToolUse", []))
 
-    from acumen.guard import containment_hook
+    if options.block_repo or options.block_pkg:
+        from acumen.scrub import make_source_guard
 
-    reads, _ = _access_roots(options)
-    agent_home = options.env.get("HOME")
-    guard = containment_hook(
-        reads,
-        options.deny_paths,
-        cwd=options.cwd,
-        home=Path(agent_home) if agent_home else None,
-    )
-    hooks.setdefault("PreToolUse", [])
-    hooks["PreToolUse"] = [guard, *hooks["PreToolUse"]]
+        pre.insert(0, make_source_guard(options.block_repo, options.block_pkg))
+
+    if options.confine:
+        from acumen.guard import containment_hook
+
+        reads, _ = _access_roots(options)
+        agent_home = options.env.get("HOME")
+        guard = containment_hook(
+            reads,
+            options.deny_paths,
+            cwd=options.cwd,
+            home=Path(agent_home) if agent_home else None,
+        )
+        pre.insert(0, guard)
+
+    if pre:
+        hooks["PreToolUse"] = pre
     return hooks
 
 
@@ -520,7 +536,7 @@ def _codex_command(options: AgentOptions, prompt: str) -> list[str]:
         "--model",
         options.model,
     ]
-    if options.deny_paths:
+    if options.deny_paths or options.block_repo or options.block_pkg:
         command.append("--dangerously-bypass-hook-trust")
     reads, writes = _access_roots(options)
     # The Linux command sandbox re-executes the Codex binary through bubblewrap.
@@ -531,6 +547,10 @@ def _codex_command(options: AgentOptions, prompt: str) -> list[str]:
     # evaluates the command path it is given, so allowing /usr/bin does not make
     # an invocation through the /bin -> /usr/bin symlink readable.
     reads.extend(path for path in (Path("/bin"), Path("/lib"), Path("/lib64")) if path.exists())
+    if options.block_repo or options.block_pkg:
+        # The source guard imports acumen.scrub; make the package importable inside the sandbox
+        # regardless of install layout (an editable install lives outside the venv prefix).
+        reads.append(_acumen_package_root())
     reads = list(dict.fromkeys(reads))
     command.extend(("-c", 'default_permissions="acumen"'))
     filesystem = {":root": "deny", ":minimal": "read"}
@@ -556,9 +576,26 @@ def _codex_command(options: AgentOptions, prompt: str) -> list[str]:
     return command
 
 
-def _codex_guard_source(denied: Sequence[Path]) -> str:
-    """Return a standalone Codex PreToolUse guard for absolute denied roots."""
+def _acumen_package_root() -> Path:
+    """Directory containing the importable ``acumen`` package (its parent on ``sys.path``)."""
+    import acumen
+
+    return Path(acumen.__file__).resolve().parent.parent
+
+
+def _codex_guard_source(denied: Sequence[Path], *, repo: str | None = None, pkg_name: str | None = None) -> str:
+    """Return a standalone Codex PreToolUse guard.
+
+    Denies two things, either optional: any path resolving under ``denied`` (filesystem
+    containment), and — via :func:`acumen.scrub.find_source_fetch`, imported at run time because
+    the guard executes under acumen's own interpreter — any attempt to fetch the target's own
+    source repository/distribution (``repo``/``pkg_name``). Mirrors the Claude-side
+    :func:`acumen.scrub.make_source_guard` so both providers enforce the same rule.
+    """
     roots = repr([str(path.resolve()) for path in denied])
+    repo_repr = repr(repo)
+    pkg_repr = repr(pkg_name)
+    acumen_root_repr = repr(str(_acumen_package_root()))
     return f"""\
 import json
 import shlex
@@ -566,6 +603,8 @@ import sys
 from pathlib import Path
 
 ROOTS = [Path(value) for value in {roots}]
+REPO = {repo_repr}
+PKG = {pkg_repr}
 
 
 def blocked(value, cwd):
@@ -606,30 +645,50 @@ def strings(value):
             yield from strings(item)
 
 
+def deny(reason):
+    print(json.dumps({{
+        "hookSpecificOutput": {{
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }}
+    }}))
+    raise SystemExit(0)
+
+
 payload = json.load(sys.stdin)
 cwd = Path(payload.get("cwd") or ".").resolve()
-for value in strings(payload.get("tool_input") or {{}}):
+tool_input = payload.get("tool_input") or {{}}
+for value in strings(tool_input):
     hit = blocked(value, cwd)
     if hit is not None:
-        print(json.dumps({{
-            "hookSpecificOutput": {{
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": "acumen blocks access to isolated benchmark data: " + hit,
-            }}
-        }}))
-        raise SystemExit(0)
+        deny("acumen blocks access to isolated benchmark data: " + hit)
+
+if REPO or PKG:
+    if {acumen_root_repr} not in sys.path:
+        sys.path.insert(0, {acumen_root_repr})
+    try:
+        from acumen.scrub import find_source_fetch
+    except Exception:
+        find_source_fetch = None
+    if find_source_fetch is not None:
+        hit = find_source_fetch(payload.get("tool_name", ""), tool_input, repo=REPO, pkg_name=PKG)
+        if hit is not None:
+            deny(
+                "acumen benchmarks against the installed package only; fetching the target's "
+                "source repository or distribution is not permitted: " + str(hit)
+            )
 """
 
 
 def _install_codex_guard(options: AgentOptions) -> None:
     """Install a trusted, run-local Codex guard when isolation needs a deny boundary."""
-    if not options.deny_paths:
+    if not options.deny_paths and not (options.block_repo or options.block_pkg):
         return
     codex_home = Path(options.env["CODEX_HOME"])
     script = codex_home / "acumen_guard.py"
     script.parent.mkdir(parents=True, exist_ok=True)
-    script.write_text(_codex_guard_source(options.deny_paths))
+    script.write_text(_codex_guard_source(options.deny_paths, repo=options.block_repo, pkg_name=options.block_pkg))
     hooks_dir = options.cwd / ".codex"
     hooks_dir.mkdir(parents=True, exist_ok=True)
     hooks = {
@@ -694,6 +753,54 @@ def _sandbox_failure(lines: Sequence[str]) -> str | None:
         if any(marker in lowered for marker in _SANDBOX_FAILURES):
             return line.strip()
     return None
+
+
+async def codex_sandbox_probe(env: dict[str, str], *, timeout: float = 30.0) -> str | None:
+    """Return ``None`` if Codex's command sandbox can start here, else an actionable error string.
+
+    Runs ``codex sandbox -- true`` — no model call, so it is free and deterministic — and reads
+    its stderr for a namespace/sandbox-init failure. Codex runs every benchmark command inside
+    this sandbox, so if it cannot start, no Codex run can save an answer; catching it in preflight
+    turns a paid, per-run ``error_sandbox`` into one free up-front message.
+
+    Conservative on purpose: a probe that cannot run, times out, or exits non-zero for a reason
+    that is *not* a recognised sandbox failure returns ``None`` (let the run proceed) rather than
+    block a setup that might work. Only a matched sandbox-init failure is reported.
+    """
+    cli = shutil.which("codex", path=env.get("PATH"))
+    if cli is None:
+        return None  # a missing CLI is reported by check_agent_cli; nothing to probe here
+    # Run in a throwaway empty directory with the read-only profile. This tests only the one thing
+    # that fails on a locked-down host — whether Codex can create its namespace sandbox at all —
+    # without the workspace profile's git-protection, which mounts a tmpfs over the workspace's
+    # ``.git`` and errors in a non-repo directory (a false positive unrelated to the real runs,
+    # which use their own filesystem profile in a temp sandbox dir).
+    probe_dir = tempfile.mkdtemp(prefix="acumen-codex-probe-")
+    argv = [cli, "sandbox", "-c", 'default_permissions=":read-only"', "--", "true"]
+    proc: asyncio.subprocess.Process | None = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, cwd=probe_dir, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (OSError, TimeoutError):
+        if proc is not None:
+            with suppress(ProcessLookupError):
+                proc.kill()
+        return None
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+    if proc.returncode == 0:
+        return None
+    hit = _sandbox_failure(stderr.decode("utf-8", "replace").splitlines())
+    if hit is None:
+        return None  # non-zero for some other reason — not a namespace block
+    return (
+        "codex's command sandbox could not start on this system, so no codex run can execute its "
+        f"commands or save an answer ({hit}). codex isolates every benchmark command inside an "
+        "unprivileged namespace sandbox, which this host does not currently permit. Enable "
+        "unprivileged user namespaces for codex, or run acumen where they are allowed."
+    )
 
 
 def _is_turn_item(event: dict[str, Any]) -> bool:
@@ -918,6 +1025,21 @@ def _codex_terminal(
     )
 
 
+# ``codex exec`` prints this to stderr whenever its stdin is not a TTY (acumen wires it to
+# /dev/null), then reads immediate EOF and appends an empty ``<stdin>`` block. It is benign
+# but reads as a confusing prompt to anyone watching the run, so drop it before it surfaces.
+_CODEX_STDIN_NOTICE = "Reading additional input from stdin"
+
+# Codex's own ``tracing`` logs, shaped ``<RFC3339 timestamp>Z <LEVEL> codex_<module>: <msg>``.
+# They report Codex-internal events (rollout writes after a session ends, commands the sandbox
+# denies under ``approval_policy="never"``, the model's malformed ``apply_patch`` attempts) that
+# are captured in the run transcript anyway and never signal an acumen fault — so they are noise
+# on the console, and worse they corrupt the ``\r`` progress bars. Kept in the noise sink for
+# sandbox-failure detection, but never echoed. Real bwrap/kernel sandbox errors are bare (no
+# ``codex_`` prefix), so they still print and are still detected.
+_CODEX_TRACE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+(?:ERROR|WARN|INFO|DEBUG|TRACE)\s+codex")
+
+
 async def _drain_stderr(
     stream: asyncio.StreamReader,
     callback: Callable[[str], None] | None,
@@ -925,8 +1047,21 @@ async def _drain_stderr(
 ) -> None:
     while line := await stream.readline():
         text = line.decode(errors="replace").rstrip("\r\n")
+        if _CODEX_STDIN_NOTICE in text:
+            continue
         if sink is not None:
             sink.append(text)
+        if _CODEX_TRACE_RE.match(text):
+            continue
+        # Everything else Codex renders to stderr is its human-readable transcript — the agent's
+        # messages, the commands it runs, the source of the files it writes. All of it is already
+        # on the ``--json`` stdout stream (recorded to the run log), so echoing it here only
+        # duplicates the transcript and, worse, interleaves with the ``\r`` progress bar on the
+        # shared TTY and corrupts it. The one thing worth surfacing live is a genuine sandbox/
+        # harness failure — bare (no ``codex_`` prefix) and matched by :data:`_SANDBOX_FAILURES`.
+        # Forward only that; the rest stays in ``sink`` for detection and the saved log.
+        if _sandbox_failure((text,)) is None:
+            continue
         if callback is not None:
             callback(text)
         else:

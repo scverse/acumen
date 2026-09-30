@@ -43,19 +43,23 @@ max_usd: 3.0                          # budget cap (USD) for benchmark agents; d
 
 meta_model: claude-opus-5             # model for the meta-agent commands (draft, improve, tasks, ship, check)
 
+# bench_auth: auto                    # credential for benchmark agents: auto|session|api (CLI --auth/--bench-auth override)
+# meta_auth: auto                     # credential for the meta-agent: auto|session|api (CLI --auth/--meta-auth override)
+
 # skill_name: your_skill              # name for the built skill; defaults to the repo's name
 """
 
 #: A tasks file with one placeholder task, showing the required shape. Each task needs a
-#: stable `id` and a train/test pair; the answer is graded by exact string match after
+#: stable `id` and a train/valid pair; the answer is graded by exact string match after
 #: `strip()`.
 TASKS_TEMPLATE = """\
 # acumen tasks — what the agent is asked to do, and the answer it is graded against.
 #
 # Each task has a stable `id` (used in run paths — renaming it orphans old runs) and a
-# train/test pair. The improver only ever sees train results; test is the held-out measure
-# of whether a skill actually helps. Answers are compared by EXACT string match after
-# strip(), so keep them to a single unambiguous token.
+# train/valid/test triple. The improver only ever sees train results; valid is the held-out
+# measure used to pick the best version; test is the untouched final split, benched once at the
+# end of a fit on the best version and the baseline. Answers are compared by EXACT string match
+# after strip(), so keep them to a single unambiguous token.
 #
 # Do NOT name the target package in a prompt. The agent is already told, before every task,
 # that your package (from `config.yaml`) is installed and is the one to use — so "using
@@ -81,10 +85,15 @@ tasks:
         — the data, the goal, and exactly what to report. Do not name the package (it is
         provided). End by asking for only the final answer, so it grades as a single token.
       answer: REPLACE_ME_TRAIN
+    valid:
+      prompt: >-
+        The same kind of analysis on a different, held-out input. This split picks the best
+        version; the improver never sees its results.
+      answer: REPLACE_ME_VALID
     test:
       prompt: >-
-        The same kind of analysis on a different, held-out input. This split is what measures
-        whether the skill generalizes; the improver never sees its results.
+        The same kind of analysis on a third, untouched input. This split is benched only once
+        at the end of a fit, as the final check that the skill generalizes.
       answer: REPLACE_ME_TEST
 """
 

@@ -26,12 +26,14 @@ Reason = Literal[
     "error",
     "provider_exhausted",
     "sandbox_blocked",
+    "connection_error",
 ]
 
 #: Reasons that mark a run as a harness failure rather than evidence about a model. A run
 #: with one of these is recorded for diagnosis but must never reach a report, an improve
-#: pass, or a resume as though it measured something.
-INVALID_REASONS: frozenset[Reason] = frozenset({"provider_exhausted", "sandbox_blocked"})
+#: pass, or a resume as though it measured something — and it stays pending so a later run
+#: retries it (``connection_error`` is a transient network drop, not the model's fault).
+INVALID_REASONS: frozenset[Reason] = frozenset({"provider_exhausted", "sandbox_blocked", "connection_error"})
 
 _FENCE_RE = re.compile(r"^\s*```[^\n]*\n(?P<body>.*?)\n?\s*```\s*$", re.DOTALL)
 _HEADER_LINE_RE = re.compile(r"^\s*#+\s")

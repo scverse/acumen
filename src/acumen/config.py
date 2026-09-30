@@ -54,6 +54,14 @@ class Config:
     #: subjects; ``meta_model`` is the tooling that builds and vets a skill. Defaults to the
     #: first ``models`` entry, so one ``models:`` line configures the lot.
     meta_model: str = "claude-opus-5"
+    #: Default credential for the benchmark agents — ``"auto"`` (session if logged in, else the
+    #: API), ``"session"``, or ``"api"``. ``None`` means unset ⇒ ``"auto"``. Overridden by the
+    #: CLI ``--auth``/``--bench-auth``. Split from :attr:`meta_auth` so the benches and the
+    #: meta-agent can bill different credentials (e.g. metered benches, subscription meta).
+    bench_auth: str | None = None
+    #: Default credential for the meta-agent commands (``improve``, ``wiki``, ``tasks``), same
+    #: values as :attr:`bench_auth`. ``None`` ⇒ ``"auto"``. Overridden by ``--auth``/``--meta-auth``.
+    meta_auth: str | None = None
     #: Per-model token rates (USD per million), overriding or extending the built-in table
     #: in :mod:`acumen.prices`. Name a model here when you are on negotiated rates, run
     #: through a gateway, or use a model acumen does not ship a price for — an unpriced
@@ -82,9 +90,14 @@ _KNOWN = {
     "max_turns",
     "max_usd",
     "meta_model",
+    "bench_auth",
+    "meta_auth",
     "skill_name",
     "prices",
 }
+
+#: The credential choices a config auth field or an ``--auth`` flag accepts.
+AUTH_CHOICES = ("auto", "session", "api")
 
 
 def _looks_remote(repo: str) -> bool:
@@ -117,6 +130,16 @@ def _optional_str(raw: dict[str, Any], key: str, default: str) -> str:
     if key not in raw:
         return default
     return _require_str(raw, key)
+
+
+def _optional_choice(raw: dict[str, Any], key: str, choices: tuple[str, ...]) -> str | None:
+    """Return a validated choice string for ``key``, or ``None`` when the key is absent."""
+    if key not in raw:
+        return None
+    value = raw[key]
+    if not isinstance(value, str) or value not in choices:
+        raise ConfigError(f"'{key}' must be one of {list(choices)}, got {value!r}")
+    return value
 
 
 def _positive_int(raw: dict[str, Any], key: str, default: int) -> int:
@@ -209,6 +232,8 @@ def parse_config(raw: Any) -> Config:
         max_turns=_positive_int(raw, "max_turns", 40),
         max_usd=_positive_float(raw, "max_usd", 3.0),
         meta_model=_optional_str(raw, "meta_model", default_model),
+        bench_auth=_optional_choice(raw, "bench_auth", AUTH_CHOICES),
+        meta_auth=_optional_choice(raw, "meta_auth", AUTH_CHOICES),
         prices=_prices(raw),
     )
 

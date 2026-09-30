@@ -13,9 +13,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-Split = Literal["train", "test"]
+# ``valid`` is held out from the improver but still picks the best version, so it is really a
+# validation split. ``test`` is the true holdout: nothing in the loop ever sees it, and it is
+# benched only once at the end of a fit on the single best version and the baseline.
+Split = Literal["train", "valid", "test"]
 
-SPLITS: tuple[Split, ...] = ("train", "test")
+#: Every legal split. Used for path validation, task parsing, generation and checking.
+SPLITS: tuple[Split, ...] = ("train", "valid", "test")
+
+#: The splits benched during normal epochs and by ``acumen bench`` with no ``--split``. ``test``
+#: is deliberately excluded so it stays untouched until the final held-out evaluation.
+BENCH_SPLITS: tuple[Split, ...] = ("train", "valid")
 
 NOSKILL_ARM = "noskill"
 

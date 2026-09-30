@@ -10,11 +10,17 @@ from pathlib import Path
 from acumen.agents import AgentProvider, provider_for_model
 from acumen.config import Config
 from acumen.env import AuthMode, Target
-from acumen.paths import SPLITS, RunKey, Split, arm_name, is_complete, run_dir
+from acumen.paths import BENCH_SPLITS, SPLITS, RunKey, Split, arm_name, is_complete, run_dir
 from acumen.prices import PriceTable
 from acumen.runner import RunOutcome, run_once
 from acumen.skills import Skill
 from acumen.tasks import Task
+
+#: Invalid reasons that stop the rest of a provider's cells for this pass: the credential is
+#: empty (``provider_exhausted``) or the network is down (``connection_error``). Both would fail
+#: every remaining cell the same way, so the pass raises ``BenchmarkInvalidError`` and the cells
+#: stay pending for the next run to resume. ``sandbox_blocked`` is handled separately (pass-scoped).
+_PROVIDER_SCOPED_STOP = frozenset({"provider_exhausted", "connection_error"})
 
 
 @dataclass(frozen=True)
@@ -77,13 +83,14 @@ def build_matrix(
     tasks: Sequence[Task],
     *,
     skill: str | None = None,
-    splits: Iterable[Split] = SPLITS,
+    splits: Iterable[Split] = BENCH_SPLITS,
     task_ids: Sequence[str] | None = None,
 ) -> list[PlannedRun]:
     """Expand config and tasks into the full list of runs for one arm.
 
-    A pass is models x tasks x replicates x splits. Both splits always run; only
-    train results are ever shown to the improver, and that is enforced downstream.
+    A pass is models x tasks x replicates x splits. The default benches train and valid; the
+    held-out ``test`` split is only ever run when asked for explicitly. Only train results are
+    ever shown to the improver, and that is enforced downstream.
 
     Parameters
     ----------
@@ -275,7 +282,7 @@ async def run_matrix(
                     if peer is not asyncio.current_task() and not peer.done():
                         peer.cancel()
                 return outcome
-            if outcome.reason == "provider_exhausted" and provider not in exhausted:
+            if outcome.reason in _PROVIDER_SCOPED_STOP and provider not in exhausted:
                 exhausted[provider] = outcome
                 current = asyncio.current_task()
                 # Stop both queued and in-flight siblings for this provider. Tasks for the
@@ -314,6 +321,13 @@ async def run_matrix(
     return outcomes
 
 
+#: Budget cap for the auth-probe run. Generous on purpose: the probe is bounded by ``max_turns=5``
+#: and only confirms the credential works, but one turn carries the full ``claude_code`` system
+#: prompt, whose input cost at a premium model's rate can exceed a tight cap and fail preflight
+#: before the model replies. A trivial "reply ok" never approaches this.
+PREFLIGHT_MAX_USD = 2.0
+
+
 async def _preflight_model(
     model: str,
     *,
@@ -323,7 +337,7 @@ async def _preflight_model(
     env_passthrough: Sequence[str] | None,
 ) -> str | None:
     """Return None if the model can authenticate, else a short error string."""
-    from acumen.agents import AgentOptions, run_agent
+    from acumen.agents import AgentOptions, codex_sandbox_probe, run_agent
     from acumen.sandbox import sandbox
 
     provider = provider_for_model(model)
@@ -335,14 +349,27 @@ async def _preflight_model(
             provider=provider,
             env_passthrough=env_passthrough,
         ) as box:
+            # Codex runs every command inside its own namespace sandbox. A trivial auth probe
+            # writes no files and runs no command, so it would pass even where that sandbox
+            # cannot start — and then every real run fails with error_sandbox after paying for
+            # the tokens. Test the sandbox itself first (free, no model call); report and stop
+            # here if it cannot start.
+            if provider == "codex":
+                sandbox_error = await codex_sandbox_probe(box.env)
+                if sandbox_error is not None:
+                    return sandbox_error
             result = await run_agent(
                 "Reply with only the word: ok",
                 options=AgentOptions(
                     cwd=box.root,
                     env=box.env,
                     model=model,
+                    # Bounded by turns, not dollars: the probe only confirms the credential works,
+                    # but one turn carries the full claude_code system prompt, whose input cost at a
+                    # premium model's rate (Opus) exceeds a tight cap — so a dollar cap that low
+                    # fails preflight before the model can reply. max_turns=5 already bounds it.
                     max_turns=5,
-                    max_usd=0.10,
+                    max_usd=PREFLIGHT_MAX_USD,
                     discover_skills=False,
                     confine=False,
                 ),

@@ -164,13 +164,17 @@ class LiveLog:
         if result is None:
             return False
         prompt = getattr(result, "prompt", "")
+        # The run's authoritative usage — what it is billed on — so the footer matches result.json
+        # rather than re-summing the session file's per-message usage (which overcounts, since each
+        # turn re-counts the cached context).
+        usage = getattr(result, "usage", None)
         if getattr(result, "provider", "claude") == "codex":
-            traj = from_codex_events(getattr(result, "transcript", []), prompt=prompt)
+            traj = from_codex_events(getattr(result, "transcript", []), prompt=prompt, usage=usage)
         else:
             if not result.session_id:
                 return False
             native = locate_transcript(config_dir, work_dir, result.session_id)
-            traj = from_claude_transcript(native, prompt=prompt) if native and native.is_file() else None
+            traj = from_claude_transcript(native, prompt=prompt, usage=usage) if native and native.is_file() else None
         if traj is None:
             return False
         write_trajectory_json(traj, self.jsonl_path.with_suffix(".trajectory.json"))

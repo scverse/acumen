@@ -78,9 +78,13 @@ def _read_events(jsonl: Path) -> list[dict[str, Any]] | None:
     return events
 
 
-def render_transcript(jsonl: Path, html: Path, *, prompt: str = "") -> bool:
-    """Render a Claude SDK-native transcript to HTML through the unified renderer."""
-    traj = from_claude_transcript(jsonl, prompt=prompt)
+def render_transcript(jsonl: Path, html: Path, usage: dict[str, Any] | None = None, *, prompt: str = "") -> bool:
+    """Render a Claude SDK-native transcript to HTML through the unified renderer.
+
+    ``usage`` is the run's authoritative ``ResultMessage.usage`` for the footer; without it the
+    footer falls back to the session file's per-message usage, which overcounts.
+    """
+    traj = from_claude_transcript(jsonl, prompt=prompt, usage=usage)
     if traj is None:
         return False
     return render_trajectory(traj, html)
@@ -122,7 +126,7 @@ def render_agent_transcript(
         return render_codex_transcript(jsonl, html, usage, prompt)
     # Claude's own transcript already carries the prompt as its first user message, so it needs
     # no injected copy — call positionally so a monkeypatched stub with *args stays satisfied.
-    return render_transcript(jsonl, html)
+    return render_transcript(jsonl, html, usage)
 
 
 def build_trajectory(
@@ -134,13 +138,15 @@ def build_trajectory(
 ) -> Trajectory | None:
     """Map a saved run transcript into a :class:`Trajectory` for rendering and ``trajectory.json``.
 
-    ``usage`` is the tally the caller recorded; it is the only source of Codex usage on a capped
-    run whose stream carries no ``turn.completed``. Claude usage is read from the transcript.
+    ``usage`` is the run's authoritative usage. For Codex it is the only source on a capped run
+    whose stream carries no ``turn.completed``; for Claude it is the billed ``ResultMessage.usage``,
+    which the footer must report rather than re-summing the session file's per-message usage (that
+    overcounts, since each turn re-counts the cached context).
     """
     if provider == "codex":
         events = _read_events(jsonl)
         return None if events is None else from_codex_events(events, prompt=prompt, usage=usage)
-    return from_claude_transcript(jsonl, prompt=prompt)
+    return from_claude_transcript(jsonl, prompt=prompt, usage=usage)
 
 
 __all__ = [
