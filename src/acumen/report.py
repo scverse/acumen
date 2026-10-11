@@ -70,8 +70,10 @@ __all__ = ["_split_diff_rows"]
 # pair red-green colourblind readers cannot separate: a green ramp built parallel to the orange
 # one below scores ΔE 1.2 against it under simulated deuteranopia (OKLab ×100; ≥8 is the
 # target, and darkening the green only reaches 7.2). Teal is the nearest hue that clears the
-# gate — deuteranopia 14.9, protanopia 8.2, normal-vision 23.7 — so the two providers stay
-# distinguishable in every vision type. Train/test already spends the texture channel, so
+# gate — worst pair across the two ramps: deuteranopia 11.9, protanopia 9.0, normal-vision
+# 15.8 — so the two providers stay distinguishable in every vision type. The teal ramp leans
+# toward sky blue as it lightens: a pale *teal* lands on the mid oranges under protanopia
+# (ΔE ≈5), and drifting the hue is what lets its lightest step match haiku's lightness. Train/test already spends the texture channel, so
 # colour is the only thing carrying provider identity here; it has to work on its own.
 _MODEL_ORDER = ("fable", "opus", "sonnet", "haiku", "astra", "sol", "terra", "luna")
 _MODEL_COLOR = {
@@ -80,11 +82,11 @@ _MODEL_COLOR = {
     "opus": "#e18c74",  # a lighter tint
     "sonnet": "#e8a794",  # lighter still
     "haiku": "#eec0b0",  # lightest — least potent
-    # OpenAI — the cool ramp, four even OKLab steps over the same lightness span.
+    # OpenAI — the cool ramp, four even OKLab steps from deep teal up to haiku's lightness.
     "astra": "#005661",  # most potent, darkest
-    "sol": "#006c76",
-    "terra": "#00828c",
-    "luna": "#0099a3",  # lightest — least potent
+    "sol": "#2e7f91",
+    "terra": "#55abc5",
+    "luna": "#7dd9fc",  # lightest — least potent
 }
 _OTHER_MODEL_COLOR = "#8a8378"  # neutral fallback for an unrecognised model id
 

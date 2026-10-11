@@ -16,8 +16,9 @@ and this project adheres to [Semantic Versioning][].
   one-sided p per axis, with a Benjamini–Hochberg FDR q computed within each axis across the
   versions. This replaces the joint dominance p (the max of the two) and its Holm correction, so
   the table now shows whether a version improves success, cost, or both.
-- Give `astra` models the darkest teal in the report's GPT ramp, re-stepping sol, terra and luna
-  so the ramp has four even steps over the same lightness span.
+- Give `astra` models the darkest teal in the report's GPT ramp, and re-step sol, terra and luna
+  so the ramp lightens in four even steps up to haiku's lightness, keeping the least potent GPT
+  model as pale as the least potent Claude one.
 - Merge the five per-command meta-agent model keys (`draft_model`, `improve_model`,
   `tasks_model`, `ship_model`, `check_model`) into a single `meta_model` key. It still defaults
   to the first `models` entry, and each command's `--model` flag still overrides it per run. A
