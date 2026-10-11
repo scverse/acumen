@@ -73,16 +73,17 @@ __all__ = ["_split_diff_rows"]
 # gate — deuteranopia 14.9, protanopia 8.2, normal-vision 23.7 — so the two providers stay
 # distinguishable in every vision type. Train/test already spends the texture channel, so
 # colour is the only thing carrying provider identity here; it has to work on its own.
-_MODEL_ORDER = ("fable", "opus", "sonnet", "haiku", "sol", "terra", "luna")
+_MODEL_ORDER = ("fable", "opus", "sonnet", "haiku", "astra", "sol", "terra", "luna")
 _MODEL_COLOR = {
     # Anthropic — the warm ramp.
     "fable": "#d86f53",  # Claude orange — most potent, darkest/most saturated
     "opus": "#e18c74",  # a lighter tint
     "sonnet": "#e8a794",  # lighter still
     "haiku": "#eec0b0",  # lightest — least potent
-    # OpenAI — the cool ramp, stepped over the same lightness span.
-    "sol": "#005661",  # most potent, darkest
-    "terra": "#007782",
+    # OpenAI — the cool ramp, four even OKLab steps over the same lightness span.
+    "astra": "#005661",  # most potent, darkest
+    "sol": "#006c76",
+    "terra": "#00828c",
     "luna": "#0099a3",  # lightest — least potent
 }
 _OTHER_MODEL_COLOR = "#8a8378"  # neutral fallback for an unrecognised model id
@@ -509,7 +510,7 @@ def resolve_palette(models: Sequence[str], overrides: Mapping[str, str] | None =
 def _models_in_order(df: pd.DataFrame) -> list[str]:
     """Models present, grouped by provider and most-potent first, then any others.
 
-    Anthropic's tiers lead (fable, opus, sonnet, haiku), then OpenAI's (sol, terra, luna), so
+    Anthropic's tiers lead (fable, opus, sonnet, haiku), then OpenAI's (astra, sol, terra, luna), so
     each provider's ramp reads as a run of one hue rather than being interleaved with the other.
     """
 
@@ -1235,23 +1236,23 @@ _CLUSTER_COLUMN = "task_id"
 _MIN_CLUSTERS = 3
 
 
-def _holm(pvalues: Sequence[float]) -> list[float]:
-    """Holm–Bonferroni adjusted p-values, returned in the order given.
+def _bh(pvalues: Sequence[float]) -> list[float]:
+    """Benjamini–Hochberg adjusted p-values (q-values), returned in the order given.
 
-    Controls the probability of *any* false claim across the family — the right target when the
-    family feeds a single decision (ship this version or not), rather than the false-discovery
-    rate, which earns its keep over hundreds of tests. Holm is also valid under arbitrary
-    dependence, which matters here: every comparison reuses the baseline arm and the same
-    bootstrap draws, so the tests are far from independent.
+    Applied once per metric — success rate across the versions, then cost across the versions —
+    so each axis is its own family and a reader can see which one a version moves, rather than
+    only whether it moves both. Controlling the false-discovery rate rather than the chance of any
+    false claim keeps the correction proportionate when several versions all genuinely improve.
 
-    The running maximum enforces monotonicity — a smaller raw p can never adjust to a larger
-    value than one above it in the ordering.
+    Walking from the largest p down, the running minimum enforces monotonicity — a smaller raw p
+    can never adjust to a larger value than one below it in the ordering.
     """
-    order = sorted(range(len(pvalues)), key=lambda i: pvalues[i])
-    adjusted = [0.0] * len(pvalues)
-    running = 0.0
-    for rank, index in enumerate(order):
-        running = max(running, min(1.0, pvalues[index] * (len(pvalues) - rank)))
+    m = len(pvalues)
+    order = sorted(range(m), key=lambda i: pvalues[i], reverse=True)
+    adjusted = [0.0] * m
+    running = 1.0
+    for position, index in enumerate(order):
+        running = min(running, pvalues[index] * m / (m - position))
         adjusted[index] = running
     return adjusted
 
@@ -1312,29 +1313,23 @@ def _frontier_probability(rate: np.ndarray, cost_per_run: np.ndarray) -> np.ndar
     return (~dominated.any(axis=2)).mean(axis=0)
 
 
-def _dominance_p(
-    rate: np.ndarray, cost_per_run: np.ndarray, challenger: int, reference: int
-) -> tuple[float, float, float]:
-    """One-sided p per axis and their max: does ``challenger`` beat ``reference`` on *both*?
+def _axis_p(rate: np.ndarray, cost_per_run: np.ndarray, challenger: int, reference: int) -> tuple[float, float]:
+    """One-sided bootstrap p per axis: is ``challenger`` more accurate, and is it cheaper?
 
-    An intersection–union test. Dominance is a conjunction — cheaper *and* more accurate — so the
-    evidence for it is only as strong as its weakest half, and the max is the p-value. That the
-    two axes need no multiplicity correction is a property of the conjunction, not an oversight:
-    getting lucky on one axis buys nothing when the other must clear as well.
-
-    This is what stops a version buying its way in on price. An arm that is dramatically cheaper
-    but no more accurate scores overwhelming evidence on cost, none on rate, and fails.
+    The two are reported separately rather than folded into one claim, so a version that is much
+    cheaper but no more accurate shows exactly that — overwhelming evidence on cost, none on
+    rate — instead of either passing on price or vanishing behind its weaker axis.
     """
     d_rate = rate[:, challenger] - rate[:, reference]
     d_cost = cost_per_run[:, challenger] - cost_per_run[:, reference]
     usable = np.isfinite(d_rate) & np.isfinite(d_cost)
     d_rate, d_cost = d_rate[usable], d_cost[usable]
     if not len(d_rate):
-        return 1.0, 1.0, 1.0
+        return 1.0, 1.0
     floor = 1 / len(d_rate)  # the bootstrap cannot resolve below one resample
     p_rate = max(float((d_rate <= 0).mean()), floor)
     p_cost = max(float((d_cost >= 0).mean()), floor)
-    return p_rate, p_cost, max(p_rate, p_cost)
+    return p_rate, p_cost
 
 
 @dataclass(frozen=True)
@@ -1347,8 +1342,8 @@ class SkillTests:
         One row per arm: its success rate, cost per run, and the share of resamples in which it
         sits on the Pareto frontier.
     comparisons
-        One row per claim "this version dominates the baseline", with the per-axis deltas, the
-        intersection–union p, and the Holm-adjusted p across them.
+        One row per version against the baseline: for each axis (success rate, cost per run) the
+        delta, the one-sided bootstrap p, and its Benjamini–Hochberg q across the versions.
     baseline
         The arm everything is measured against — the noskill arm when there is one.
     n_clusters
@@ -1374,18 +1369,17 @@ def skill_tests(
     resamples: int = _BOOTSTRAP_RESAMPLES,
     seed: int = _BOOTSTRAP_SEED,
 ) -> SkillTests:
-    """Test which skill versions beat which, on cost and success rate jointly.
+    """Test whether each skill version beats the baseline on success rate, and on cost.
 
     Deliberately reports no single combined score. Folding rate and cost into one number picks an
-    exchange rate between them on the reader's behalf, and that choice decides the answer: a
-    version that is much cheaper while being *worse* at the task can come out ahead. The
-    dominance test in :func:`_dominance_p` requires both axes to improve, so it cannot be bought
-    off that way, and :func:`_frontier_probability` ranks the arms without needing a threshold.
+    exchange rate between them on the reader's behalf, and that choice decides the answer. Each
+    axis is instead tested on its own (:func:`_axis_p`) and corrected on its own (:func:`_bh`), so
+    the table shows plainly whether a version improves success, cost, or both;
+    :func:`_frontier_probability` ranks the arms on the two jointly without needing a threshold.
 
     Only the versus-baseline claims are tested — the question the benchmark exists to answer, and
-    the family the Holm adjustment covers. Testing every version against every other as well
-    would spend the correction budget on claims nobody makes (whether the *baseline* dominates a
-    skill) and can bury the real result: on a four-arm report it turns a Holm p of 0.03 into 0.15.
+    the family each axis's correction covers. Testing every version against every other as well
+    would spend the correction budget on claims nobody makes and can bury the real result.
 
     Parameters
     ----------
@@ -1402,7 +1396,9 @@ def skill_tests(
     cost, successes, runs = _cluster_totals(df, arms, split=split)
     n_clusters = len(cost)
     baseline = arms[0] if arms else NOSKILL_ARM  # noskill sorts first when it is present
-    empty = pd.DataFrame(columns=["challenger", "reference", "d_rate", "d_cost", "p", "p_adjusted"])
+    empty = pd.DataFrame(
+        columns=["challenger", "reference", "d_rate", "p_rate", "q_rate", "d_cost", "p_cost", "q_cost"]
+    )
     if np.isnan(cost).any():
         return SkillTests(
             arms=pd.DataFrame(columns=["arm", "rate", "cost", "frontier"]),
@@ -1434,20 +1430,21 @@ def skill_tests(
 
     rows = []
     for challenger in range(1, len(arms)):
-        p_rate, p_cost, p = _dominance_p(rate, cost_per_run, challenger, 0)
+        p_rate, p_cost = _axis_p(rate, cost_per_run, challenger, 0)
         rows.append(
             {
                 "challenger": arms[challenger],
                 "reference": baseline,
                 "d_rate": observed_rate[challenger] - observed_rate[0],
-                "d_cost": observed_cost[challenger] - observed_cost[0],
                 "p_rate": p_rate,
+                "d_cost": observed_cost[challenger] - observed_cost[0],
                 "p_cost": p_cost,
-                "p": p,
             }
         )
     comparisons = pd.DataFrame(rows)
-    comparisons["p_adjusted"] = _holm(comparisons["p"].tolist())
+    # One family per axis: success is corrected across the versions, and cost separately.
+    comparisons.insert(4, "q_rate", _bh(comparisons["p_rate"].tolist()))
+    comparisons["q_cost"] = _bh(comparisons["p_cost"].tolist())
     return SkillTests(arms=arm_rows, comparisons=comparisons, baseline=baseline, n_clusters=n_clusters)
 
 
@@ -1472,20 +1469,25 @@ def _fmt_p(p: float) -> str:
 #: because "best" does not point one way here — the strongest arm has the *highest* success rate
 #: and the *lowest* cost, and a reader scanning the bold cells for the winner should not have to
 #: keep track of which column runs which way. The first few describe an arm on its own; the rest
-#: compare it with the baseline.
+#: compare it with the baseline, one group per axis.
 _VALID_COLUMNS = (
     ("Success rate", "rate", True, lambda v: f"{v:.1%}"),
     ("Cost / run", "cost", False, lambda v: f"${v:.3f}"),
     ("On frontier", "frontier", True, lambda v: f"{v:.1%}"),
     ("&Delta; rate", "d_rate", True, _fmt_delta_rate),
+    ("p", "p_rate", False, _fmt_p),
+    ("FDR q", "q_rate", False, _fmt_p),
     ("&Delta; cost", "d_cost", False, _fmt_delta_cost),
-    ("p", "p", False, _fmt_p),
-    ("Holm p", "p_adjusted", False, _fmt_p),
+    ("p", "p_cost", False, _fmt_p),
+    ("FDR q", "q_cost", False, _fmt_p),
 )
 
 #: How many of the above describe the arm itself; the remainder are the comparison, and sit under
-#: a shared header so it is clear they all refer to the baseline rather than to each other.
+#: a shared header per axis so it is clear they all refer to the baseline rather than to each other.
 _ARM_COLUMNS = 3
+
+#: The comparison's per-axis groups, in column order: (header, how many columns it spans).
+_AXIS_GROUPS = (("Success", 3), ("Cost", 3))
 
 
 def _best_cells(values: Sequence[float | None], *, highest: bool) -> set[int]:
@@ -1543,10 +1545,11 @@ def _tests_table_html(tests: SkillTests) -> str:
 
     own = "".join(f'<th rowspan="2">{title}</th>' for title, *_ in _VALID_COLUMNS[:_ARM_COLUMNS])
     versus = "".join(f"<th>{title}</th>" for title, *_ in _VALID_COLUMNS[_ARM_COLUMNS:])
-    span = len(_VALID_COLUMNS) - _ARM_COLUMNS
+    baseline = _skill_label(tests.baseline)
+    groups = "".join(f'<th colspan="{span}">{axis} vs {baseline}</th>' for axis, span in _AXIS_GROUPS)
     return f"""<div class="table-center"><table class="tests">
 <thead>
-<tr><th rowspan="2">Skill</th>{own}<th colspan="{span}">Compared with {_skill_label(tests.baseline)}</th></tr>
+<tr><th rowspan="2">Skill</th>{own}{groups}</tr>
 <tr>{versus}</tr>
 </thead>
 <tbody>{"".join(body)}</tbody>
@@ -2411,15 +2414,15 @@ def render_report(
  is dominated, because something on the line costs less <em>and</em> succeeds more.</p>
 <figure><img alt="Cost per run against success rate, by model and skill version" src="{tradeoff_uri}"></figure>
 <h3 id="dominance">Is the difference real?</h3>
-<p class="task-desc">A version <em>dominates</em> the baseline when it is both cheaper and more
- accurate by more than chance. The two axes are tested separately and the weaker of the two
- p-values is reported, so a version cannot pass on price while being worse at the task.
- Improving both numbers is not enough on its own: a gain the resampling cannot tell apart from
- noise leaves the Holm p high, which says the evidence is thin rather than that the version is
- bad. Best value in each column is <strong>bold</strong>, highest for the rates and lowest for
- cost and for the p-values. <em>On frontier</em> is how often an arm holds the Pareto frontier
- across resamples. Resampling is over the {tests.n_clusters} test tasks, paired across arms, so the
- unit is the task rather than the run.</p>
+<p class="task-desc">Each version is compared with the baseline on two separate questions: does it
+ succeed more often, and does it cost less per run? Each is a one-sided test, and each is corrected
+ on its own, with a Benjamini–Hochberg false-discovery rate (<em>FDR q</em>) across the versions.
+ Success is one family and cost is another, so a version can show a real gain on success, on cost,
+ or on both, and the table says which. A gain the resampling cannot tell apart from noise leaves q
+ high, which says the evidence is thin rather than that the version is bad. Best value in each column
+ is <strong>bold</strong>, highest for the rates and lowest for cost and for the p- and q-values.
+ <em>On frontier</em> is how often an arm holds the Pareto frontier across resamples. Resampling is
+ over the {tests.n_clusters} tasks, paired across arms, so the unit is the task rather than the run.</p>
 {_tests_table_html(tests)}
 <h3 id="loaded">Did it help when it actually loaded?</h3>
 <p class="task-desc">If a skill never loads, the agent never reads it, so that run tells us nothing
