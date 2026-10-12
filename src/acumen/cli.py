@@ -1267,7 +1267,7 @@ def _cmd_epoch(args: argparse.Namespace) -> int:
         return 2
 
     print(f"\nepoch complete: {plan.new_version} produced and benched on valid.")
-    print("next: `acumen report` to see it, or `acumen epoch` again for another round")
+    print("next: `acumen report` to see it, or `acumen fit` to keep training with early stopping")
     return 0
 
 
@@ -2085,7 +2085,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit = sub.add_parser(
         "fit",
         help="run many training epochs with early stopping (like training a model)",
-        description="Run `acumen epoch` back to back until validation stops improving (patience) or "
+        description="Run training epochs back to back until validation stops improving (patience) or "
         "a hard cap is hit, writing a per-epoch training curve to training.csv and a progress line "
         "each epoch. Fully resumable — re-run to continue.",
     )

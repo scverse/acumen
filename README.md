@@ -12,10 +12,12 @@
 
 An agentic skill is a short, plain-text set of instructions that helps a coding agent use a tool
 correctly. Most Python packages ship none — maintainers have no easy way to write one, or to tell
-whether it actually helps. acumen closes that loop: point it at a package and a few tasks, and it
-learns a skill in **training epochs**, each one benchmarking the current skill, distilling what went
-right and wrong into a knowledge wiki, and rewriting the skill — always measured against a no-skill
-baseline on a held-out split, so the gains generalize instead of memorizing answers.
+whether it actually helps. acumen closes that loop: point it at a package and a few tasks, and
+`acumen fit` optimizes a skill the way you would train a model. Each **epoch** benchmarks the
+current skill, distils what went right and wrong into a knowledge wiki, rewrites the skill, and
+scores the new version on a validation split. Training stops once validation stops improving, and
+the best version gets one final score on an untouched test split. Every score sits next to a
+no-skill baseline, so the gains carry over to new inputs instead of memorizing answers.
 
 ## Installation
 
@@ -37,18 +39,47 @@ acumen init                 # scaffold config.yaml + tasks.yaml
 acumen tasks                # mine the package for real tasks + ground-truth reproducers
 acumen check                # verify each task's answer reproduces before you spend
 
-acumen epoch                # one training round: bench train → wiki → create/improve skill → bench held-out
-acumen epoch                # run again for the next round (v2, v3, …)
+acumen fit                  # optimize the skill epoch by epoch until validation plateaus, then test
+                            # the best version; writes training.csv and report.html
 
-acumen report               # aggregate every run into a self-contained report.html
-acumen ship --skill v2      # ship the chosen skill into your package
+acumen ship --skill v2      # ship the best version into your package
 ```
 
-`acumen epoch` is the loop. Each round benchmarks the current arm on the training tasks, records
-what happened per task in `wiki/`, creates or improves the skill from that wiki, and benchmarks the
-new version on the held-out validation tasks. Re-run it to keep going; you decide when to stop.
+## The optimization loop
 
-The stages also run on their own — `acumen bench`, `acumen wiki`, and `acumen improve`.
+Every task in `tasks.yaml` comes in three splits:
+
+| split | used for |
+|---|---|
+| `train` | the only results the improver sees; the skill is learned from these |
+| `valid` | scores each new version; picks the best one and drives early stopping |
+| `test` | benched once, at the end, for the best version only |
+
+`acumen fit` repeats one **epoch** at a time. An epoch has four steps:
+
+1. **bench** the current skill on `train` (the first epoch benches the no-skill baseline instead,
+   and also on `valid`, so there is a baseline to compare against);
+2. **wiki**: record what happened per task in `wiki/`;
+3. **improve**: create or rewrite the skill from that wiki, giving `skills/v1`, `v2`, …;
+4. **validate**: bench the new version on `valid`.
+
+After each epoch, fit prints a progress line and updates the training curve in `training.csv`. It
+stops when any of these happens:
+
+- `--patience` epochs (default 2) pass without validation mean success rising by more than
+  `--min-delta` (default 0.05, i.e. 5 percentage points) over the last improvement;
+- `--max-epochs` is reached (default 10);
+- validation reaches 100%.
+
+Pass `--epochs N` to run exactly N epochs with no early stopping. Afterwards fit benches the best
+version on `test` and writes `report.html`. Run `acumen report` to rebuild the report later.
+
+Fit can be resumed. Re-run `acumen fit` and it continues from the last finished epoch.
+`--epochs`/`--max-epochs` set the total number of epochs, not how many more to run.
+
+Each stage also runs on its own: `acumen bench`, `acumen wiki`, and `acumen improve`.
+
+## Shipping
 
 `acumen ship` gives your package a `<dist>-install-skills` command so its users can install the
 skill into whichever agent they use (`--agent {claude,codex,agents,claude-science}`, or `--dest`).
