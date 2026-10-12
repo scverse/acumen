@@ -183,7 +183,7 @@ def write_packet(packet_dir: Path, tasks: list[Task], results: list[CheckResult]
         "One section per task split below. For each, decide whether the PROMPT, the RECORDED",
         "ANSWER, and the SCRIPT describe the same thing.",
         "",
-        "**The `train` and `test` splits of a task differ on purpose.** They are two instances of",
+        "**The `train` and `valid` splits of a task differ on purpose.** They are two instances of",
         "one analysis with two different answers, deliberately asking about different groups,",
         "conditions, datasets, or directions. A difference between the two is the design of the",
         "benchmark, not a defect — judge each split on its own terms.",

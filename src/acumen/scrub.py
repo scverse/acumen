@@ -227,11 +227,30 @@ def build_filtered_source(src: Path, dest: Path) -> Path:
     return dest
 
 
-def _artifact_hit(candidate: str, original_src: Path) -> str | None:
-    """Return ``candidate`` if it resolves to a skill/guidance artifact or the original tree."""
+def _within(path: Path, root: Path) -> bool:
+    """Whether ``path`` is ``root`` or nested under it. Both are expected already resolved."""
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _artifact_hit(candidate: str, original_src: Path, exempt: Sequence[Path] = ()) -> str | None:
+    """Return ``candidate`` if it resolves to a skill/guidance artifact or the original tree.
+
+    ``exempt`` names the agent's own writable work tree. A path under one of those roots is never
+    an artifact to hide, *even when it is named* ``SKILL.md``: that is exactly what the improver
+    must write into its staging directory (and the seeded parent skill it edits, and the skill
+    body a wiki run reads) — all of which live under the agent's ``work`` dir. Without this the
+    guard, whose job is to hide the *target's* shipped guidance, would also deny the agent the one
+    file it exists to produce. Exemption is checked first, so it wins over the name/dir matches.
+    """
     try:
         resolved = Path(candidate).expanduser().resolve()
     except (OSError, RuntimeError, ValueError):
+        return None
+    if any(_within(resolved, root) for root in exempt):
         return None
     if resolved.name in GUIDANCE_FILES:
         return candidate
@@ -239,14 +258,14 @@ def _artifact_hit(candidate: str, original_src: Path) -> str | None:
         return candidate
     # The unfiltered source tree is off-limits — the agent must read the filtered copy, so any
     # path back into the original checkout (which still holds the stripped artifacts) is denied.
-    try:
-        resolved.relative_to(original_src)
-    except ValueError:
-        return None
-    return candidate
+    if _within(resolved, original_src):
+        return candidate
+    return None
 
 
-def find_skill_access(tool_name: str, tool_input: dict[str, Any], original_src: Path) -> str | None:
+def find_skill_access(
+    tool_name: str, tool_input: dict[str, Any], original_src: Path, exempt: Sequence[Path] = ()
+) -> str | None:
     """Return the first path in a tool call that reaches a skill/guidance artifact, else ``None``.
 
     Pure and side-effect free, so the enforcement can be exercised directly without standing up
@@ -262,6 +281,10 @@ def find_skill_access(tool_name: str, tool_input: dict[str, Any], original_src: 
         The tool's arguments.
     original_src
         The real (unfiltered) source checkout, resolved by the caller.
+    exempt
+        The agent's own writable work roots, resolved by the caller. Paths under any of them are
+        never flagged, so the agent can write and read its own staging skill (see
+        :func:`_artifact_hit`).
 
     Returns
     -------
@@ -270,7 +293,7 @@ def find_skill_access(tool_name: str, tool_input: dict[str, Any], original_src: 
     for key in _PATH_KEYS:
         value = tool_input.get(key)
         if isinstance(value, str):
-            hit = _artifact_hit(value, original_src)
+            hit = _artifact_hit(value, original_src, exempt)
             if hit is not None:
                 return hit
     command = tool_input.get("command")
@@ -279,29 +302,163 @@ def find_skill_access(tool_name: str, tool_input: dict[str, Any], original_src: 
             token = raw.rstrip(",;")
             if not token:
                 continue
-            hit = _artifact_hit(token, original_src)
+            hit = _artifact_hit(token, original_src, exempt)
             if hit is not None:
                 return hit
     return None
 
 
-def make_skill_guard(original_src: Path) -> HookMatcher:
+def _iter_strings(value: Any) -> Any:
+    """Yield every string anywhere inside a tool_input (dict/list/scalar), provider-agnostic.
+
+    Claude carries a Bash command under ``command`` and a read path under ``file_path``; Codex
+    nests the argv differently. Walking all string leaves means one matcher covers both without
+    knowing either schema.
+    """
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_strings(item)
+
+
+def _source_needles(repo: str | None) -> frozenset[str]:
+    """Lowercased substrings that identify the target's own repository.
+
+    ``owner/repo`` is the load-bearing one — every clone/fetch/archive URL and every
+    ``gh repo clone`` names it — with ``host/owner/repo`` added for extra specificity. A local
+    ``repo`` (a filesystem path, not a URL) yields nothing: its source is not fetchable over the
+    network and the sandbox never contains it, so containment already covers it.
+    """
+    if not repo:
+        return frozenset()
+    text = repo.strip().lower().rstrip("/")
+    if text.endswith(".git"):
+        text = text[:-4]
+    for prefix in ("https://", "http://", "ssh://", "git://"):
+        if text.startswith(prefix):
+            text = text[len(prefix) :]
+            break
+    text = text.replace(":", "/")  # git@github.com:owner/repo -> git@github.com/owner/repo
+    head = text.split("/", 1)[0]
+    if "@" in head:  # strip userinfo like git@
+        text = text.split("@", 1)[1]
+    parts = [part for part in text.split("/") if part]
+    needles: set[str] = set()
+    if len(parts) >= 3:
+        host, owner, name = parts[0], parts[-2], parts[-1]
+        needles.add(f"{owner}/{name}")
+        needles.add(f"{host}/{owner}/{name}")
+    return frozenset(needles)
+
+
+def _normalise_token(value: str) -> str:
+    token = value.strip().lower().rstrip("/")
+    if token.endswith(".git"):
+        token = token[:-4]
+    return token.replace(":", "/")
+
+
+_ARCHIVE_SUFFIXES = (".tar.gz", ".tgz", ".zip", ".whl")
+
+
+def find_source_fetch(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    repo: str | None = None,
+    pkg_name: str | None = None,
+) -> str | None:
+    """Return the first token that fetches the target's own source repo/distribution, else ``None``.
+
+    Pure and side-effect free, so it is unit-testable without an agent (mirrors
+    :func:`find_skill_access`). It flags ``git clone``/``fetch``, ``gh repo clone``,
+    ``git+<repo>`` installs and any ``curl``/``wget`` of a ``github.com``/``codeload``/
+    ``raw.githubusercontent`` URL — all of which must name ``owner/repo`` — plus a narrow
+    check for downloading the package's own source archive from an index.
+
+    It deliberately does **not** block reads of skill/guidance files: in the skill arm the agent
+    legitimately reads its own installed skill under ``<sandbox>/.claude/skills/``. Blocking the
+    fetch is what matters — without the clone there is no external skill tree to read.
+    """
+    needles = _source_needles(repo)
+    pkg = pkg_name.lower() if pkg_name else None
+    if not needles and not pkg:
+        return None
+    for value in _iter_strings(tool_input or {}):
+        token = _normalise_token(value)
+        if any(needle in token for needle in needles):
+            return value
+        if pkg and pkg in token:
+            # A source archive of the package (``…/pkg-1.2.3.tar.gz``) …
+            if any(suffix in token for suffix in _ARCHIVE_SUFFIXES):
+                return value
+            # … or a pip/uv install/download of the package. The benchmark forbids installing
+            # anything (the package is already present), so naming it here is only ever an
+            # attempt to fetch a fresh, unscrubbed copy.
+            if ("pip" in token or "uv " in token) and ("install" in token or "download" in token):
+                return value
+    return None
+
+
+def make_source_guard(repo: str | None, pkg_name: str | None) -> HookMatcher:
+    """Build the ``PreToolUse`` hook that denies a benchmark agent the target's own source.
+
+    ``matcher=None`` fires the hook for every tool. Used only by benchmark runs; meta-agents get
+    :func:`make_skill_guard` instead, and ``ship`` gets neither.
+    """
+    from claude_agent_sdk import HookMatcher
+
+    async def guard(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
+        hit = find_source_fetch(
+            input_data.get("tool_name", ""),
+            input_data.get("tool_input", {}) or {},
+            repo=repo,
+            pkg_name=pkg_name,
+        )
+        if hit is None:
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    "acumen benchmarks against the already-installed package only; fetching the "
+                    f"target's source repository or distribution is not permitted ({hit}). Work "
+                    "from the installed package."
+                ),
+            }
+        }
+
+    return HookMatcher(matcher=None, hooks=[guard])
+
+
+def make_skill_guard(original_src: Path, exempt: Sequence[Path] = ()) -> HookMatcher:
     """Build the ``PreToolUse`` hook that denies an agent any existing skill/guidance.
 
     ``matcher=None`` fires the hook for every tool. Paths are resolved against the real source
     checkout, so the guard holds regardless of the agent's ``cwd``.
+
+    ``exempt`` names the agent's own writable work tree (its ``work`` dir). Paths under it are
+    never denied — the guard hides the *target's* shipped guidance, not the skill the agent is
+    itself writing or editing there, which is legitimately named ``SKILL.md``.
     """
     # Imported here, not at module scope: the Claude SDK is an optional dependency and a
     # Codex-only install never builds an SDK hook.
     from claude_agent_sdk import HookMatcher
 
     root = original_src.resolve()
+    exempt_roots = tuple(dict.fromkeys(path.resolve() for path in exempt))
 
     async def guard(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
         hit = find_skill_access(
             input_data.get("tool_name", ""),
             input_data.get("tool_input", {}) or {},
             root,
+            exempt_roots,
         )
         if hit is None:
             return {}

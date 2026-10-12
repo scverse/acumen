@@ -100,6 +100,13 @@ class Target:
     pkg_version: str
 
     @property
+    def is_remote(self) -> bool:
+        """Whether ``source`` is a remote URL (fetchable) rather than a local path."""
+        from acumen.config import _looks_remote
+
+        return _looks_remote(self.source)
+
+    @property
     def bin_dir(self) -> Path:
         """The venv's ``bin`` directory — what goes on an agent's PATH."""
         return self.venv_dir / ("Scripts" if os.name == "nt" else "bin")

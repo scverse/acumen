@@ -86,6 +86,40 @@ _SANDBOX_DENIAL_MARKERS = (
     "proxy connect aborted: 403",
 )
 
+# A transient network drop is a failure of the benchmark infrastructure, not evidence about the
+# model, so a cell that hit one stays pending and a later run retries it. Kept deliberately narrow
+# and TCP/DNS/gateway-specific: an origin 4xx/5xx the agent surfaced as content, or a plain
+# model error, must NOT match — misreading one would silently retry a real measurement forever.
+_CONNECTION_MARKERS = (
+    "connection reset",
+    "econnreset",
+    "connection refused",
+    "econnrefused",
+    "connection aborted",
+    "econnaborted",
+    "connection timed out",
+    "etimedout",
+    "read timed out",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "nodename nor servname",
+    "failed to resolve",
+    "getaddrinfo",
+    "network is unreachable",
+    "enetunreach",
+    "no route to host",
+    "ehostunreach",
+    "remote end closed connection",
+    "server disconnected",
+    "connection closed by peer",
+    "eof occurred in violation of protocol",
+    "cannot connect to host",
+    "broken pipe",
+    "502 bad gateway",
+    "503 service unavailable",
+    "504 gateway timeout",
+)
+
 
 @dataclass(frozen=True)
 class RunOutcome:
@@ -130,6 +164,25 @@ def _provider_exhaustion_error(message: AgentResult | None, error: str | None = 
     detail = "\n".join(str(part) for part in parts if part).strip()
     lowered = detail.lower()
     if any(marker in lowered for marker in _PROVIDER_EXHAUSTION_MARKERS):
+        return detail
+    return None
+
+
+def _connection_error(message: AgentResult | None, error: str | None = None) -> str | None:
+    """Return transient-network evidence (a dropped/refused/timed-out connection), or ``None``.
+
+    Same shape as :func:`_provider_exhaustion_error`: skip our intentional caps, join the
+    provider-neutral error text, match the narrow :data:`_CONNECTION_MARKERS`. A hit means the
+    cell could not run through no fault of the model, so it is recorded invalid and stays pending.
+    """
+    if message is not None and (message.subtype or "").lower() in _SUBTYPE_REASONS:
+        return None
+    parts = [error or ""]
+    if message is not None:
+        parts.extend([message.subtype or "", message.result, *(message.errors or [])])
+    detail = "\n".join(str(part) for part in parts if part).strip()
+    lowered = detail.lower()
+    if any(marker in lowered for marker in _CONNECTION_MARKERS):
         return detail
     return None
 
@@ -266,6 +319,8 @@ def _build_options(
     read_dirs: tuple[Path, ...] = (),
     prices: PriceTable | None = None,
     stderr: Callable[[str], None] | None = None,
+    block_repo: str | None = None,
+    block_pkg: str | None = None,
 ) -> AgentOptions:
     """Assemble the SDK options for one run.
 
@@ -294,6 +349,8 @@ def _build_options(
         discover_skills=True,
         price_usd=pricer(model, prices),
         read_dirs=read_dirs,
+        block_repo=block_repo,
+        block_pkg=block_pkg,
         stderr=stderr,
     )
 
@@ -394,6 +451,12 @@ async def run_once(
             read_dirs=(target.venv_dir,),
             prices=prices,
             stderr=stderr,
+            # Deny fetching the target's own source (git clone, gh, curl, git+ install): the
+            # installed venv is scrubbed of any shipped skill, but the upstream repo is not, so a
+            # clone would smuggle it in and contaminate the baseline. Local targets pass None —
+            # their source is not fetchable and never lands in the sandbox.
+            block_repo=target.source if target.is_remote else None,
+            block_pkg=target.pkg_name,
         )
         try:
             result = await run_agent(prompt, options=options)
@@ -434,6 +497,9 @@ async def run_once(
         success, reason = False, "provider_exhausted"
     elif denial is not None:
         success, reason = False, "sandbox_blocked"
+    elif _connection_error(result, error) is not None:
+        # A transient network drop — record invalid so resume retries it, not as a measurement.
+        success, reason = False, "connection_error"
     elif error is not None or result is None:
         success, reason = False, "error"
     else:
