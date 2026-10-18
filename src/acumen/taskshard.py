@@ -269,10 +269,13 @@ async def _run_shard_agent(
         raise TaskGenError(f"the task-generation agent errored: {result.subtype} {result.errors or ''}".strip())
 
     tasks = _validate_generated(staged)
-    cost = resolve_cost(
-        result.total_cost_usd,
-        price_usage(result.usage, model=model, provider=result.provider, prices=prices),
-    ).cost_usd
+    cost = (
+        resolve_cost(
+            result.total_cost_usd,
+            price_usage(result.usage, model=model, provider=result.provider, prices=prices),
+        ).cost_usd
+        or 0.0
+    )
     return tasks, result, cost
 
 

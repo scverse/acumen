@@ -739,10 +739,13 @@ async def pollinate(
             path=written.path,
             rationale=rationale,
             changed=new_text != parent_text,
-            cost_usd=resolve_cost(
-                result.total_cost_usd,
-                price_usage(result.usage, model=selected_model, provider=result.provider, prices=table),
-            ).cost_usd,
+            cost_usd=(
+                resolve_cost(
+                    result.total_cost_usd,
+                    price_usage(result.usage, model=selected_model, provider=result.provider, prices=table),
+                ).cost_usd
+                or 0.0
+            ),
             turns=result.num_turns,
             n_train_runs=0,
             n_train_failures=0,

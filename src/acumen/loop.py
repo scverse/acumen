@@ -162,6 +162,7 @@ async def _bench(
                 on_done=on_done,
                 env_passthrough=cfg.env_passthrough,
                 dataset_cache_dirs=cfg.dataset_cache_dirs,
+                prices=PriceTable(overrides=cfg.prices),
             )
         except BenchmarkInvalidError as err:
             # A provider limit, an exhausted credential or a dropped network is the platform's
@@ -336,10 +337,13 @@ async def improve_rulebook(
             path=written.path,
             rationale=rationale,
             changed=new_text != parent_text,
-            cost_usd=resolve_cost(
-                result.total_cost_usd,
-                price_usage(result.usage, model=selected_model, provider=result.provider, prices=table),
-            ).cost_usd,
+            cost_usd=(
+                resolve_cost(
+                    result.total_cost_usd,
+                    price_usage(result.usage, model=selected_model, provider=result.provider, prices=table),
+                ).cost_usd
+                or 0.0
+            ),
             turns=result.num_turns,
             n_train_runs=len(train_runs),
             n_train_failures=n_failures,

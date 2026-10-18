@@ -205,10 +205,13 @@ async def draft_skill(
         skill = load_skill(skills_root, version, expect_name=cfg.skill_name)
         return DraftResult(
             skill=skill,
-            cost_usd=resolve_cost(
-                result.total_cost_usd,
-                price_usage(result.usage, model=selected_model, provider=result.provider, prices=table),
-            ).cost_usd,
+            cost_usd=(
+                resolve_cost(
+                    result.total_cost_usd,
+                    price_usage(result.usage, model=selected_model, provider=result.provider, prices=table),
+                ).cost_usd
+                or 0.0
+            ),
             turns=result.num_turns,
             log_jsonl=log.jsonl_path if log is not None else None,
             log_html=log.html_path if log is not None and log.html_rendered else None,

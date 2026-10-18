@@ -79,6 +79,26 @@ def _auth(args: argparse.Namespace, cfg: Config) -> tuple[str, object]:
     return provider, mode
 
 
+def _priced(cfg: Config) -> Config:
+    """``cfg`` with rates filled in for every model these commands run, so cost is recorded.
+
+    The agents inside ``draft`` / ``evolve`` build their rate table from ``cfg.prices``, and an empty
+    table prices nothing — costs come back unavailable, which would zero the spend figures a run
+    reports and projects. Rates are fetched the way ``improve`` and ``tasks`` fetch them, degrade to
+    unpriced with a warning if the pricing pages are down, and an operator's own ``prices:`` block
+    always wins.
+    """
+    from acumen.cli import _agent_prices
+
+    table = _agent_prices(cfg, model=cfg.meta_model)
+    filled = dict(cfg.prices)
+    for model in dict.fromkeys([cfg.meta_model, *cfg.models]):
+        rates = table.rates(model)
+        if rates is not None:
+            filled.setdefault(model, rates)
+    return replace(cfg, prices=filled)
+
+
 def _prepare(args: argparse.Namespace, cfg: Config) -> Target:
     print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
     target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
@@ -96,6 +116,7 @@ def _cmd_draft(args: argparse.Namespace) -> int:
     if args.model:
         cfg = replace(cfg, meta_model=args.model)
 
+    cfg = _priced(cfg)
     existing = available_versions(args.skills)
     if existing and not args.force:
         print(
@@ -403,6 +424,7 @@ def _evolve(args: argparse.Namespace) -> int:
     tasks = load_tasks(args.tasks)
     if args.max_concurrency:
         cfg = replace(cfg, max_concurrency=args.max_concurrency)
+    cfg = _priced(cfg)
     _, auth_mode = _auth(args, cfg)
     target = _prepare(args, cfg)
     if cfg.dataset_cache_dirs and not args.no_warm:

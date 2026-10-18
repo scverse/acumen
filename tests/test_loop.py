@@ -216,3 +216,33 @@ def test_draft_scores_mean_and_spread() -> None:
     assert ds.spread == pytest.approx((29 - 22) / 36)
     empty = DraftScores(version="v1", scores=[], sizes=[])
     assert empty.mean_rate == 0.0 and empty.spread == 0.0 and empty.mean_load_rate == 0.0
+
+
+# ── Cost accounting: an unpriced run is $0, never None ──────────────────────────────────
+
+
+def test_priced_fills_rates_for_every_model_and_keeps_operator_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    from acumen import cli, cli_rulebook
+    from acumen.prices import PriceTable, Rates
+
+    fetched = Rates(input=3.0, cached_input=0.3, cache_write=3.75, output=15.0)
+    mine = Rates(input=1.0, cached_input=0.1, cache_write=1.25, output=5.0)
+    monkeypatch.setattr(
+        cli, "_agent_prices", lambda cfg, model=None: PriceTable(fetched={MODEL: fetched, "meta-m": fetched})
+    )
+    cfg = Config(repo="/pkg", skill_name="pkg", models=[MODEL], meta_model="meta-m", prices={MODEL: mine})
+
+    priced = cli_rulebook._priced(cfg)
+
+    assert priced.prices[MODEL] == mine  # the operator's own rates win
+    assert priced.prices["meta-m"] == fetched  # the meta model is priced too
+    assert PriceTable(overrides=priced.prices).rates("meta-m") == fetched
+
+
+def test_unpriced_agent_costs_are_zero_so_sums_and_formats_never_break(tmp_path: Path) -> None:
+    """resolve_cost() returns None for a model with no rates; the modules that add costs must not see it."""
+    from acumen.prices import PriceTable, price_usage, resolve_cost
+
+    unpriced = price_usage({"input_tokens": 10}, model="x", provider="claude", prices=PriceTable())
+    assert resolve_cost(None, unpriced).cost_usd is None  # the hazard
+    assert (resolve_cost(None, unpriced).cost_usd or 0.0) + 1.5 == 1.5  # what the modules now do
