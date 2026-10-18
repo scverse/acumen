@@ -1,9 +1,12 @@
 """Generational rulebook evolution: improve-from-best, cheap screens, a confirmed ratchet.
 
-The CV loop (:mod:`acumen.loop`) measures one improvement step honestly but costs ~a session window
-per iteration, and both live rounds showed its chain walking *through* regressions (iteration 2
-improved from a version that was already worse out of sample). This module trades per-decision
-certainty for decision volume — the shape of an autoresearch run with hundreds of generations:
+Each generation edits the champion *rulebook* (:mod:`acumen.rulebooks`) — the instructions a skill is
+drafted from — instead of a skill. Scoring one rulebook means drafting it into a skill, and drafting
+is noisy (the same text drafted twice differs by several points), so decisions are made on a mean over
+independent drafts and every boundary is structural. This module trades per-decision certainty for
+decision volume — the shape of an autoresearch run with hundreds of generations. The pieces it
+composes (the improve agent, resumable drafting, scoring over drafts, the lockbox evaluation) live in
+:mod:`acumen.loop`; see ``docs/how-evolve-works.md`` for the whole picture.
 
 * **Improve from the best, always.** Every generation's improve agent starts from the current
   champion and its failure evidence, never from a regressed child. Rejected candidates keep their

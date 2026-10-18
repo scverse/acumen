@@ -34,7 +34,9 @@ and this project adheres to [Semantic Versioning][].
   into candidate scripts), `acumen status` (a health check for a running experiment: progress, spend,
   skill-load rate, platform-killed runs recorded as failures) and `acumen verdict` (draft means, paired
   sign tests and the hard/easy split behind the answer).
-- Document the rulebook-evolution protocol and the rules for running it unattended (`docs/evolve.md`).
+- Document rulebook evolution: how it works (`docs/how-evolve-works.md`: the rulebook, a generation, islands,
+  the lockbox, the verdict, what it writes) and the staged protocol with the rules for running it
+  unattended (`docs/evolve.md`).
 
 ### Changed
 

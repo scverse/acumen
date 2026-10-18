@@ -84,10 +84,21 @@ Each stage also runs on its own: `acumen bench`, `acumen wiki`, and `acumen impr
 `acumen fit` improves one skill. When the question is whether an *improvement procedure* generalises,
 the noise in drafting the skill gets in the way: the same instructions drafted twice differ by several
 points. `acumen evolve` searches over the instructions instead — a **rulebook**, versioned under
-`rulebooks/` — and scores each candidate as a mean over several independent drafts, behind a
-write-once `acumen lockbox` that nothing optimizes on. See [the protocol](docs/evolve.md) for a
-complete, resumable procedure, including how to grow the benchmark first (`acumen tasks --candidates`)
-and how to read the verdict.
+`rulebooks/` — and scores each candidate as a mean over several independent drafts, behind a write-once
+`acumen lockbox` that nothing optimizes on. It can run several independent **islands** on disjoint
+tasks and keep only the edits that replicated across them.
+
+```bash
+acumen mine                       # real analyses that use your package (needs the `gh` CLI)
+acumen tasks --candidates mined --out tasks_all.yaml
+acumen lockbox --tasks tasks_all.yaml --out lockbox --working tasks.yaml
+acumen evolve --lockbox lockbox --islands 3 --headroom --screen-drafts 3
+acumen status runs                # health check while it runs; `acumen verdict` for the answer
+```
+
+- [How it works](https://acumen.readthedocs.io/en/latest/how-evolve-works.html): the rulebook, a generation, islands, the lockbox and the
+  verdict.
+- [The protocol](https://acumen.readthedocs.io/en/latest/evolve.html): the staged procedure, and the rules for running it unattended.
 
 ## Shipping
 
