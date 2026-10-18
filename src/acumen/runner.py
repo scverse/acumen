@@ -34,6 +34,7 @@ from acumen.skills import Skill
 from acumen.tasks import Task
 from acumen.trajectory import render_trajectory, write_trajectory_json
 from acumen.transcript import build_trajectory, locate_transcript
+from acumen.transient import is_transient
 
 #: Result subtypes the CLI reports on a cap breach, mapped to our reason taxonomy.
 _SUBTYPE_REASONS: dict[str, Reason] = {
@@ -185,6 +186,20 @@ def _connection_error(message: AgentResult | None, error: str | None = None) -> 
     if any(marker in lowered for marker in _CONNECTION_MARKERS):
         return detail
     return None
+
+
+def _platform_refusal(message: AgentResult | None, error: str | None = None) -> str | None:
+    """Return rate-limit/overload/session-limit evidence from the run's *errors*, or ``None``.
+
+    Reads only the harness error and the provider's error list — never the agent's final text,
+    which can legitimately mention a rate limit — so a task about rate limiting cannot be
+    misread as the platform refusing the run.
+    """
+    parts = [error or ""]
+    if message is not None:
+        parts.extend([message.subtype or "", *(message.errors or [])])
+    detail = "\n".join(str(part) for part in parts if part).strip()
+    return detail if detail and is_transient(detail) else None
 
 
 def _sandbox_denial(jsonl: Path) -> str | None:
@@ -372,6 +387,7 @@ async def run_once(
     stderr: Callable[[str], None] | None = None,
     env_passthrough: Sequence[str] | None = None,
     prices: PriceTable | None = None,
+    dataset_cache_dirs: Sequence[str] | None = None,
 ) -> RunOutcome:
     """Execute one benchmark run end to end and write its ``result.json``.
 
@@ -410,6 +426,9 @@ async def run_once(
     env_passthrough
         Extra environment variable names to carry into the sandbox on top of the built-in
         allowlist (the operator's ``config.env_passthrough``).
+    dataset_cache_dirs
+        cwd-relative dataset directories to symlink to the target's shared dataset cache
+        (``config.dataset_cache_dirs``), identically in both arms.
 
     Returns
     -------
@@ -422,6 +441,11 @@ async def run_once(
             f"arm {key.arm!r} expects skill {key.skill!r} but was given {skill.version if skill else None!r}"
         )
     run_dir.mkdir(parents=True, exist_ok=True)
+    # A re-run (a stale draft's result, --no-resume) must not inherit the previous run's artifacts:
+    # grading reads answer.md and skill-loading reads the transcript, and both are only rewritten
+    # if this run gets far enough to produce them.
+    for name in (RESULT_FILE, ANSWER_FILE, SCRIPT_FILE, TRANSCRIPT_JSONL, TRANSCRIPT_HTML):
+        (run_dir / name).unlink(missing_ok=True)
     split = task.split(key.split)
 
     provider = provider_for_model(model)
@@ -436,6 +460,7 @@ async def run_once(
         skill=skill,
         env_passthrough=env_passthrough,
         provider=provider,
+        dataset_cache_dirs=dataset_cache_dirs,
     ) as box:
         prompt = benchmark_prompt(
             split.prompt,
@@ -500,6 +525,11 @@ async def run_once(
     elif _connection_error(result, error) is not None:
         # A transient network drop — record invalid so resume retries it, not as a measurement.
         success, reason = False, "connection_error"
+    elif not grade.success and _platform_refusal(result, error) is not None:
+        # A rate limit, overload or session limit says nothing about the task or the skill. Like a
+        # dropped connection it is recorded invalid, so resume retries it and the improver never
+        # sees it as evidence — the first live loop wrote 54 such "failures" in minutes.
+        success, reason = False, "connection_error"
     elif error is not None or result is None:
         success, reason = False, "error"
     else:
@@ -562,6 +592,9 @@ async def run_once(
         "pkg_version": target.fingerprint,
         "commit": target.commit,
         "skill_hash": skill.hash if skill else None,
+        # Bytes of skill content the agent had available; 0 for the baseline. The report's
+        # leanness axis — recorded per run so it is tied to the exact skill that ran.
+        "skill_bytes": skill.size if skill else 0,
         "skill_name": skill.name if skill else None,
         # Evidence, not configuration: did the agent actually invoke the Skill tool?
         "skill_loaded": skill_loaded,

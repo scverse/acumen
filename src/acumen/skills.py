@@ -72,6 +72,10 @@ class Skill:
     name: str
     description: str
     hash: str
+    #: Bytes of skill content (``SKILL.md`` + references) — the leanness axis. Recorded in every
+    #: ``result.json`` as ``skill_bytes`` so the report can trade size against success without
+    #: needing the skill tree at hand. ``0`` is what "no skill" weighs.
+    size: int = 0
 
     @property
     def number(self) -> int:
@@ -139,6 +143,18 @@ def skill_content(directory: Path) -> dict[str, str]:
     return content
 
 
+def skill_size(directory: Path) -> int:
+    """Total bytes of a skill's content files — what an agent has to read to use it.
+
+    This is the *leanness* measure the report trades against success. Bytes rather than tokens,
+    because bytes are exact, model-independent, and need no tokenizer; and content files only, for
+    the same reason as :func:`skill_hash` — ``meta.json`` never reaches an agent.
+    """
+    if not directory.is_dir():
+        raise SkillError(f"skill directory does not exist: {directory}")
+    return sum(path.stat().st_size for path in content_files(directory))
+
+
 def skill_hash(directory: Path) -> str:
     """Hash a skill directory's content — the value recorded in every ``result.json``.
 
@@ -183,6 +199,43 @@ def parse_frontmatter(text: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise SkillError(f"SKILL.md frontmatter must be a mapping, got {type(data).__name__}")
     return data
+
+
+def normalize_frontmatter(text: str) -> str:
+    r"""Quote frontmatter scalars YAML would misread, leaving valid frontmatter untouched.
+
+    A drafting agent writes ``description: Analyze data (Visium: yes) — use when …`` and YAML
+    rejects the second colon ("mapping values are not allowed here"). The content is fine; only the
+    quoting is missing, and the frontmatter is *our* format constraint, so repairing it is a
+    normalization rather than an edit of the agent's work: every unquoted top-level ``key: value``
+    line is rewritten with the value double-quoted (escaping ``\\`` and ``"``). Applied only when
+    the frontmatter fails to parse, and returns ``text`` unchanged if the repair does not parse
+    either — the validator then reports the real problem.
+    """
+    match = _FRONTMATTER_RE.match(text)
+    if not match:
+        return text
+    body = match.group("body")
+    try:
+        yaml.safe_load(body)
+        return text
+    except yaml.YAMLError:
+        pass
+    fixed_lines = []
+    for line in body.splitlines():
+        key, sep, value = line.partition(":")
+        value = value.strip()
+        if sep and key and not key[0].isspace() and value and value[0] not in "\"'[{|>":
+            escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+            fixed_lines.append(f'{key}: "{escaped}"')
+        else:
+            fixed_lines.append(line)
+    fixed_body = "\n".join(fixed_lines)
+    try:
+        yaml.safe_load(fixed_body)
+    except yaml.YAMLError:
+        return text
+    return text[: match.start("body")] + fixed_body + text[match.end("body") :]
 
 
 def load_skill(skills_root: Path, version: str | int, *, expect_name: str | None = None) -> Skill:
@@ -236,6 +289,7 @@ def load_skill(skills_root: Path, version: str | int, *, expect_name: str | None
         name=name.strip(),
         description=description.strip(),
         hash=skill_hash(directory),
+        size=skill_size(directory),
     )
 
 

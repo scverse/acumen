@@ -407,8 +407,8 @@ def test_build_matrix_and_resume(project: Path, model: str, make_result) -> None
 
     runs = project / "runs"
     make_result(runs, RunKey(arm="skill_v1", split="train", model=model, task_id="example_task", rep=1))
-    assert [p.key.split for p in pending(planned, runs)] == ["valid"]
-    assert len(pending(planned, runs, resume=False)) == 2
+    assert [p.key.split for p in pending(planned, runs, skill_hash=None)] == ["valid"]
+    assert len(pending(planned, runs, skill_hash=None, resume=False)) == 2
 
 
 def test_build_matrix_excludes_test_by_default_and_runs_it_when_asked(project: Path) -> None:

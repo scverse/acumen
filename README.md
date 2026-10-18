@@ -79,6 +79,16 @@ Fit can be resumed. Re-run `acumen fit` and it continues from the last finished 
 
 Each stage also runs on its own: `acumen bench`, `acumen wiki`, and `acumen improve`.
 
+## Evolving the rulebook
+
+`acumen fit` improves one skill. When the question is whether an *improvement procedure* generalises,
+the noise in drafting the skill gets in the way: the same instructions drafted twice differ by several
+points. `acumen evolve` searches over the instructions instead — a **rulebook**, versioned under
+`rulebooks/` — and scores each candidate as a mean over several independent drafts, behind a
+write-once `acumen lockbox` that nothing optimizes on. See [the protocol](docs/evolve.md) for a
+complete, resumable procedure, including how to grow the benchmark first (`acumen tasks --candidates`)
+and how to read the verdict.
+
 ## Shipping
 
 `acumen ship` gives your package a `<dist>-install-skills` command so its users can install the

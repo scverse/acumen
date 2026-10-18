@@ -24,6 +24,7 @@ extras: []                            # pip extras the target publishes, e.g. [t
 dependency_groups: []                 # PEP 735 groups from the target's pyproject, e.g. [full]
 pip_packages: []                      # packages the target declares nowhere, e.g. [harmonypy]
 python: "3.12"                        # interpreter for the target's throwaway venv
+submodules: true                      # check out the target's git submodules — tutorials often live in one
 env_passthrough: []                   # extra env vars agents may keep (e.g. [OMP_NUM_THREADS]); the agent env is otherwise a clean allowlist
                                       # naming any host denies every other one — a host the target needs but you left out
                                       # aborts the pass rather than scoring as a wrong answer. Private addresses are always denied.

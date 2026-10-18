@@ -29,8 +29,11 @@ class Task:
 
     id: str
     train: TaskSplit
-    valid: TaskSplit
     test: TaskSplit
+    #: The ``valid`` half is optional: an experiment that cross-validates over tasks and keeps its
+    #: own hold-out (``acumen lockbox``) needs only a train/test pair per task. Benching ``valid``
+    #: on a task without one is an error, not a silent skip.
+    valid: TaskSplit | None = None
     max_turns: int | None = None
     max_usd: float | None = None
     model: str | None = None
@@ -45,7 +48,10 @@ class Task:
         halves = {"train": self.train, "valid": self.valid, "test": self.test}
         if split not in halves:
             raise TaskError(f"no such split: {split!r}")
-        return halves[split]
+        found = halves[split]
+        if found is None:
+            raise TaskError(f"task {self.id!r} has no {split!r} split")
+        return found
 
 
 def _require_str(value: Any, where: str) -> str:
@@ -81,9 +87,9 @@ def _parse_task(raw: Any, index: int) -> Task:
     if not is_safe_component(task_id):
         raise TaskError(f"{where}.id {task_id!r} is not filesystem-safe — use only letters, digits, '.', '_', '-'")
     where = f"task {task_id!r}"
-    for key in ("train", "valid", "test"):
+    for key in ("train", "test"):
         if key not in raw:
-            raise TaskError(f"{where} is missing the '{key}' split — train, valid and test are all required")
+            raise TaskError(f"{where} is missing the '{key}' split — train and test are required (valid is optional)")
     max_turns = raw.get("max_turns")
     if max_turns is not None and (not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns < 1):
         raise TaskError(f"{where}.max_turns must be a positive integer, got {max_turns!r}")
@@ -103,8 +109,8 @@ def _parse_task(raw: Any, index: int) -> Task:
     return Task(
         id=task_id,
         train=_parse_split(raw["train"], f"{where}.train"),
-        valid=_parse_split(raw["valid"], f"{where}.valid"),
         test=_parse_split(raw["test"], f"{where}.test"),
+        valid=_parse_split(raw["valid"], f"{where}.valid") if "valid" in raw else None,
         max_turns=max_turns,
         max_usd=max_usd,
         model=model,

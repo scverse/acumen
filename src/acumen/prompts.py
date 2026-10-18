@@ -141,6 +141,197 @@ relevant and not otherwise.
   without confirming it in the installed package or the docs. No hedging — say what to do."""
 
 
+DRAFT_PROMPT = """\
+You are writing a Claude Skill for the Python package `{package}` (version {version}).
+
+A skill is documentation written for an agent, not for a human. Its only purpose is to
+make an agent that has never used `{package}` succeed at real tasks with it on the first
+try. It is not a tutorial, not a README, and not a sales pitch.
+
+The agent arrives with a goal stated in plain English — what a user wants done, not which
+function to call. The skill's job is to get it from that goal to a working result: route it
+to the right entry point and the right sequence of steps, so it never has to reverse-engineer
+that from the module layout.
+
+# What you can read
+
+- The package's source is at `{src}`. Read it — the source, the docstrings, the examples,
+  the docs directory. This is the ground truth about how the package behaves.
+- `{package}` is also installed; run `{python}` to check anything you are unsure about.
+  Verify claims before you write them down.
+
+# What you must write
+
+Your working directory is `{out}`. Write:
+
+1. `{out}/SKILL.md` — required. It must begin with YAML frontmatter, exactly:
+
+---
+name: {skill_name}
+description: <one sentence: what this skill covers and when to use it>
+---
+
+   The `name` must be exactly `{skill_name}`.
+
+   The `description` is load-bearing and must be HONEST. It is the only part of the skill
+   an agent sees before deciding whether to open it, and it is the only thing that gets
+   the skill loaded at the right moment.
+   State what the skill covers and the goals it applies to — name the outcomes a user would
+   actually phrase, so the skill loads when one of them comes up. Do not oversell it, and do
+   not claim coverage the body does not deliver. Use this format:
+   [What it does] + [When to use it: the goals/triggers it fires on] + [Key capabilities]
+
+2. `{out}/references/*.md` — optional. Use these for detail that only some tasks need.
+
+# How to write it
+
+- **Organize around goals, not modules.** Work out what people actually use `{package}` to
+  accomplish — read its examples, tutorials, and docs, not just its API — and structure the
+  skill so a stated goal maps to the right entry point and the right sequence of steps. Do not
+  just mirror the package's module layout.
+- **Write what is not guessable.** An agent already knows Python and can read a
+  traceback. Spend your words on what it would get WRONG by guessing: non-obvious
+  defaults, required preprocessing, the function that looks right but isn't, where
+  results are written, argument shapes and orientation, footguns the API invites, right order
+  of steps to follow.
+- **Generalize within each goal.** Organize around categories of goal, but keep the guidance
+  under each one general enough to cover any task in that category. Don't enumerate one-off
+  recipes — that's the failure mode on the other side of module-mirroring.
+- **Progressive disclosure.** `SKILL.md` should be short and route to `references/` for
+  depth. An agent pays for every token of it on every task, including the tasks where it
+  is irrelevant. If `SKILL.md` is long, you are taxing every run.
+- **Be concrete.** A correct short code example beats a paragraph of prose. Show the real
+  call, with the arguments that matter.
+- **Prefer removing text over adding it.** Anything that merely restates the obvious is
+  worse than nothing: it costs tokens and buries the parts that matter.
+- **No hedging.** Say what to do.
+
+# Verify before you finish
+
+Do not write claims you have not checked. If you assert a default value, a return type,
+or where an output lands, confirm it in the source or by running `{python}`. A skill that
+confidently states something false is worse than no skill at all — it will send an agent
+in the wrong direction with full confidence.
+{feedback}
+When you are done, `{out}/SKILL.md` must exist and start with the frontmatter above.
+"""
+
+RULEBOOK_IMPROVE_PROMPT = """\
+You are improving a RULEBOOK: the reusable instructions a drafting agent follows to write a Claude
+Skill (`SKILL.md`) for the Python package `{package}`. You are NOT writing a skill. You are editing
+the *instructions that generate* one, so the NEXT skill drafted from them succeeds more often.
+
+You are producing rulebook version {new_version} — an improvement of {parent_version}.
+
+# What a rulebook is
+
+A rulebook is a prompt template. A drafting agent is handed it, fills in the placeholders (the
+package, where its source is, where to write, the skill name), and follows it to produce a skill.
+The current rulebook is at `{rulebook_path}` — a copy you EDIT IN PLACE; what it contains when you
+finish becomes {new_version}.
+
+# What you can read
+
+- `{rulebook_path}` — the current rulebook ({parent_version}). Edit this file.
+- `{train_dir}` — evidence from benchmarking the skill THIS rulebook produced, on the TRAIN split.
+  Read `{train_dir}/SUMMARY.md` first. For each run: the task, the expected answer, the answer the
+  drafted skill's agent gave, whether it passed, and WHETHER THE SKILL LOADED AT ALL. This is your
+  only signal about what the rulebook's instructions actually produce.
+
+# What you are NOT allowed to see
+
+A separate, held-out TEST split measures whether your rulebook change generalises rather than
+tuning to these particular tasks. You must not see it; any tool call that reaches test results is
+BLOCKED. Do not attempt it — reaching test data would invalidate the benchmark.
+
+# Two failures, two fixes — same as for a skill, one level up
+
+Each run records whether the skill LOADED and whether it SUCCEEDED. Separate them:
+1. **Skill never loaded** — the rulebook's guidance on writing the `description` is too weak. The
+   only lever on loading is what the rulebook tells the drafter to put in the description.
+2. **Skill loaded but failed** — the rulebook's guidance on the skill BODY is too weak: it let the
+   drafter leave something out, or steered it wrong. Fix the instruction, not one skill's wording.
+
+# Improve the INSTRUCTIONS, never the instance — this is the whole point
+
+You are editing reusable instructions, so the failure mode is baking in a specific case:
+- **Fix the methodology, not the case.** If the drafted skill failed because it never told the
+  agent where an output lands, the rulebook fix is a stronger GENERAL instruction to document
+  where outputs land — never the specific output location from this task.
+- **NEVER put a task-specific fact in the rulebook.** No dataset name, parameter value, expected
+  answer, function name, or anything you saw in the train runs. The rulebook generates skills for
+  work you have not seen; baking in particulars is both overfitting and the wrong level entirely.
+- **Keep it general and lean.** Every rulebook instruction is paid on every future draft. Add one
+  only where the evidence shows the current rulebook lets a drafter go wrong; cut one that changed
+  nothing.
+- **Preserve every `{{...}}` placeholder EXACTLY** — `{{package}}`, `{{src}}`, `{{python}}`,
+  `{{out}}`, `{{skill_name}}`, `{{version}}`, `{{feedback}}`. They tell the drafter which package,
+  where to read, and where to write. Dropping, renaming, or adding one breaks every future draft.
+
+# What you must write
+
+1. Edit `{rulebook_path}` in place. It must stay a valid draft-prompt template: the same
+   placeholders, still instructing the drafter to write a `SKILL.md` that begins with honest
+   `name`/`description` frontmatter.
+2. `{rationale_path}` — one short paragraph: WHICH rulebook instruction you changed and WHY,
+   grounded in the train evidence. Write it OUTSIDE the rulebook file.
+{feedback}
+When you are done, `{rulebook_path}` still fills cleanly with the placeholders above, and
+`{rationale_path}` holds your rationale.
+"""
+
+POLLINATE_PROMPT = """\
+You are CROSS-POLLINATING {k} independently evolved RULEBOOKS for the Python package `{package}`.
+A rulebook is the reusable instructions a drafting agent follows to write a Claude Skill
+(`SKILL.md`); you are NOT writing a skill. Each island started from the SAME seed rulebook and
+evolved it over many generations on a DISJOINT set of analysis tasks — so an edit that helped on
+two islands was validated twice, on unrelated tasks, independently. Your job is to distill the
+edits that replicate into META-RULES and merge them into one rulebook.
+
+You are producing rulebook version {new_version} — a merge grounded in {parent_version}.
+
+# What you can read
+
+- `{rulebook_path}` — the seed/parent rulebook ({parent_version}). A copy you EDIT IN PLACE; what
+  it contains when you finish becomes {new_version}.
+- `{islands_dir}/island-<i>/champion.md` — island i's final champion rulebook (the survivor of its
+  screens and full-bench confirmations).
+- `{islands_dir}/island-<i>/journal.jsonl` — every generation's decision on island i: the
+  exploration directive, the screen scores, whether the edit was accepted, and whether a full
+  bench confirmed or reverted it.
+- `{islands_dir}/island-<i>/diffs/` — one unified diff per generation that reached the island's
+  champion chain: exactly the edits that survived.
+
+# What you must derive: meta-rules
+
+A piece of guidance is a META-RULE only if it REPLICATES: the same kind of change was accepted on
+two or more islands independently (compare the diffs and champions — the wording may differ, the
+principle must match). Treat guidance found on a single island as island noise: keep it only if it
+is clearly a special case of a replicated principle. Rejected and reverted edits are evidence too —
+guidance that repeatedly FAILED screens or was reverted on a full bench should not survive the
+merge, even if one champion still carries it.
+
+# How to merge
+
+- Start from the parent at `{rulebook_path}` and fold each meta-rule in ONCE, in the clearest
+  wording any island found — do not concatenate the champions.
+- Same rules as any rulebook edit: fix methodology, never an instance; NEVER put a task-specific
+  fact (dataset, parameter value, expected answer) into the rulebook; keep it lean — every
+  instruction is paid on every future draft; preserve every `{{...}}` placeholder EXACTLY
+  (`{{package}}`, `{{src}}`, `{{python}}`, `{{out}}`, `{{skill_name}}`, `{{version}}`,
+  `{{feedback}}`).
+
+# What you must write
+
+1. Edit `{rulebook_path}` in place — it must remain a valid draft-prompt template.
+2. `{rationale_path}` — the meta-rule list: one line per meta-rule, naming WHICH islands support
+   it and what evidence (accepted diffs, journal entries). Write it OUTSIDE the rulebook file.
+{feedback}
+When you are done, `{rulebook_path}` still fills cleanly with the placeholders above, and
+`{rationale_path}` enumerates the meta-rules with their supporting islands.
+"""
+
+
 IMPROVE_PROMPT = """\
 You are improving an agent skill for the Python package `{package}` (version {version}).
 
@@ -494,6 +685,57 @@ omitted. Do not add other keys unless you deliberately want a per-task override 
 - You wrote at least one task per tutorial, and covered all of them.
 - `{out}` exists and parses as the YAML above with at least one task.
 """
+
+
+#: The per-notebook scope block: cover ONE assigned tutorial. Filled into ``{scope}`` by
+#: :func:`taskgen_shard_prompt` — one such agent runs per notebook, fanned out by the harness, so
+#: coverage of the whole package is the union of the shards rather than one agent's stamina. The
+#: ``{notebook}`` placeholder is the notebook's path within the source copy.
+TASKGEN_SCOPE_SHARD = """\
+# Your one tutorial — cover the analyses in it
+
+You are generating tasks for exactly ONE tutorial from this package: `{notebook}`. Read it in
+full, and the source it exercises, and write a task for each genuinely DIFFERENT analysis it
+demonstrates — usually one to three. Do NOT wander into other tutorials or unrelated parts of the
+API; other agents cover those, and overlap wastes the benchmark. If the notebook demonstrates a
+single analysis, ONE well-formed task is the correct output — do not pad it to hit a count.
+"""
+
+#: The mined-analysis scope block: cover ONE real-world script someone published. Filled into
+#: ``{scope}`` by :func:`taskgen_mined_prompt`. The one thing that differs from a tutorial shard is
+#: data: the script's own inputs are not here, so every task must be re-grounded on a bundled
+#: dataset — the same analysis, on data the benchmarked agent can actually load.
+TASKGEN_SCOPE_MINED = """\
+# Your one analysis — a real script someone published using this package
+
+You are generating tasks from exactly ONE real-world analysis: `{analysis}`, mined from a public
+repository or page (its origin is in the header comment). Read it in full, and the package source
+it exercises. It shows what a practitioner actually did with the package — that is the unit of
+work this benchmark should measure. Write a task for each genuinely DIFFERENT analysis it
+performs — usually one to three; if it performs one, ONE task is the correct output.
+
+The script's OWN DATA IS NOT AVAILABLE here, and you must not try to fetch it. Re-ground every
+task on one of the package's bundled example datasets (see its `datasets` module) that fits the
+analysis — the same analysis, on data you can actually run. If no bundled dataset can support an
+analysis, skip that analysis rather than invent one. Do NOT wander beyond what this script
+demonstrates; other agents cover other analyses, and overlap wastes the benchmark.
+"""
+
+#: The mined-analysis coverage bullet, paired with :data:`TASKGEN_SCOPE_MINED`.
+TASKGEN_CHECK_MINED = (
+    "- Every task is grounded in an analysis actually performed in `{analysis}`, re-run on a\n"
+    "  bundled dataset — you did not wander, and you did not invent an analysis the script lacks."
+)
+
+#: The whole-package "before you finish" coverage bullet, paired with :data:`TASKGEN_SCOPE_WHOLE`.
+TASKGEN_CHECK_WHOLE = "- You wrote at least one task per tutorial, and covered all of them."
+
+#: The per-notebook coverage bullet, paired with :data:`TASKGEN_SCOPE_SHARD`. ``{notebook}`` is
+#: the assigned notebook's path.
+TASKGEN_CHECK_SHARD = (
+    "- Every task is grounded in an analysis actually demonstrated in `{notebook}` — you did not\n"
+    "  wander into other tutorials."
+)
 
 
 REVIEW_PROMPT = """\
@@ -902,6 +1144,163 @@ PR; leave the changes in the working tree for the user to review with `git diff`
 edits if it is not a git repo)."""
 
 
+def draft_prompt(
+    *,
+    package: str,
+    version: str,
+    src: Path,
+    python: Path,
+    out: Path,
+    skill_name: str,
+    feedback: str | None = None,
+    template: str | None = None,
+) -> str:
+    """Build the prompt for the drafting agent.
+
+    Unlike a benchmark agent, the drafter gets read access to the target's source —
+    it is writing documentation about the package, so it needs to see it.
+
+    Parameters
+    ----------
+    package
+        The target package name.
+    version
+        The installed version, so the skill describes what is actually installed.
+    src
+        The package checkout, readable by this agent only.
+    python
+        The interpreter with the package installed, for verifying claims.
+    out
+        The staging directory the agent writes the skill into.
+    skill_name
+        The name the frontmatter must declare — ``config.skill_name``.
+    feedback
+        Optional maintainer guidance, subordinated below the hard rules. ``None`` leaves the
+        prompt byte-identical to a run without the flag.
+    template
+        The draft-instruction template to fill, i.e. a *rulebook* version's text. Defaults to the
+        built-in :data:`DRAFT_PROMPT` when ``None``, so a plain ``acumen draft`` is unchanged. The
+        rulebook loop passes ``rulebooks/vN/rulebook.md`` here to draft from the version on trial;
+        the template must carry the same placeholders this fills (validated by
+        :func:`acumen.rulebooks.validate_rulebook`).
+
+    Returns
+    -------
+    The draft prompt.
+    """
+    return (template or DRAFT_PROMPT).format(
+        package=package,
+        version=version,
+        src=src,
+        python=python,
+        out=out,
+        skill_name=skill_name,
+        feedback=feedback_block(feedback),
+    )
+
+
+def rulebook_improve_prompt(
+    *,
+    package: str,
+    rulebook_path: Path,
+    train_dir: Path,
+    rationale_path: Path,
+    parent_version: str,
+    new_version: str,
+    feedback: str | None = None,
+) -> str:
+    """Build the prompt for the outer-loop agent that improves the *rulebook*.
+
+    One level up from :func:`improve_prompt`: the artifact under edit is the draft-instruction
+    template (a rulebook version), not a skill. The evidence is the same train-split material the
+    skill improver reads — how the skill THIS rulebook produced performed — but the fix is to the
+    reusable instructions, so the prompt hammers on "improve the methodology, never the instance"
+    and on preserving the template placeholders. The held-out test split stays unreachable,
+    enforced structurally and by the same guard the skill improver uses.
+
+    Parameters
+    ----------
+    package
+        The target package name, for orientation.
+    rulebook_path
+        The staged rulebook copy the agent edits in place to produce the new version.
+    train_dir
+        The train-split evidence directory (``SUMMARY.md`` + per-run material), laid out by the
+        same writer the skill improver uses.
+    rationale_path
+        Where the agent writes its rationale — outside the rulebook file.
+    parent_version, new_version
+        The rulebook version being improved and the one being produced, e.g. ``v1`` -> ``v2``.
+    feedback
+        Optional maintainer guidance, subordinated below the hard rules. ``None`` leaves the
+        prompt byte-identical to a run without the flag.
+
+    Returns
+    -------
+    The rulebook-improve prompt.
+    """
+    return RULEBOOK_IMPROVE_PROMPT.format(
+        package=package,
+        rulebook_path=rulebook_path,
+        train_dir=train_dir,
+        rationale_path=rationale_path,
+        parent_version=parent_version,
+        new_version=new_version,
+        feedback=feedback_block(feedback),
+    )
+
+
+def pollinate_prompt(
+    *,
+    package: str,
+    k: int,
+    rulebook_path: Path,
+    islands_dir: Path,
+    rationale_path: Path,
+    parent_version: str,
+    new_version: str,
+    feedback: str | None = None,
+) -> str:
+    """Build the prompt for the cross-pollination agent that merges island champions.
+
+    The agent reads each island's champion rulebook, decision journal, and accepted-edit diffs,
+    distills the edits that replicated across independent islands into meta-rules, and merges them
+    into the parent rulebook. Replication across disjoint task partitions is the evidence standard:
+    it is the structural version of "this edit ALWAYS seems to improve".
+
+    Parameters
+    ----------
+    package
+        The target package name, for orientation.
+    k
+        How many islands evolved independently.
+    rulebook_path
+        The staged parent-rulebook copy the agent edits in place to produce the merged version.
+    islands_dir
+        Directory holding one ``island-<i>/`` of materials per island (champion, journal, diffs).
+    rationale_path
+        Where the agent writes the meta-rule list — outside the rulebook file.
+    parent_version, new_version
+        The parent rulebook version and the merged one being produced.
+    feedback
+        Optional maintainer guidance, subordinated below the hard rules.
+
+    Returns
+    -------
+    The cross-pollination prompt.
+    """
+    return POLLINATE_PROMPT.format(
+        package=package,
+        k=k,
+        rulebook_path=rulebook_path,
+        islands_dir=islands_dir,
+        rationale_path=rationale_path,
+        parent_version=parent_version,
+        new_version=new_version,
+        feedback=feedback_block(feedback),
+    )
+
+
 def improve_prompt(
     *,
     package: str,
@@ -1102,6 +1501,75 @@ def taskgen_prompt(
         out_dir=out.parent,
         scripts_dir=scripts_dir,
         feedback=feedback_block(feedback),
+    )
+
+
+_WHOLE_SCOPE_HEADING = "# Cover every tutorial — enumerate them FIRST"
+_WHOLE_CHECK = "- You wrote at least one task per tutorial, and covered all of them."
+
+
+def _rescope_taskgen(prompt: str, *, scope: str, coverage_check: str) -> str:
+    """Swap the whole-package scope section and coverage bullet of :data:`TASKGEN_PROMPT` for another.
+
+    The sharded and mined generators share every other rule with :func:`taskgen_prompt` verbatim —
+    how to write a task, ground truth by execution, the output schema — so the three cannot drift
+    on what a well-formed task looks like. Only the ``# Cover every tutorial`` section and the
+    matching "before you finish" bullet differ.
+    """
+    start = prompt.index(_WHOLE_SCOPE_HEADING)
+    end = prompt.index("\n# ", start + len(_WHOLE_SCOPE_HEADING))
+    prompt = prompt[:start] + scope.rstrip() + "\n" + prompt[end:]
+    if _WHOLE_CHECK not in prompt:
+        raise ValueError("TASKGEN_PROMPT no longer has the whole-package coverage bullet to replace")
+    return prompt.replace(_WHOLE_CHECK, coverage_check)
+
+
+def taskgen_shard_prompt(
+    *,
+    package: str,
+    src: Path,
+    python: Path,
+    out: Path,
+    scripts_dir: Path,
+    notebook: str,
+    feedback: str | None = None,
+) -> str:
+    """Build the prompt for one *sharded* task-generation agent — a single assigned notebook.
+
+    Identical to :func:`taskgen_prompt` except for the scope: instead of enumerating and covering
+    every tutorial in one context, this agent covers exactly one notebook. The harness fans out one
+    such agent per notebook, so whole-package coverage is the union of the shards and one error
+    loses one notebook, not the run.
+    """
+    base = taskgen_prompt(package=package, src=src, python=python, out=out, scripts_dir=scripts_dir, feedback=feedback)
+    return _rescope_taskgen(
+        base,
+        scope=TASKGEN_SCOPE_SHARD.format(notebook=notebook),
+        coverage_check=TASKGEN_CHECK_SHARD.format(notebook=notebook),
+    )
+
+
+def taskgen_mined_prompt(
+    *,
+    package: str,
+    src: Path,
+    python: Path,
+    out: Path,
+    scripts_dir: Path,
+    analysis: Path,
+    feedback: str | None = None,
+) -> str:
+    """Build the prompt for one *mined-analysis* task-generation agent.
+
+    The third scope of the shared task prompt: the agent is handed one real-world script
+    (``analysis``, seeded into its working directory by the harness) and told to re-ground its
+    analyses on bundled datasets, since the script's own inputs are not available.
+    """
+    base = taskgen_prompt(package=package, src=src, python=python, out=out, scripts_dir=scripts_dir, feedback=feedback)
+    return _rescope_taskgen(
+        base,
+        scope=TASKGEN_SCOPE_MINED.format(analysis=analysis),
+        coverage_check=TASKGEN_CHECK_MINED.format(analysis=analysis),
     )
 
 
