@@ -1,6 +1,6 @@
 # API
 
-acumen is a CLI (`acumen init/tasks/check/draft/bench/improve/report/ship`) that is a thin shell over
+acumen is a CLI (`acumen init/tasks/check/draft/bench/improve/report/ship`, plus `mine/lockbox/coverage/warm/evolve/status/verdict` for [rulebook evolution](how-evolve-works.md)) that is a thin shell over
 an importable Python API. Everything below is re-exported from the top-level `acumen` package,
 so `from acumen import build_report` works.
 

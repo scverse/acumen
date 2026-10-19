@@ -32,6 +32,8 @@ from acumen.check import (
     select_tasks,
     summarize_checks,
 )
+from acumen.cli_rulebook import add_parsers as add_rulebook_parsers
+from acumen.cli_rulebook import add_tasks_args
 from acumen.config import AUTH_CHOICES, Config, ConfigError, load_config
 from acumen.env import DEFAULT_CACHE_ROOT, AuthMode, EnvError, prepare_target, resolve_auth_mode
 from acumen.epoch import EpochPlan, completed_epochs, resolve_epoch
@@ -565,7 +567,7 @@ def _resolve_arms(cfg: Config, tasks: Sequence[Task], args: argparse.Namespace) 
     for version in versions:
         skill = None if version is None else load_skill(args.skills, version, expect_name=cfg.skill_name)
         planned = build_matrix(cfg, tasks, skill=version, splits=args.split or BENCH_SPLITS, task_ids=args.task)
-        todo = pending(planned, args.runs, resume=not args.no_resume)
+        todo = pending(planned, args.runs, skill_hash=skill.hash if skill else None, resume=not args.no_resume)
         arms.append(_Arm(version=version, skill=skill, planned=planned, todo=todo))
     return arms
 
@@ -753,7 +755,7 @@ def _build_arms(
     for version, splits in specs:
         skill = None if version is None else load_skill(skills_root, version, expect_name=cfg.skill_name)
         planned = build_matrix(cfg, tasks, skill=version, splits=splits, task_ids=task_ids)
-        todo = pending(planned, runs_root, resume=resume)
+        todo = pending(planned, runs_root, skill_hash=skill.hash if skill else None, resume=resume)
         arms.append(_Arm(version=version, skill=skill, planned=planned, todo=todo))
     return arms
 
@@ -867,7 +869,10 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     except BenchmarkInvalidError as err:
         print(f"\nerror: {err}", file=sys.stderr)
         _invalid_bench_note()
-        return 2
+        # 3 = the platform paused the pass (limit, credit, network): wait and rerun the identical
+        # command. 2 = something a wait will not fix (a refused sandbox host).
+        paused = all(o.reason in {"provider_exhausted", "connection_error"} for o in err.outcomes)
+        return 3 if paused else 2
 
     if len(running) > 1:
         _print_run_summary(collected, progress.elapsed, label=f"all {len(running)} arms")
@@ -1079,7 +1084,7 @@ def _prepare_pass(cfg: Config, args: argparse.Namespace):
     return auth_modes, meta_auth, prices, target
 
 
-def _valid_complete_fn(cfg: Config, tasks: list[Task], runs_root: Path) -> Callable[[str], bool]:
+def _valid_complete_fn(cfg: Config, tasks: list[Task], runs_root: Path, skills_root: Path) -> Callable[[str], bool]:
     """Build the "does this version have a complete ``valid`` bench?" predicate.
 
     Shared by epoch resolution (``resolve_epoch``/``completed_epochs``) so the two never
@@ -1088,7 +1093,8 @@ def _valid_complete_fn(cfg: Config, tasks: list[Task], runs_root: Path) -> Calla
 
     def valid_complete(version: str) -> bool:
         planned = build_matrix(cfg, tasks, skill=version, splits=["valid"])
-        return not pending(planned, runs_root, resume=True)
+        skill = load_skill(skills_root, version, expect_name=cfg.skill_name)
+        return not pending(planned, runs_root, skill_hash=skill.hash, resume=True)
 
     return valid_complete
 
@@ -1116,7 +1122,7 @@ def _run_one_epoch(
     """
     runs_root = args.runs
 
-    valid_complete = _valid_complete_fn(cfg, tasks, runs_root)
+    valid_complete = _valid_complete_fn(cfg, tasks, runs_root, args.skills)
     plan = resolve_epoch(args.skills, valid_complete=valid_complete)
     parent_label = plan.parent_version or arm_name(None)
     tail = " (resuming)" if plan.resumed else ""
@@ -1314,7 +1320,7 @@ def _cmd_fit(args: argparse.Namespace) -> int:
         return 2
 
     # How many epochs are already fully done on disk — the loop resumes from the next one.
-    completed = completed_epochs(args.skills, valid_complete=_valid_complete_fn(cfg, tasks, args.runs))
+    completed = completed_epochs(args.skills, valid_complete=_valid_complete_fn(cfg, tasks, args.runs, args.skills))
     remaining = max(0, total - completed)
     prior = [row for row in build_training_rows(args.runs, cfg) if row.epoch <= completed] if completed else []
     stopping = f"early stopping with patience {args.patience}, min-delta {_fmt_pp(args.min_delta)}"
@@ -1469,6 +1475,11 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
         f"generating tasks with {cfg.meta_model} (this reads the source and runs package code) ...",
         flush=True,
     )
+
+    if args.candidates or args.per_notebook:
+        from acumen.cli_rulebook import cmd_tasks_sharded
+
+        return cmd_tasks_sharded(args, cfg, target, out, auth_mode, _agent_prices(cfg, model=cfg.meta_model))
 
     log = LiveLog.open(args.log_dir, "tasks", stream=args.stream)
     print(f"log → {log.jsonl_path}", flush=True)
@@ -2138,6 +2149,7 @@ def build_parser() -> argparse.ArgumentParser:
     tasks_cmd.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
     tasks_cmd.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     tasks_cmd.add_argument("--force", action="store_true", help="overwrite an existing tasks file")
+    add_tasks_args(tasks_cmd)
     _add_auth_arg(tasks_cmd, default=None)
     _add_feedback_arg(tasks_cmd, extra=" (e.g. which functionality to skip or focus on)")
     _add_log_args(tasks_cmd)
@@ -2226,6 +2238,8 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--dir", type=Path, default=Path("."), dest="directory", help="directory to scaffold into")
     init.add_argument("--force", action="store_true", help="overwrite existing config.yaml / tasks.yaml")
     init.set_defaults(func=_cmd_init)
+
+    add_rulebook_parsers(sub)
     return parser
 
 

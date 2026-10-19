@@ -8,7 +8,7 @@ from typing import Any
 
 import yaml
 
-from .paths import PathError, slugify
+from .paths import PathError, is_safe_component, slugify
 from .prices import Rates
 
 
@@ -35,6 +35,13 @@ class Config:
     #: specifiers (``numpy<2``) work.
     pip_packages: list[str] = field(default_factory=list)
     python: str = "3.12"
+    #: Whether to check out the target's git submodules after cloning. Defaults to True
+    #: because a package's tutorials are routinely a submodule (squidpy keeps its 50
+    #: notebooks in ``docs/notebooks`` -> ``scverse/squidpy-tutorials``), and the drafting
+    #: and task-generation agents read those docs as their primary evidence — without them
+    #: the agent silently sees an empty directory and falls back to guessing from source.
+    #: Set False for a target whose submodules are private, huge, or irrelevant.
+    submodules: bool = True
     #: Names of environment variables to carry from the operator's shell into isolated
     #: agents (bench sandboxes and the draft/improve/tasks meta-agents), on top of the
     #: built-in auth/proxy allowlist. The agent env is otherwise a clean allowlist — every
@@ -42,6 +49,13 @@ class Config:
     #: (``OMP_NUM_THREADS``, ``R_HOME``, a service key) must name it here. Values are passed
     #: through verbatim; only list what the package genuinely needs.
     env_passthrough: list[str] = field(default_factory=list)
+    #: Names of directories, relative to an agent's working directory, into which the target
+    #: package downloads example data (squidpy/scanpy: ``data`` for ``datasets.*``, ``cache``
+    #: for cached reads — both are cwd-relative defaults). Each is symlinked from every sandbox
+    #: to one persistent, shared directory under the target cache, so a dataset is downloaded
+    #: once per target rather than once per run. Datasets are read-only inputs, so sharing them
+    #: leaks no run state; the env scrub is untouched. Empty (the default) shares nothing.
+    dataset_cache_dirs: list[str] = field(default_factory=list)
     models: list[str] = field(default_factory=lambda: ["claude-opus-5"])
     n_replicates: int = 3
     max_concurrency: int = 4
@@ -83,7 +97,9 @@ _KNOWN = {
     "dependency_groups",
     "pip_packages",
     "python",
+    "submodules",
     "env_passthrough",
+    "dataset_cache_dirs",
     "models",
     "n_replicates",
     "max_concurrency",
@@ -160,6 +176,15 @@ def _positive_float(raw: dict[str, Any], key: str, default: float) -> float:
     return float(value)
 
 
+def _bool(raw: dict[str, Any], key: str, default: bool) -> bool:
+    if key not in raw:
+        return default
+    value = raw[key]
+    if not isinstance(value, bool):
+        raise ConfigError(f"'{key}' must be true or false, got {value!r}")
+    return value
+
+
 def _str_list(raw: dict[str, Any], key: str, default: list[str]) -> list[str]:
     if key not in raw:
         return list(default)
@@ -216,6 +241,15 @@ def parse_config(raw: Any) -> Config:
     if len(set(models)) != len(models):
         raise ConfigError(f"'models' contains duplicates: {models}")
 
+    dataset_cache_dirs = _str_list(raw, "dataset_cache_dirs", [])
+    for name in dataset_cache_dirs:
+        # Each entry becomes a symlink directly under the sandbox root, so it must be a single
+        # plain path component — a nested or parent-relative path would escape the sandbox.
+        if not is_safe_component(name):
+            raise ConfigError(
+                f"'dataset_cache_dirs' entry {name!r} must be a single directory name (letters, digits, '.', '_', '-')"
+            )
+
     default_model = models[0]
     return Config(
         repo=repo,
@@ -225,7 +259,9 @@ def parse_config(raw: Any) -> Config:
         dependency_groups=_str_list(raw, "dependency_groups", []),
         pip_packages=_str_list(raw, "pip_packages", []),
         python=_optional_str(raw, "python", "3.12"),
+        submodules=_bool(raw, "submodules", True),
         env_passthrough=_str_list(raw, "env_passthrough", []),
+        dataset_cache_dirs=dataset_cache_dirs,
         models=models,
         n_replicates=_positive_int(raw, "n_replicates", 3),
         max_concurrency=_positive_int(raw, "max_concurrency", 4),

@@ -1030,7 +1030,8 @@ def test_bench_exits_nonzero_and_prints_provider_exhaustion(
     monkeypatch.setattr("acumen.cli.prepare_target", lambda *_args, **_kwargs: target)
     monkeypatch.setattr("acumen.cli.run_matrix", invalid_matrix)
 
-    assert main(bench_args(project)) == 2
+    # 3, not 2: exhausted usage is the platform pausing the pass, so the identical rerun resumes it.
+    assert main(bench_args(project)) == 3
     err = capsys.readouterr().err
     assert "benchmark invalid" in err
     assert "You've hit your usage limit" in err

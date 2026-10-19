@@ -96,7 +96,8 @@ def _task_to_dict(task: Task) -> dict[str, object]:
     if not task.needs_script:
         entry["needs_script"] = False
     entry["train"] = {"prompt": task.train.prompt, "answer": task.train.answer}
-    entry["valid"] = {"prompt": task.valid.prompt, "answer": task.valid.answer}
+    if task.valid is not None:
+        entry["valid"] = {"prompt": task.valid.prompt, "answer": task.valid.answer}
     entry["test"] = {"prompt": task.test.prompt, "answer": task.test.answer}
     if task.max_turns is not None:
         entry["max_turns"] = task.max_turns

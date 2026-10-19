@@ -10,7 +10,46 @@ and this project adheres to [Semantic Versioning][].
 
 ## [0.0.2dev]
 
+### Added
+
+- Add the rulebook-evolution loop beside `acumen epoch`. `acumen evolve` searches over a *rulebook*
+  (the instructions a skill is drafted from) rather than over one skill: each generation edits the
+  champion rulebook under a rotating exploration directive, drafts a skill from it, and screens it
+  on a rotating task subset (`--screen-size`, `--screen-drafts N` to average over N independent
+  drafts, `--accept-delta` as the noise bar). A screen win becomes champion only after a
+  full-benchmark confirmation (`--confirm-every`), `--headroom` restricts the search to tasks the
+  bare model fails, and `--islands K` evolves K independent islands on disjoint task partitions and
+  keeps only edits that replicated across islands. Resumes by file presence: rerun the identical
+  command. It exits 3 when the platform paused it (limit, overload, network) and nothing bad was
+  recorded.
+- Add `acumen draft` (a skill from the package source, optionally under a rulebook), `acumen
+  lockbox` (a write-once, digest-verified hold-out), `acumen coverage` (which public API symbols the
+  tasks exercise, and what a skill teaches versus what the benchmark verifies) and `acumen warm`
+  (pre-download datasets into a shared per-target cache, linked into sandboxes by
+  `dataset_cache_dirs`).
+- Add sharded task generation, `acumen tasks --per-notebook` and `--candidates DIR`: one agent per
+  tutorial notebook or mined real-world script, resumable per shard, merged into one `tasks.yaml`
+  with namespaced ids and reproducers. `acumen.mining` harvests the candidate scripts.
+- Add `acumen mine` (harvest real analyses that use the target from GitHub code search and web pages
+  into candidate scripts), `acumen status` (a health check for a running experiment: progress, spend,
+  skill-load rate, platform-killed runs recorded as failures) and `acumen verdict` (draft means, paired
+  sign tests and the hard/easy split behind the answer).
+- Document rulebook evolution: how it works (`docs/how-evolve-works.md`: the rulebook, a generation, islands,
+  the lockbox, the verdict, what it writes) and the staged protocol with the rules for running it
+  unattended (`docs/evolve.md`).
+
 ### Changed
+
+- A task's `valid` split is now optional, so an experiment that cross-validates over tasks and keeps
+  its own lockbox can use train/test pairs. Benching `valid` on a task without one is an error.
+- `acumen bench` exits 3, not 2, when a pass is cut short by an exhausted credential or a dropped
+  network: the cells stay pending and rerunning the identical command resumes them. 2 is kept for
+  what waiting will not fix (a refused sandbox host).
+- A rate limit, overload or session limit seen in a run's errors is now recorded as an invalid run
+  (`connection_error`) rather than a failed task, so resume retries it and no improver reads it as
+  evidence. Only the harness error and the provider's error list are read, never the agent's answer.
+- `pending()` takes the benched skill's hash and counts a run as done only if it was recorded with
+  that skill, so a re-drafted `v1` never inherits another draft's results.
 
 - Test success rate and cost separately in the report's significance tables. Each version gets a
   one-sided p per axis, with a Benjamini–Hochberg FDR q computed within each axis across the
