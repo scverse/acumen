@@ -79,6 +79,12 @@ Fit can be resumed. Re-run `acumen fit` and it continues from the last finished 
 
 Each stage also runs on its own: `acumen bench`, `acumen wiki`, and `acumen improve`.
 
+To measure what the wiki adds, `acumen fit --ablate-wiki` writes `v1` from the package source
+alone. It uses the same create prompt with no wiki or transcripts, and runs no train benches. It
+then benches that `v1` and the no-skill baseline on `valid` and stops. The test split is left
+untouched. One project root holds one ablation run. Compare its `v1` with the first epoch of a
+normal fit run in another root.
+
 ## Shipping
 
 `acumen ship` gives your package a `<dist>-install-skills` command so its users can install the

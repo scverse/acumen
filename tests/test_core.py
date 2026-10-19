@@ -75,7 +75,7 @@ from acumen.env import (
 )
 from acumen.grade import INVALID_REASONS, grade_answer, grade_run
 from acumen.guard import SYSTEM_ROOTS, find_escape
-from acumen.improve import find_valid_access
+from acumen.improve import ImproveError, find_valid_access, improve_skill
 from acumen.logs import LiveLog
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
 from acumen.pricefeed import PriceFeedError, diff_rates, fetch_table, parse_anthropic, parse_openai
@@ -91,7 +91,7 @@ from acumen.prices import (
     resolve_cost,
 )
 from acumen.procs import label_env, reap, supported, survivors
-from acumen.prompts import feedback_block, improve_prompt, wiki_prompt
+from acumen.prompts import _SKILL_CRAFT, feedback_block, improve_prompt, wiki_prompt
 from acumen.report import (
     _ALL_MODELS_COLOR,
     ReportError,
@@ -3005,6 +3005,19 @@ def test_write_meta_persists_feedback_but_omits_it_when_absent(tmp_path: Path) -
     assert read_meta(directory).feedback == "emphasise pseudobulk"
 
 
+def test_write_meta_records_an_ablation_but_omits_it_for_a_normal_fit(tmp_path: Path) -> None:
+    directory = tmp_path / "v1"
+    directory.mkdir()
+    (directory / "SKILL.md").write_text("---\nname: target\ndescription: d\n---\nbody\n")
+
+    write_meta(directory, parent=None, rationale="created v1")
+    assert "ablation" not in (directory / "meta.json").read_text()
+    assert read_meta(directory).ablation is None
+
+    write_meta(directory, parent=None, rationale="created v1", ablation="no-wiki")
+    assert read_meta(directory).ablation == "no-wiki"
+
+
 # --- improve evidence ------------------------------------------------------------------
 
 
@@ -3232,6 +3245,41 @@ def test_improve_prompt_create_mode_writes_frontmatter_from_scratch() -> None:
     assert "FIRST agent skill" in prompt
     assert "name: p" in prompt
     assert "noskill" in prompt
+
+
+def _create_prompt(**overrides) -> str:
+    kwargs = {
+        "package": "p",
+        "version": "1",
+        "src": Path("/s"),
+        "python": Path("/py"),
+        "skill_dir": Path("/skill"),
+        "wiki_dir": Path("/wiki"),
+        "transcripts_dir": Path("/tr"),
+        "rationale_path": Path("/r.md"),
+        "skill_name": "p",
+        "new_version": "v1",
+        "parent_version": None,
+    }
+    return improve_prompt(**(kwargs | overrides))
+
+
+def test_improve_prompt_source_only_drops_the_evidence_and_nothing_else() -> None:
+    """The wiki ablation must differ from create mode only in what the agent reads."""
+    create = _create_prompt()
+    source_only = _create_prompt(source_only=True)
+
+    assert "/wiki" not in source_only and "/tr" not in source_only
+    assert "wiki" not in source_only.lower() and "transcript" not in source_only.lower()
+    # Same task framing, frontmatter rules, craft and closing — the controlled part of the ablation.
+    for shared in ("FIRST agent skill", "name: p", "/s", "/py", "When you are done"):
+        assert shared in create and shared in source_only
+    assert _SKILL_CRAFT in create and _SKILL_CRAFT in source_only
+
+
+def test_improve_prompt_source_only_refuses_a_parent() -> None:
+    with pytest.raises(ValueError, match="first skill"):
+        _create_prompt(source_only=True, parent_version="v1")
 
 
 def test_wiki_prompt_demands_brevity_and_the_entry_format() -> None:
@@ -5651,3 +5699,45 @@ def test_write_training_csv_roundtrips_header_and_per_model_columns(tmp_path: Pa
         for prefix in ("train_success", "valid_success", "train_cost", "valid_cost"):
             assert f"{prefix}__{model}" in header
     assert lines[1].startswith("1,v1,noskill,")
+
+
+# --- wiki ablation ---------------------------------------------------------------------
+
+
+def test_improve_skill_source_only_creates_v1_without_train_runs_or_wiki(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ablation needs no evidence: no train runs, nothing staged but the filtered source."""
+    seen: dict[str, object] = {}
+
+    async def fake_run_agent(prompt, *, options, on_event=None):
+        seen["prompt"] = prompt
+        seen["staged"] = sorted(path.name for path in options.cwd.iterdir())
+        staging = options.cwd / "v1"
+        (staging / "SKILL.md").write_text("---\nname: target-demo\ndescription: d\n---\nbody\n")
+        (options.cwd / "rationale.md").write_text("from the source")
+        return _agent_result()
+
+    monkeypatch.setattr("acumen.improve.run_agent", fake_run_agent)
+    monkeypatch.setattr("acumen.improve.build_agent_env", lambda **_kwargs: {})
+    skills = tmp_path / "skills"
+    common = {
+        "cfg": parse_config({"repo": "/tmp/target-demo", "meta_model": "claude-opus-5"}),
+        "target": _review_target(tmp_path),
+        "skills_root": skills,
+        "runs_root": tmp_path / "runs",  # absent: no train runs at all
+        "wiki_root": tmp_path / "wiki",
+        "tasks": [_task("bulk")],
+        "prices": _REVIEW_PRICES,
+        "source_only": True,
+    }
+
+    result = asyncio.run(improve_skill(**common))
+
+    assert result.skill.version == "v1" and result.parent is None
+    assert seen["staged"] == ["v1"], "only the staging dir — no wiki, no transcripts"
+    assert "wiki" not in str(seen["prompt"]).lower()
+    assert read_meta(skills / "v1").ablation == "no-wiki"
+    # One root = one ablation: a second source-only v1 is refused rather than written as v2.
+    with pytest.raises(ImproveError, match="no version yet"):
+        asyncio.run(improve_skill(**common))

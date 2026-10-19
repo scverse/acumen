@@ -281,6 +281,52 @@ When you are done, `{skill_dir}/SKILL.md` exists and starts with the frontmatter
 """
 
 
+# The wiki ablation (``acumen fit --ablate-wiki``): CREATE_PROMPT with the evidence taken out — no
+# wiki, no transcripts — so the only difference between the two first skills is what they learned
+# from. Keep the rest in lockstep with CREATE_PROMPT, or the ablation measures the prompt instead.
+CREATE_SOURCE_ONLY_PROMPT = """\
+You are writing the FIRST agent skill (version {new_version}) for the Python package `{package}`
+(version {version}).
+
+A skill is documentation written for an agent, not a human. Its only purpose is to make an agent
+that has never used `{package}` succeed at real tasks with it on the first try. It is not a
+tutorial, not a README, not a sales pitch. The agent arrives with a goal in plain English; the
+skill routes it to the right entry point and sequence of steps.
+
+# What you can read
+
+- `{src}` — the package source (filtered: any skill or agent-guidance files a package ships have
+  been stripped and are BLOCKED — write from the API, the source, and the user-facing docs, not
+  from someone else's skill). `{package}` is installed; run `{python}` to verify claims. Do not
+  install packages.
+- You have web access if the published docs help.
+
+# What you must write
+
+Your staging directory is `{skill_dir}`. Write:
+
+1. `{skill_dir}/SKILL.md` — required. It must begin with YAML frontmatter, exactly:
+
+---
+name: {skill_name}
+description: <one sentence: what this skill covers and when to use it>
+---
+
+   The `name` must be exactly `{skill_name}`. The `description` is load-bearing and must be HONEST —
+   it is the only thing an agent sees before deciding whether to open the skill.
+
+2. `{skill_dir}/references/*.md` — optional, for detail only some tasks need.
+
+3. `{rationale_path}` — one short paragraph on what the skill covers and why, grounded in the
+   package source. Write it OUTSIDE `{skill_dir}`.
+
+{craft}
+{feedback}
+When you are done, `{skill_dir}/SKILL.md` exists and starts with the frontmatter above, and
+`{rationale_path}` contains your rationale.
+"""
+
+
 WIKI_PROMPT = """\
 You are a benchmark analyst keeping a running knowledge wiki about how well an agent skill for the
 Python package `{package}` helps on ONE task. Your job this round: read what happened when the
@@ -916,6 +962,7 @@ def improve_prompt(
     new_version: str,
     parent_version: str | None = None,
     feedback: str | None = None,
+    source_only: bool = False,
 ) -> str:
     """Build the prompt for the improving agent, in create or improve mode.
 
@@ -955,11 +1002,17 @@ def improve_prompt(
     feedback
         Optional maintainer guidance, subordinated below the hard rules. ``None`` leaves the
         prompt byte-identical to a run without the flag.
+    source_only
+        The wiki ablation (``acumen fit --ablate-wiki``): create the first skill from the filtered
+        source alone, with no wiki and no transcripts. ``wiki_dir`` and ``transcripts_dir`` are
+        then unused. Only valid in create mode.
 
     Returns
     -------
     The improve or create prompt.
     """
+    if source_only and parent_version is not None:
+        raise ValueError("source_only creates the first skill; it cannot improve a parent version")
     common = {
         "package": package,
         "version": version,
@@ -974,6 +1027,8 @@ def improve_prompt(
         "craft": _SKILL_CRAFT,
         "feedback": feedback_block(feedback),
     }
+    if source_only:
+        return CREATE_SOURCE_ONLY_PROMPT.format(**common)
     if parent_version is None:
         return CREATE_PROMPT.format(**common)
     return IMPROVE_PROMPT.format(parent_version=parent_version, **common)

@@ -5,6 +5,8 @@ distilled, per-task ``observations.md``/``hypothesis.md`` notes that :mod:`acume
 train-split runs and accumulates across versions — plus the parent skill (in improve mode), the
 raw train transcripts (for drill-down), and the *filtered* package source. On the first epoch there
 is no parent skill: the wiki holds only the ``noskill`` baseline and the improver **creates** v1.
+The wiki ablation (``source_only``) creates v1 from the filtered source alone, with no wiki and no
+transcripts, to measure what the evidence adds.
 
 Two load-bearing isolations, both structural rather than by prompt:
 
@@ -56,6 +58,9 @@ from acumen.skills import (
 )
 from acumen.tasks import Task
 from acumen.wiki import WIKI_DIRNAME, collect_arm_runs
+
+#: ``meta.json``'s ``ablation`` marker for a v1 created from the source alone (``acumen fit --ablate-wiki``).
+ABLATION_NO_WIKI = "no-wiki"
 
 #: The subtree component that marks the held-out split. A path under ``runs/<arm>/valid/…`` is
 #: what the improver must never reach.
@@ -248,6 +253,7 @@ async def improve_skill(
     max_usd: float | None = None,
     feedback: str | None = None,
     log: LiveLog | None = None,
+    source_only: bool = False,
 ) -> ImproveResult:
     """Create or improve a skill from the knowledge wiki.
 
@@ -284,11 +290,17 @@ async def improve_skill(
         ``meta.json``. It cannot reach the held-out valid split.
     log
         A :class:`LiveLog` to stream the agent's messages to and render an HTML log from.
+    source_only
+        The wiki ablation: create v1 from the filtered source alone — no wiki, no transcripts, no
+        train runs needed — and mark it ``ablation: no-wiki`` in ``meta.json``. Only valid when no
+        version exists yet.
 
     Returns
     -------
     The created/improved skill, loaded and validated, with its parent and cost.
     """
+    if source_only and (parent_version is not None or latest_version(skills_root) is not None):
+        raise ImproveError("the wiki ablation creates the first skill — skills/ must hold no version yet")
     # Resolve parent: an explicit version, else the latest present, else None (create the first).
     resolved_parent = parent_version if parent_version is not None else latest_version(skills_root)
     parent = None if resolved_parent is None else load_skill(skills_root, resolved_parent, expect_name=cfg.skill_name)
@@ -300,8 +312,8 @@ async def improve_skill(
         raise ImproveError(f"{dest} already exists — skill versions are immutable and never overwritten")
 
     parent_arm = arm_name(parent_ver)
-    train_runs = collect_arm_runs(runs_root, parent_arm, tasks, split="train")
-    if not train_runs:
+    train_runs = [] if source_only else collect_arm_runs(runs_root, parent_arm, tasks, split="train")
+    if not train_runs and not source_only:
         hint = (
             "acumen bench --no-skill --split train"
             if parent_ver is None
@@ -332,8 +344,9 @@ async def improve_skill(
             _seed_staging(staging, parent)
         else:
             staging.mkdir(parents=True, exist_ok=True)
-        _stage_wiki(wiki_root, wiki_dir)
-        _stage_transcripts(runs_root, parent_arm, tasks, transcripts_dir)
+        if not source_only:
+            _stage_wiki(wiki_root, wiki_dir)
+            _stage_transcripts(runs_root, parent_arm, tasks, transcripts_dir)
         # The filtered source: a package's own shipped skill must not bias the optimization.
         source_copy = build_filtered_source(target.src_dir, holder / "source")
 
@@ -363,6 +376,7 @@ async def improve_skill(
             new_version=new_version,
             parent_version=parent_ver,
             feedback=feedback,
+            source_only=source_only,
         )
         options = AgentOptions(
             cwd=work,
@@ -420,7 +434,13 @@ async def improve_skill(
         rationale = _read_rationale(rationale_path, result, parent_ver, new_version)
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(staging, dest)
-        write_meta(dest, parent=parent_ver, rationale=rationale, feedback=feedback)
+        write_meta(
+            dest,
+            parent=parent_ver,
+            rationale=rationale,
+            feedback=feedback,
+            ablation=ABLATION_NO_WIKI if source_only else None,
+        )
         skill = load_skill(skills_root, new_version, expect_name=cfg.skill_name)
         return ImproveResult(
             skill=skill,

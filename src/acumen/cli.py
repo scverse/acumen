@@ -36,7 +36,7 @@ from acumen.config import AUTH_CHOICES, Config, ConfigError, load_config
 from acumen.env import DEFAULT_CACHE_ROOT, AuthMode, EnvError, prepare_target, resolve_auth_mode
 from acumen.epoch import EpochPlan, completed_epochs, resolve_epoch
 from acumen.grade import INVALID_REASONS
-from acumen.improve import ImproveError, improve_skill
+from acumen.improve import ABLATION_NO_WIKI, ImproveError, improve_skill
 from acumen.logs import LiveLog
 from acumen.paths import BENCH_SPLITS, SPLITS, Split, arm_name
 from acumen.pricefeed import (
@@ -50,12 +50,12 @@ from acumen.pricefeed import (
     try_fetch_table,
 )
 from acumen.prices import PriceTable, Rates
-from acumen.report import ReportError, build_report
+from acumen.report import ReportError, arm_label, build_report, load_results
 from acumen.review import ReviewError, ReviewResult, ReviewStatus, ReviewVerdict, review_tasks
 from acumen.runner import RunOutcome, StderrFilter
 from acumen.scaffold import InitError, is_scaffold_tasks, scaffold
 from acumen.ship import ShipError, ship_skill
-from acumen.skills import Skill, SkillError, available_versions, latest_version, load_skill, skill_dir
+from acumen.skills import Skill, SkillError, available_versions, latest_version, load_skill, read_meta, skill_dir
 from acumen.taskgen import TaskGenError, generate_tasks
 from acumen.tasks import Task, TaskError, load_tasks
 from acumen.training import (
@@ -1093,6 +1093,64 @@ def _valid_complete_fn(cfg: Config, tasks: list[Task], runs_root: Path) -> Calla
     return valid_complete
 
 
+def _infer_skill(
+    args: argparse.Namespace,
+    *,
+    cfg: Config,
+    tasks: list[Task],
+    target,
+    prices: PriceTable,
+    meta_auth: AuthMode,
+    new_version: str,
+    parent_version: str | None,
+    banner: str,
+    mode: str,
+    source_only: bool = False,
+):
+    """Run the improver once — create or improve ``new_version`` — with its log and progress line.
+
+    Shared by a training epoch and the wiki ablation, so both log and report the meta-agent the
+    same way. Returns the :class:`ImproveResult`.
+    """
+    log = LiveLog.open(args.log_dir, "improve", stream=args.stream)
+    if mode == "verbose":
+        print(banner, flush=True)
+        print(f"log → {log.jsonl_path}", flush=True)
+    spinner = nullcontext() if mode == "verbose" else _Spinner(f"inferring skill → {new_version}", mode)
+    improve_started = time.monotonic()
+    with log, spinner:
+        result = asyncio.run(
+            improve_skill(
+                cfg=cfg,
+                prices=prices,
+                target=target,
+                skills_root=args.skills,
+                runs_root=args.runs,
+                wiki_root=args.wiki,
+                tasks=tasks,
+                auth_mode=meta_auth,
+                parent_version=parent_version,
+                feedback=args.feedback,
+                log=log,
+                source_only=source_only,
+            )
+        )
+    improve_elapsed = _fmt_secs(time.monotonic() - improve_started)
+    new = result.skill
+    if mode == "verbose":
+        print(f"wrote {new.directory}  (parent {result.parent or 'noskill'})")
+        print(f"  description: {new.description}")
+        print(f"  cost:        {_fmt_cost(result.cost_usd)} over {result.turns} turns in {improve_elapsed}")
+        _print_log_result(log)
+    else:
+        print(
+            f"  inferring skill → {new.version} done  "
+            f"({improve_elapsed}, {_fmt_cost(result.cost_usd)}, {result.turns} turns)",
+            flush=True,
+        )
+    return result
+
+
 def _run_one_epoch(
     args: argparse.Namespace,
     *,
@@ -1188,41 +1246,18 @@ def _run_one_epoch(
         print(f"\n[3/4] {resumed_msg}" if mode == "verbose" else f"  {resumed_msg}", flush=True)
     else:
         verb = "creating" if plan.first else "improving"
-        log = LiveLog.open(args.log_dir, "improve", stream=args.stream)
-        if mode == "verbose":
-            print(f"\n[3/4] {verb} the skill → {plan.new_version} with {cfg.meta_model} ...", flush=True)
-            print(f"log → {log.jsonl_path}", flush=True)
-        spinner = nullcontext() if mode == "verbose" else _Spinner(f"inferring skill → {plan.new_version}", mode)
-        improve_started = time.monotonic()
-        with log, spinner:
-            result = asyncio.run(
-                improve_skill(
-                    cfg=cfg,
-                    prices=prices,
-                    target=target,
-                    skills_root=args.skills,
-                    runs_root=runs_root,
-                    wiki_root=args.wiki,
-                    tasks=tasks,
-                    auth_mode=meta_auth,
-                    parent_version=plan.parent_version,
-                    feedback=args.feedback,
-                    log=log,
-                )
-            )
-        improve_elapsed = _fmt_secs(time.monotonic() - improve_started)
-        new = result.skill
-        if mode == "verbose":
-            print(f"wrote {new.directory}  (parent {result.parent or 'noskill'})")
-            print(f"  description: {new.description}")
-            print(f"  cost:        {_fmt_cost(result.cost_usd)} over {result.turns} turns in {improve_elapsed}")
-            _print_log_result(log)
-        else:
-            print(
-                f"  inferring skill → {new.version} done  "
-                f"({improve_elapsed}, {_fmt_cost(result.cost_usd)}, {result.turns} turns)",
-                flush=True,
-            )
+        _infer_skill(
+            args,
+            cfg=cfg,
+            tasks=tasks,
+            target=target,
+            prices=prices,
+            meta_auth=meta_auth,
+            new_version=plan.new_version,
+            parent_version=plan.parent_version,
+            banner=f"\n[3/4] {verb} the skill → {plan.new_version} with {cfg.meta_model} ...",
+            mode=mode,
+        )
 
     # Step 4 — bench the new version on the held-out valid signal (completes it if unfinished).
     bench_phase(
@@ -1233,7 +1268,169 @@ def _run_one_epoch(
     return plan
 
 
+def _ablation_root_state(skills_root: Path) -> str:
+    """Whether a root is empty, a wiki-ablation run, or a normal fit — read from ``v1``'s meta.
+
+    An ablation root holds one source-only ``v1`` and must never be continued by a training epoch
+    (and vice versa), or one root would mix the two arms the ablation compares.
+    """
+    first = skill_dir(skills_root, "v1")
+    if not first.is_dir():
+        return "empty"
+    meta = read_meta(first)
+    return "ablation" if meta is not None and meta.ablation == ABLATION_NO_WIKI else "fit"
+
+
+def _refuse_ablation_root(skills_root: Path) -> bool:
+    """Print why a training epoch cannot run in a wiki-ablation root; ``True`` when it cannot."""
+    if _ablation_root_state(skills_root) != "ablation":
+        return False
+    print(
+        f"error: {skill_dir(skills_root, 'v1')} was written by `acumen fit --ablate-wiki` — this root "
+        "is a wiki-ablation run and cannot be continued by training epochs. Use a fresh root.",
+        file=sys.stderr,
+    )
+    return True
+
+
+def _run_ablation(
+    args: argparse.Namespace,
+    *,
+    cfg: Config,
+    tasks: list[Task],
+    target,
+    prices: PriceTable,
+    auth_modes: dict[AgentProvider, AuthMode],
+    meta_auth: AuthMode,
+    mode: str,
+) -> None:
+    """The wiki ablation: write v1 from the source alone and bench it and noskill on valid.
+
+    No train benches, no wiki and no test: at epoch 1 nothing has been selected on valid yet, so
+    valid is an unbiased comparison for a source-only v1 and a wiki-grounded one (from a normal
+    fit in another root). Every step resumes, so re-running a finished root does nothing.
+    """
+
+    def bench_valid(skill: str | None, *, label: str, verbose_banner: str) -> None:
+        if mode == "verbose":
+            print(verbose_banner, flush=True)
+        bench_arms = _build_arms(
+            [(skill, ["valid"])], cfg=cfg, tasks=tasks, runs_root=args.runs, skills_root=args.skills
+        )
+        if mode == "verbose":
+            _print_plan(bench_arms)
+        bar = None if mode == "verbose" else _PhaseBar(label, sum(len(a.todo) for a in bench_arms), mode)
+        _execute_arms(
+            bench_arms,
+            cfg=cfg,
+            target=target,
+            runs_root=args.runs,
+            auth_modes=auth_modes,
+            prices=prices,
+            keep_sandboxes=False,
+            progress=bar,
+            quiet=mode != "verbose",
+        )
+        if bar is not None:
+            bar.finish()
+
+    noskill = arm_name(None)
+    bench_valid(
+        None, label="bench baseline", verbose_banner=f"\n[1/3] benchmarking [{noskill}] on the valid signal ..."
+    )
+    if skill_dir(args.skills, "v1").exists():
+        resumed_msg = "v1 already exists — skipping the source-only draft (resumed ablation)"
+        print(f"\n[2/3] {resumed_msg}" if mode == "verbose" else f"  {resumed_msg}", flush=True)
+    else:
+        _infer_skill(
+            args,
+            cfg=cfg,
+            tasks=tasks,
+            target=target,
+            prices=prices,
+            meta_auth=meta_auth,
+            new_version="v1",
+            parent_version=None,
+            banner=f"\n[2/3] creating v1 from the package source alone with {cfg.meta_model} ...",
+            mode=mode,
+            source_only=True,
+        )
+    bench_valid("v1", label="bench valid", verbose_banner="\n[3/3] benchmarking v1 on the valid signal ...")
+
+
+def _cmd_ablate_wiki(args: argparse.Namespace, cfg: Config, tasks: list[Task]) -> int:
+    """``acumen fit --ablate-wiki``: one source-only v1 against noskill on valid, then stop."""
+    if _ablation_root_state(args.skills) == "fit":
+        print(
+            f"error: {args.skills} already holds a normal fit — the wiki ablation needs a fresh root "
+            "(one root = one ablation run).",
+            file=sys.stderr,
+        )
+        return 2
+    ignored = [
+        flag
+        for flag, value, default in (
+            ("--epochs", args.epochs, None),
+            ("--max-epochs", args.max_epochs, 10),
+            ("--patience", args.patience, 2),
+            ("--min-delta", args.min_delta, 0.05),
+        )
+        if value != default
+    ]
+    if ignored:
+        print(f"note: {', '.join(ignored)} ignored — --ablate-wiki runs a single source-only epoch")
+
+    try:
+        auth_modes, meta_auth, prices, target = _prepare_pass(cfg, args)
+    except PriceFeedError as err:
+        print(f"error: {err}", file=sys.stderr)
+        print("Retry when the pricing pages are reachable, or pin rates in config.yaml.", file=sys.stderr)
+        return 2
+
+    print("fit --ablate-wiki: v1 from the package source alone (no train benches, no wiki), valid only")
+    try:
+        _run_ablation(
+            args,
+            cfg=cfg,
+            tasks=tasks,
+            target=target,
+            prices=prices,
+            auth_modes=auth_modes,
+            meta_auth=meta_auth,
+            mode=_progress_mode(args),
+        )
+    except BenchmarkInvalidError as err:
+        print(f"\nerror: {err}", file=sys.stderr)
+        _invalid_bench_note()
+        return 2
+
+    write_training_csv(build_training_rows(args.runs, cfg), args.out)
+    valid = load_results(args.runs, skip_invalid=True)
+    valid = valid[valid["split"] == "valid"]
+    print("\nablation complete (valid):")
+    for arm in (arm_name(None), arm_name("v1")):
+        runs = valid[valid["arm"] == arm]
+        success = float(runs["success"].mean()) if len(runs) else None
+        cost = runs["cost_usd"].dropna()
+        print(
+            f"  {arm_label(arm):<8} success {_fmt_rate(success)}  "
+            f"cost/run {_fmt_cost(float(cost.mean()) if len(cost) else None)}  ({len(runs)} runs)"
+        )
+    print(f"training curve → {args.out.resolve()}")
+
+    # Same as fit: the report is a summary of what ran, so a failure must not fail the ablation.
+    report_out = Path("report.html")
+    try:
+        build_report(args.runs, report_out, tasks, skills_root=args.skills)
+        print(f"report → {report_out.resolve()}")
+    except ReportError as err:
+        print(f"note: report skipped — {err}", file=sys.stderr)
+    return 0
+
+
 def _cmd_epoch(args: argparse.Namespace) -> int:
+    if _refuse_ablation_root(args.skills):
+        return 2
     cfg = load_config(args.config)
     tasks = load_tasks(args.tasks)
     if args.max_concurrency:
@@ -1293,6 +1490,10 @@ def _cmd_fit(args: argparse.Namespace) -> int:
         cfg = replace(cfg, n_replicates=args.replicates)
     if args.model:
         cfg = replace(cfg, meta_model=args.model)
+    if args.ablate_wiki:
+        return _cmd_ablate_wiki(args, cfg, tasks)
+    if _refuse_ablation_root(args.skills):
+        return 2
 
     fixed = args.epochs is not None
     # A GLOBAL target across invocations, not a per-run count: --epochs/--max-epochs is the total
@@ -2111,6 +2312,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="run exactly this many epochs (disables early stopping and ignores --max-epochs)",
+    )
+    fit.add_argument(
+        "--ablate-wiki",
+        action="store_true",
+        help="ablation: write v1 from the package source alone (no train benches, no wiki) and bench "
+        "it and noskill on valid only, then stop; one root = one ablation run",
     )
     fit.add_argument("--model", help="override config meta_model")
     fit.add_argument("--max-concurrency", type=int, help="override config max_concurrency")
