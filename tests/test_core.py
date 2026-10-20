@@ -3014,8 +3014,8 @@ def test_write_meta_records_an_ablation_but_omits_it_for_a_normal_fit(tmp_path: 
     assert "ablation" not in (directory / "meta.json").read_text()
     assert read_meta(directory).ablation is None
 
-    write_meta(directory, parent=None, rationale="created v1", ablation="no-wiki")
-    assert read_meta(directory).ablation == "no-wiki"
+    write_meta(directory, parent=None, rationale="created v1", ablation="no-optimize")
+    assert read_meta(directory).ablation == "no-optimize"
 
 
 # --- improve evidence ------------------------------------------------------------------
@@ -3264,10 +3264,10 @@ def _create_prompt(**overrides) -> str:
     return improve_prompt(**(kwargs | overrides))
 
 
-def test_improve_prompt_source_only_drops_the_evidence_and_nothing_else() -> None:
-    """The wiki ablation must differ from create mode only in what the agent reads."""
+def test_improve_prompt_no_optimize_drops_the_evidence_and_nothing_else() -> None:
+    """The no-optimize ablation must differ from create mode only in what the agent reads."""
     create = _create_prompt()
-    source_only = _create_prompt(source_only=True)
+    source_only = _create_prompt(ablation="no-optimize")
 
     assert "/wiki" not in source_only and "/tr" not in source_only
     assert "wiki" not in source_only.lower() and "transcript" not in source_only.lower()
@@ -3277,9 +3277,24 @@ def test_improve_prompt_source_only_drops_the_evidence_and_nothing_else() -> Non
     assert _SKILL_CRAFT in create and _SKILL_CRAFT in source_only
 
 
-def test_improve_prompt_source_only_refuses_a_parent() -> None:
+def test_improve_prompt_no_optimize_refuses_a_parent() -> None:
     with pytest.raises(ValueError, match="first skill"):
-        _create_prompt(source_only=True, parent_version="v1")
+        _create_prompt(ablation="no-optimize", parent_version="v1")
+
+
+@pytest.mark.parametrize("parent", [None, "v1"])
+def test_improve_prompt_no_wiki_withholds_every_wiki_artifact(parent: str | None) -> None:
+    """No-wiki keeps the craft and the loaded/body rule but names no wiki artifact at all."""
+    no_wiki = _create_prompt(parent_version=parent, ablation="no-wiki")
+
+    for absent in ("wiki", "discriminators", "REGRESSIONS", "[gap:", "hypothesis", "observations"):
+        assert absent not in no_wiki, absent
+    assert "/tr" in no_wiki and "INDEX.md" in no_wiki
+    assert _SKILL_CRAFT in no_wiki
+    for shared in ("`p`", "/s", "/py", "BLOCKED", "When you are done"):
+        assert shared in no_wiki
+    if parent is not None:
+        assert "The skill never loaded" in no_wiki and "EDIT THESE FILES IN PLACE" in no_wiki
 
 
 def test_wiki_prompt_demands_brevity_and_the_entry_format() -> None:
@@ -5701,10 +5716,10 @@ def test_write_training_csv_roundtrips_header_and_per_model_columns(tmp_path: Pa
     assert lines[1].startswith("1,v1,noskill,")
 
 
-# --- wiki ablation ---------------------------------------------------------------------
+# --- fit ablations ----------------------------------------------------------------------
 
 
-def test_improve_skill_source_only_creates_v1_without_train_runs_or_wiki(
+def test_improve_skill_no_optimize_creates_v1_without_train_runs_or_wiki(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The ablation needs no evidence: no train runs, nothing staged but the filtered source."""
@@ -5729,7 +5744,7 @@ def test_improve_skill_source_only_creates_v1_without_train_runs_or_wiki(
         "wiki_root": tmp_path / "wiki",
         "tasks": [_task("bulk")],
         "prices": _REVIEW_PRICES,
-        "source_only": True,
+        "ablation": "no-optimize",
     }
 
     result = asyncio.run(improve_skill(**common))
@@ -5737,7 +5752,56 @@ def test_improve_skill_source_only_creates_v1_without_train_runs_or_wiki(
     assert result.skill.version == "v1" and result.parent is None
     assert seen["staged"] == ["v1"], "only the staging dir — no wiki, no transcripts"
     assert "wiki" not in str(seen["prompt"]).lower()
-    assert read_meta(skills / "v1").ablation == "no-wiki"
+    assert read_meta(skills / "v1").ablation == "no-optimize"
     # One root = one ablation: a second source-only v1 is refused rather than written as v2.
     with pytest.raises(ImproveError, match="no version yet"):
         asyncio.run(improve_skill(**common))
+
+
+def test_improve_skill_no_wiki_edits_the_parent_from_raw_runs_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_result
+) -> None:
+    """No-wiki improves the parent in place from its train runs + INDEX.md, never the wiki."""
+    seen: dict[str, object] = {}
+
+    async def fake_run_agent(prompt, *, options, on_event=None):
+        seen["prompt"] = prompt
+        seen["staged"] = sorted(path.name for path in options.cwd.iterdir())
+        seen["parent_body"] = (options.cwd / "v2" / "SKILL.md").read_text()
+        seen["index"] = (options.cwd / "transcripts" / "bulk" / "INDEX.md").read_text()
+        seen["deny"] = options.deny_paths
+        (options.cwd / "rationale.md").write_text("from the runs")
+        return _agent_result()
+
+    monkeypatch.setattr("acumen.improve.run_agent", fake_run_agent)
+    monkeypatch.setattr("acumen.improve.build_agent_env", lambda **_kwargs: {})
+    skills = tmp_path / "skills"
+    (skills / "v1").mkdir(parents=True)
+    (skills / "v1" / "SKILL.md").write_text("---\nname: target-demo\ndescription: d\n---\nparent body\n")
+    write_meta(skills / "v1", parent=None, rationale="v1", ablation="no-wiki")
+    runs = tmp_path / "runs"
+    make_result(runs, RunKey(arm="skill_v1", split="train", model="m", task_id="bulk", rep=1), success=False)
+    wiki = tmp_path / "wiki" / "bulk"
+    wiki.mkdir(parents=True)
+    (wiki / "observations.md").write_text("- [v1][m]: must never reach the no-wiki improver\n")
+
+    result = asyncio.run(
+        improve_skill(
+            cfg=parse_config({"repo": "/tmp/target-demo", "meta_model": "claude-opus-5"}),
+            target=_review_target(tmp_path),
+            skills_root=skills,
+            runs_root=runs,
+            wiki_root=tmp_path / "wiki",
+            tasks=[_task("bulk")],
+            prices=_REVIEW_PRICES,
+            ablation="no-wiki",
+        )
+    )
+
+    assert result.skill.version == "v2" and result.parent == "v1"
+    assert seen["staged"] == ["transcripts", "v2"], "no wiki/ staged"
+    assert "parent body" in seen["parent_body"], "the parent skill is pre-filled to edit"
+    assert "**FAIL**" in seen["index"], "outcome labels reach the improver"
+    assert "knowledge wiki" not in str(seen["prompt"]).lower()
+    assert (tmp_path / "wiki").resolve() in seen["deny"]
+    assert read_meta(skills / "v2").ablation == "no-wiki"

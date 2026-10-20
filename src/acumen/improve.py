@@ -5,8 +5,9 @@ distilled, per-task ``observations.md``/``hypothesis.md`` notes that :mod:`acume
 train-split runs and accumulates across versions — plus the parent skill (in improve mode), the
 raw train transcripts (for drill-down), and the *filtered* package source. On the first epoch there
 is no parent skill: the wiki holds only the ``noskill`` baseline and the improver **creates** v1.
-The wiki ablation (``source_only``) creates v1 from the filtered source alone, with no wiki and no
-transcripts, to measure what the evidence adds.
+Two ablations (``acumen fit --ablation``) remove parts of that: ``no-optimize`` creates v1 once from
+the filtered source alone, with no evidence at all; ``no-wiki`` creates and improves without the
+wiki, reading the parent's raw train runs (each task with an ``INDEX.md`` of outcomes) instead.
 
 Two load-bearing isolations, both structural rather than by prompt:
 
@@ -57,10 +58,11 @@ from acumen.skills import (
     write_meta,
 )
 from acumen.tasks import Task
-from acumen.wiki import WIKI_DIRNAME, collect_arm_runs
+from acumen.wiki import WIKI_DIRNAME, collect_arm_runs, stage_task_evidence
 
-#: ``meta.json``'s ``ablation`` marker for a v1 created from the source alone (``acumen fit --ablate-wiki``).
-ABLATION_NO_WIKI = "no-wiki"
+#: The ablation arms of ``acumen fit --ablation``, also recorded as ``meta.json``'s ``ablation``:
+#: ``no-optimize`` writes v1 once from the source alone; ``no-wiki`` fits with the wiki withheld.
+ABLATIONS = ("no-optimize", "no-wiki")
 
 #: The subtree component that marks the held-out split. A path under ``runs/<arm>/valid/…`` is
 #: what the improver must never reach.
@@ -133,6 +135,23 @@ def _stage_transcripts(runs_root: Path, arm: str, tasks: list[Task], dest: Path)
             if src.is_file():
                 shutil.copyfile(src, run_out / name)
     return len(runs)
+
+
+def _stage_task_runs(runs: list, version: str, dest: Path) -> None:
+    """Stage the parent's train runs per task with their outcome ``INDEX.md`` — the no-wiki evidence.
+
+    The same digest a wiki agent reads (:func:`acumen.wiki.stage_task_evidence`), laid out as
+    ``dest/<task>/INDEX.md`` + ``dest/<task>/<model>__rep_<n>/``. It is raw run data, not
+    distillation, and without it the improver could not tell which transcripts failed.
+    """
+    by_task: dict[str, list] = {}
+    for run in runs:
+        by_task.setdefault(run.task_id, []).append(run)
+    dest.mkdir(parents=True, exist_ok=True)
+    for task_id, task_runs in by_task.items():
+        evidence = stage_task_evidence(dest / f".{task_id}", task_runs, version=version)
+        evidence.rename(dest / task_id)
+        evidence.parent.rmdir()
 
 
 def _validate_staged(staging: Path, skill_name: str) -> None:
@@ -253,7 +272,7 @@ async def improve_skill(
     max_usd: float | None = None,
     feedback: str | None = None,
     log: LiveLog | None = None,
-    source_only: bool = False,
+    ablation: str | None = None,
 ) -> ImproveResult:
     """Create or improve a skill from the knowledge wiki.
 
@@ -290,17 +309,22 @@ async def improve_skill(
         ``meta.json``. It cannot reach the held-out valid split.
     log
         A :class:`LiveLog` to stream the agent's messages to and render an HTML log from.
-    source_only
-        The wiki ablation: create v1 from the filtered source alone — no wiki, no transcripts, no
-        train runs needed — and mark it ``ablation: no-wiki`` in ``meta.json``. Only valid when no
-        version exists yet.
+    ablation
+        One of :data:`ABLATIONS`, recorded in ``meta.json``, or ``None`` for a normal fit.
+        ``"no-optimize"`` creates v1 from the filtered source alone — no wiki, no transcripts, no
+        train runs needed — and is only valid when no version exists yet. ``"no-wiki"`` withholds
+        the wiki: the agent gets the parent skill (when there is one), its train runs with their
+        per-task ``INDEX.md``, and the filtered source.
 
     Returns
     -------
     The created/improved skill, loaded and validated, with its parent and cost.
     """
+    if ablation is not None and ablation not in ABLATIONS:
+        raise ImproveError(f"unknown ablation {ablation!r} — expected one of {', '.join(ABLATIONS)}")
+    source_only = ablation == "no-optimize"
     if source_only and (parent_version is not None or latest_version(skills_root) is not None):
-        raise ImproveError("the wiki ablation creates the first skill — skills/ must hold no version yet")
+        raise ImproveError("the no-optimize ablation creates the first skill — skills/ must hold no version yet")
     # Resolve parent: an explicit version, else the latest present, else None (create the first).
     resolved_parent = parent_version if parent_version is not None else latest_version(skills_root)
     parent = None if resolved_parent is None else load_skill(skills_root, resolved_parent, expect_name=cfg.skill_name)
@@ -344,7 +368,9 @@ async def improve_skill(
             _seed_staging(staging, parent)
         else:
             staging.mkdir(parents=True, exist_ok=True)
-        if not source_only:
+        if ablation == "no-wiki":
+            _stage_task_runs(train_runs, parent_ver or arm_name(None), transcripts_dir)
+        elif not source_only:
             _stage_wiki(wiki_root, wiki_dir)
             _stage_transcripts(runs_root, parent_arm, tasks, transcripts_dir)
         # The filtered source: a package's own shipped skill must not bias the optimization.
@@ -376,7 +402,7 @@ async def improve_skill(
             new_version=new_version,
             parent_version=parent_ver,
             feedback=feedback,
-            source_only=source_only,
+            ablation=ablation,
         )
         options = AgentOptions(
             cwd=work,
@@ -399,8 +425,11 @@ async def improve_skill(
                 else None
             ),
             # Codex gets only the staged evidence and filtered source; deny the run tree and the
-            # original checkout wholesale.
-            deny_paths=(runs_root.resolve(), target.src_dir.resolve()),
+            # original checkout wholesale — and, for an ablation, any wiki/ that sits in the root.
+            deny_paths=(
+                (runs_root.resolve(), target.src_dir.resolve())
+                + ((wiki_root.resolve(),) if ablation is not None else ())
+            ),
         )
 
         result: AgentResult | None = None
@@ -439,7 +468,7 @@ async def improve_skill(
             parent=parent_ver,
             rationale=rationale,
             feedback=feedback,
-            ablation=ABLATION_NO_WIKI if source_only else None,
+            ablation=ablation,
         )
         skill = load_skill(skills_root, new_version, expect_name=cfg.skill_name)
         return ImproveResult(

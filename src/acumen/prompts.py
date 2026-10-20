@@ -281,9 +281,9 @@ When you are done, `{skill_dir}/SKILL.md` exists and starts with the frontmatter
 """
 
 
-# The wiki ablation (``acumen fit --ablate-wiki``): CREATE_PROMPT with the evidence taken out — no
-# wiki, no transcripts — so the only difference between the two first skills is what they learned
-# from. Keep the rest in lockstep with CREATE_PROMPT, or the ablation measures the prompt instead.
+# The no-optimize ablation (``acumen fit --ablation no-optimize``): CREATE_PROMPT with the evidence
+# taken out — no wiki, no transcripts — so the skill is written once from the source, never fitted.
+# Keep the rest in lockstep with CREATE_PROMPT, or the ablation measures the prompt instead.
 CREATE_SOURCE_ONLY_PROMPT = """\
 You are writing the FIRST agent skill (version {new_version}) for the Python package `{package}`
 (version {version}).
@@ -319,6 +319,122 @@ description: <one sentence: what this skill covers and when to use it>
 
 3. `{rationale_path}` — one short paragraph on what the skill covers and why, grounded in the
    package source. Write it OUTSIDE `{skill_dir}`.
+
+{craft}
+{feedback}
+When you are done, `{skill_dir}/SKILL.md` exists and starts with the frontmatter above, and
+`{rationale_path}` contains your rationale.
+"""
+
+
+# The no-wiki ablation (``acumen fit --ablation no-wiki``): IMPROVE_PROMPT and CREATE_PROMPT with the
+# wiki taken out — no observations, hypotheses, gap tags, discriminators or regressions. The improver
+# reads the raw train runs instead, each task with the same INDEX.md of outcomes the wiki agents get.
+# Text is only deleted or re-pointed at INDEX.md; keep the rest in lockstep with the wiki prompts.
+IMPROVE_NO_WIKI_PROMPT = """\
+You are improving an agent skill for the Python package `{package}` (version {version}).
+
+A skill is documentation written for an agent, not a human. Its only purpose is to make an
+agent that has never used `{package}` succeed at real tasks with it on the first try.
+
+You are producing version {new_version} — an improvement of version {parent_version}.
+
+# What you can read
+
+- `{skill_dir}` — the current skill ({parent_version}). This directory has been pre-filled with a
+  copy of it. EDIT THESE FILES IN PLACE; what they contain when you finish becomes {new_version}.
+- `{transcripts_dir}` — the TRAIN-split runs of the current skill: one directory per task. Each
+  holds an `INDEX.md` listing every run (pass or fail and why, whether the skill LOADED, the model,
+  the expected answer, and the answer given) and one directory per run with its `transcript.html`,
+  `script.py` and `answer.md`. READ THE INDEX FILES FIRST, then open transcripts where you need to
+  see what an agent actually did.
+- `{src}` — the package source (filtered: any skill or agent-guidance files a package ships have
+  been stripped and are BLOCKED — write from the API, not from someone else's skill). `{package}`
+  is installed; run `{python}` to verify a claim before writing it. Do not install packages.
+- You have web access if the published docs help.
+
+# What you are NOT allowed to see
+
+You are optimising against the TRAIN split. A separate, held-out VALID split measures whether your
+changes generalise rather than memorise these tasks. Any tool call that reaches valid results is
+BLOCKED. Do not attempt it — reaching valid data would invalidate the whole benchmark.
+
+# Two different failures, two different fixes
+
+Each `INDEX.md` records whether the agent LOADED the skill and whether it SUCCEEDED. Separate them
+before changing anything — they look identical in a list of failures and have opposite fixes.
+
+1. **The skill never loaded.** The agent never read the body, so nothing in the body caused this
+   and nothing you write in the body can fix it. The only lever is the `description`.
+2. **The skill loaded and the run still failed.** Now the body is on trial. Fix it, using the
+   cause a transcript actually shows — not one you imagine.
+3. **The skill loaded and the run passed.** Evidence the body works. Do not rewrite it for style.
+
+A skill that is never loaded scores exactly like no skill at all. If the runs show load rates low
+across the board, that is the biggest available win — and the only lever is the `description`. If
+one model loads reliably and another almost never does, that gap is mostly the model's behaviour;
+do not contort the sentence chasing it.
+
+{craft}
+
+# What you must write
+
+1. Edit the skill in place under `{skill_dir}`. When you finish, `{skill_dir}/SKILL.md` must still
+   begin with YAML frontmatter whose `name` is exactly `{skill_name}`.
+2. `{rationale_path}` — one short paragraph stating WHAT you changed and WHY, grounded in the runs.
+   Write it OUTSIDE the skill directory; do not put it inside `{skill_dir}`.
+{feedback}
+When you are done, `{skill_dir}/SKILL.md` exists and starts with the frontmatter above, and
+`{rationale_path}` contains your rationale.
+"""
+
+
+CREATE_NO_WIKI_PROMPT = """\
+You are writing the FIRST agent skill (version {new_version}) for the Python package `{package}`
+(version {version}).
+
+A skill is documentation written for an agent, not a human. Its only purpose is to make an agent
+that has never used `{package}` succeed at real tasks with it on the first try. It is not a
+tutorial, not a README, not a sales pitch. The agent arrives with a goal in plain English; the
+skill routes it to the right entry point and sequence of steps.
+
+# What you can read
+
+- `{transcripts_dir}` — the TRAIN-split runs of agents WITHOUT any skill (the `noskill` baseline):
+  one directory per task. Each holds an `INDEX.md` listing every run (pass or fail and why, the
+  model, the expected answer, and the answer given) and one directory per run with its
+  `transcript.html`, `script.py` and `answer.md`. READ THE INDEX FILES FIRST: they tell you where
+  an unaided agent goes wrong, which is precisely what your skill must fix. Open transcripts where
+  you need to see what an agent actually did.
+- `{src}` — the package source (filtered: any skill or agent-guidance files a package ships have
+  been stripped and are BLOCKED — write from the API, the source, and the user-facing docs, not
+  from someone else's skill). `{package}` is installed; run `{python}` to verify claims. Do not
+  install packages.
+- You have web access if the published docs help.
+
+# What you are NOT allowed to see
+
+The runs are from the TRAIN split only. A held-out VALID split measures whether your skill
+generalises. Any tool call that reaches valid results is BLOCKED — do not attempt it.
+
+# What you must write
+
+Your staging directory is `{skill_dir}`. Write:
+
+1. `{skill_dir}/SKILL.md` — required. It must begin with YAML frontmatter, exactly:
+
+---
+name: {skill_name}
+description: <one sentence: what this skill covers and when to use it>
+---
+
+   The `name` must be exactly `{skill_name}`. The `description` is load-bearing and must be HONEST —
+   it is the only thing an agent sees before deciding whether to open the skill.
+
+2. `{skill_dir}/references/*.md` — optional, for detail only some tasks need.
+
+3. `{rationale_path}` — one short paragraph on what the skill covers and why, grounded in the
+   baseline runs. Write it OUTSIDE `{skill_dir}`.
 
 {craft}
 {feedback}
@@ -962,7 +1078,7 @@ def improve_prompt(
     new_version: str,
     parent_version: str | None = None,
     feedback: str | None = None,
-    source_only: bool = False,
+    ablation: str | None = None,
 ) -> str:
     """Build the prompt for the improving agent, in create or improve mode.
 
@@ -1002,17 +1118,19 @@ def improve_prompt(
     feedback
         Optional maintainer guidance, subordinated below the hard rules. ``None`` leaves the
         prompt byte-identical to a run without the flag.
-    source_only
-        The wiki ablation (``acumen fit --ablate-wiki``): create the first skill from the filtered
-        source alone, with no wiki and no transcripts. ``wiki_dir`` and ``transcripts_dir`` are
-        then unused. Only valid in create mode.
+    ablation
+        An ablation arm of ``acumen fit --ablation``, or ``None`` for a normal fit.
+        ``"no-optimize"`` creates the first skill from the filtered source alone — no wiki, no
+        transcripts; only valid in create mode. ``"no-wiki"`` creates or improves without the
+        wiki: the agent reads ``transcripts_dir`` (per-task ``INDEX.md`` + runs) instead.
+        ``wiki_dir`` is unused in both.
 
     Returns
     -------
     The improve or create prompt.
     """
-    if source_only and parent_version is not None:
-        raise ValueError("source_only creates the first skill; it cannot improve a parent version")
+    if ablation == "no-optimize" and parent_version is not None:
+        raise ValueError("no-optimize creates the first skill; it cannot improve a parent version")
     common = {
         "package": package,
         "version": version,
@@ -1027,8 +1145,14 @@ def improve_prompt(
         "craft": _SKILL_CRAFT,
         "feedback": feedback_block(feedback),
     }
-    if source_only:
+    if ablation == "no-optimize":
         return CREATE_SOURCE_ONLY_PROMPT.format(**common)
+    if ablation == "no-wiki":
+        if parent_version is None:
+            return CREATE_NO_WIKI_PROMPT.format(**common)
+        return IMPROVE_NO_WIKI_PROMPT.format(parent_version=parent_version, **common)
+    if ablation is not None:
+        raise ValueError(f"unknown ablation {ablation!r}")
     if parent_version is None:
         return CREATE_PROMPT.format(**common)
     return IMPROVE_PROMPT.format(parent_version=parent_version, **common)
