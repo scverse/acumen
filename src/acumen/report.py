@@ -9,8 +9,9 @@ The report is regenerated (overwritten) at each skill version — it always refl
 run currently on disk across every arm.
 
 The visualisations show **valid-split** performance — the held-out measure of whether a
-skill helps. The full per-run table below them still lists both splits, so train runs
-remain inspectable.
+skill helps — or test-split performance when no valid split was benched (the no-optimize
+ablation, see :func:`reported_split`). The full per-run table below them still lists every
+split, so train runs remain inspectable.
 """
 
 from __future__ import annotations
@@ -99,7 +100,7 @@ _ALL_MODELS_COLOR = "#9b968d"
 
 # Train vs valid is a *texture*, not a colour — so it never competes with the model hue.
 _SPLIT_ORDER = ("train", "valid")
-_SPLIT_HATCH = {"train": "////", "valid": ""}
+_SPLIT_HATCH = {"train": "////", "valid": "", "test": ""}
 # The line-chart analogue of the hatch above: on the training curve train and valid are told
 # apart by dash, leaving colour free to carry the model.
 _SPLIT_STYLE = {"train": "--", "valid": "-"}
@@ -129,6 +130,16 @@ _RC = {
 #: The split every figure reports on. Train runs feed the improver; the report measures
 #: held-out (valid) performance.
 _REPORTED_SPLIT = "valid"
+
+
+def reported_split(df: pd.DataFrame) -> str:
+    """The split the report's figures and tests are drawn on.
+
+    A fit benches valid, so that is the reported split whenever valid runs exist. The no-optimize
+    ablation benches test alone (there is nothing to select or stop on), so a tree with no valid
+    runs reports test instead.
+    """
+    return _REPORTED_SPLIT if (df["split"] == _REPORTED_SPLIT).any() else "test"
 
 
 #: Brand assets bundled with the package (see ``src/acumen/assets``). Inlined as ``data:``
@@ -331,9 +342,9 @@ def first_best(pairs: Iterable[tuple[str, float | None]]) -> str | None:
     return best
 
 
-def best_skill_arm(df: pd.DataFrame) -> str | None:
-    """The skill arm with the highest mean success on the reported (valid) split, or ``None``."""
-    reported = df[(df["split"] == _REPORTED_SPLIT) & (df["arm"] != NOSKILL_ARM)]
+def best_skill_arm(df: pd.DataFrame, *, split: str = _REPORTED_SPLIT) -> str | None:
+    """The skill arm with the highest mean success on ``split`` (the reported one), or ``None``."""
+    reported = df[(df["split"] == split) & (df["arm"] != NOSKILL_ARM)]
     means = reported.groupby("arm")["success"].mean()
     return first_best((arm, float(means[arm])) for arm in _arms_in_order(reported))
 
@@ -629,7 +640,13 @@ def _draw_cell(
     ax.tick_params(length=0)
 
 
-def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, str] | None = None) -> plt.Figure:
+def metrics_figure(
+    df: pd.DataFrame,
+    *,
+    split_hue: bool,
+    colors: Mapping[str, str] | None = None,
+    split: str = _REPORTED_SPLIT,
+) -> plt.Figure:
     """The metrics grid: one subplot row per skill, one column per metric.
 
     Every bar is a mean over runs — success rate, skill-load rate, then tokens, cost and
@@ -650,13 +667,15 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, st
     df
         Results to plot — the full frame, or one task's slice.
     split_hue
-        ``True`` for the per-task view (train + test as texture); ``False`` for the
-        overview (the reported valid split only).
+        ``True`` for the per-task view (train + ``split`` as texture, whichever have runs);
+        ``False`` for the overview (``split`` only).
     colors
         Bar colour per model id, as returned by :func:`resolve_palette`. It may cover more
         models than ``df`` holds — one map resolved over the whole report is reused for
         every per-task figure, so a model keeps its colour across them. Models missing
         from it fall back to their tier default; ``None`` uses the defaults throughout.
+    split
+        The reported split (see :func:`reported_split`).
     """
     arms = _arms_in_order(df)
     models = _models_in_order(df)
@@ -664,7 +683,12 @@ def metrics_figure(df: pd.DataFrame, *, split_hue: bool, colors: Mapping[str, st
     resolved = colors or {}
     colors = {model: resolved.get(model, _model_color(model)) for model in models}
     colors[_ALL_MODELS] = _ALL_MODELS_COLOR
-    splits = list(_SPLIT_ORDER) if split_hue else [_REPORTED_SPLIT]
+    if split_hue:
+        # A split with no runs (train, in the no-optimize ablation) would only reserve empty slots.
+        present = set(df["split"])
+        splits = [s for s in ("train", split) if s in present] or [split]
+    else:
+        splits = [split]
     # Every row gets a fixed slot in every arm's cell, so bars align across skills and a
     # model that wasn't run leaves a reserved gap rather than letting its neighbour stretch.
     n_rows = max(1, len(arms))
@@ -1585,7 +1609,7 @@ def _paired_delta(loaded: pd.DataFrame, base_rate: pd.Series) -> tuple[float, fl
     return rate, baseline, rate - baseline
 
 
-def loaded_only_rates(df: pd.DataFrame) -> pd.DataFrame:
+def loaded_only_rates(df: pd.DataFrame, *, split: str = _REPORTED_SPLIT) -> pd.DataFrame:
     """Success rate restricted to the runs that actually loaded the skill, per skill and model.
 
     A skill-arm run where the skill never loaded is not evidence about the skill's *body*: the
@@ -1617,7 +1641,7 @@ def loaded_only_rates(df: pd.DataFrame) -> pd.DataFrame:
     ``rate``, ``baseline`` and ``delta`` are ``NaN`` where nothing loaded or nothing could be
     paired against a baseline.
     """
-    reported = df[df["split"] == _REPORTED_SPLIT]
+    reported = df[df["split"] == split]
     arms = [arm for arm in _arms_in_order(reported) if arm != NOSKILL_ARM]
     base = reported[reported["arm"] == NOSKILL_ARM]
     # Baseline success on each (task, model). A loaded run is compared with the baseline on the
@@ -1708,7 +1732,7 @@ def _luminance(rgb: tuple[float, float, float]) -> float:
     return 0.2126 * r + 0.7152 * g + 0.0722 * b
 
 
-def loaded_dotplot_figure(df: pd.DataFrame) -> plt.Figure:
+def loaded_dotplot_figure(df: pd.DataFrame, *, split: str = _REPORTED_SPLIT) -> plt.Figure:
     """The loaded-only comparison as a dot grid — one dot per (model, skill version).
 
     Rows are the models, most-potent first, with a pooled *all models* row set off at the bottom.
@@ -1720,7 +1744,7 @@ def loaded_dotplot_figure(df: pd.DataFrame) -> plt.Figure:
     hollow ring marks a cell where the skill never loaded, which reads as no evidence rather than
     a measured zero.
     """
-    table = loaded_only_rates(df)
+    table = loaded_only_rates(df, split=split)
     table = table[table["scope"].isin(("model", "all"))]
     arms = [arm for arm in _arms_in_order(df) if arm != NOSKILL_ARM]
     present = {m for m in table["model"] if m != _ALL_MODELS}
@@ -2282,12 +2306,16 @@ def render_report(
         the overview and the per-task figures.
     """
     colors = resolve_palette(_models_in_order(df), palette)
-    overview_uri = figure_data_uri(metrics_figure(df, split_hue=False, colors=colors))
-    tradeoff_uri = figure_data_uri(tradeoff_figure(df, colors=colors))
-    # The training curve needs at least one skill version to trace; a baseline-only report has
-    # nothing to plot across, so the whole subsection (and its TOC entry) is dropped.
+    # valid for a fit; test for the no-optimize ablation, which benches nothing else.
+    split = reported_split(df)
+    test_only = split == "test"
+    overview_uri = figure_data_uri(metrics_figure(df, split_hue=False, colors=colors, split=split))
+    tradeoff_uri = figure_data_uri(tradeoff_figure(df, colors=colors, split=split))
+    # The training curve needs at least one skill version to trace, over train and valid; a
+    # baseline-only report, or a test-only no-optimize one that never trained, has nothing to plot
+    # across, so the whole subsection (and its TOC entry) is dropped.
     has_versions = len([arm for arm in _arms_in_order(df) if arm != NOSKILL_ARM]) >= 1
-    if has_versions:
+    if has_versions and not test_only:
         training_uri = figure_data_uri(training_figure(df, colors=colors))
         training_block = (
             '<h3 id="training">Success across versions</h3>'
@@ -2304,21 +2332,22 @@ def render_report(
         training_toc = ""
     # The loaded dotplot only exists once there is a skill arm to compare; a baseline-only report
     # keeps the note the table used to show.
-    if loaded_only_rates(df).empty:
+    if loaded_only_rates(df, split=split).empty:
         loaded_body = '<div class="note">No skill arm to compare — this report covers the baseline only.</div>'
     else:
-        loaded_uri = figure_data_uri(loaded_dotplot_figure(df))
+        loaded_uri = figure_data_uri(loaded_dotplot_figure(df, split=split))
         loaded_body = (
             '<figure><img alt="Change in success rate when the skill loaded, by model and version"'
             f' src="{loaded_uri}"></figure>'
         )
-    tests = skill_tests(df)
+    tests = skill_tests(df, split=split)
     # The held-out test split is benched only at the end of a fit, on the best version (highest
     # valid success, as ``fit`` picks it) and the baseline. Only those two arms are shown: an earlier
     # best's test runs, left on disk by an older fit or one that later found a better version, are stale.
+    # When test is the reported split, the overview already is this section, so it is not repeated.
     all_test = df[df["split"] == "test"]
-    best = best_skill_arm(df)
-    if best is not None and not all_test.empty:
+    best = best_skill_arm(df, split=split)
+    if best is not None and not all_test.empty and not test_only:
         version = html.escape(skill_from_arm(best) or best)
         intro = (
             '<section id="test">\n<h2>Held-out test</h2>\n'
@@ -2356,7 +2385,7 @@ def render_report(
     toc_tasks = []
     for task_id in sorted(df["task_id"].unique()):
         subset = df[df["task_id"] == task_id]
-        uri = figure_data_uri(metrics_figure(subset, split_hue=True, colors=colors))
+        uri = figure_data_uri(metrics_figure(subset, split_hue=True, colors=colors, split=split))
         task = task_by_id.get(task_id)
         desc = _task_desc_html(task) if task is not None else ""
         anchor = f"task-{task_id}"
@@ -2385,6 +2414,13 @@ def render_report(
     arms = ", ".join(arm_label(a) for a in _arms_in_order(df))
     tasks = ", ".join(sorted(df["task_id"].unique()))
     notes = "".join(f'<div class="note">⚠ {html.escape(n)}</div>' for n in _integrity_notes(df))
+    overview_note = (
+        '<p class="task-desc">No valid split was benched, as in the no-optimize ablation, which writes'
+        " v1 once from the package source with no training and no selection. Every figure and test"
+        " below is on the held-out test split.</p>\n"
+        if test_only
+        else ""
+    )
 
     return f"""<!doctype html>
 <html lang="en">
@@ -2399,12 +2435,12 @@ def render_report(
 {toc}
 <main>
 <h1>acumen benchmark report</h1>
-<div class="meta">Generated {generated} &middot; {len(df)} runs &middot; figures show the valid split
+<div class="meta">Generated {generated} &middot; {len(df)} runs &middot; figures show the {split} split
  &middot; arms: {html.escape(arms)} &middot; tasks: {html.escape(tasks)}</div>
 {notes}
 <section id="overview">
 <h2>Overview</h2>
-<p class="task-desc">Per-run means over the valid split; error bars are standard errors.</p>
+{overview_note}<p class="task-desc">Per-run means over the {split} split; error bars are standard errors.</p>
 <figure><img alt="Success rate, tokens, cost and time per skill" src="{overview_uri}"></figure>
 {training_block}
 <h3 id="tradeoff">Cost vs. success</h3>

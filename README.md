@@ -84,7 +84,8 @@ root holds one run of one arm, so use a fresh root for each run. Compare arms on
 
 - `--ablation no-optimize` asks what happens without optimization. It writes `v1` once from the
   package source alone, with no train benches, no wiki and no loop. It then benches that `v1` and
-  the no-skill baseline on `valid` and `test`.
+  the no-skill baseline on `test` only. There is nothing to select or stop on, so `valid` is
+  skipped and the report shows the `test` split.
 - `--ablation no-wiki` asks what happens without the wiki. It runs the full fit loop, but the
   improver never gets a wiki: no observations, hypotheses, discriminators or regressions. It gets
   the parent skill, the parent's raw train runs (each task with an `INDEX.md` of pass/fail and

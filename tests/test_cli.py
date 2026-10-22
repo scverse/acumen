@@ -1657,10 +1657,10 @@ def test_fit_parser_ablation_flag() -> None:
         parser.parse_args(["fit", "--ablation", "no-skill"])
 
 
-def test_cmd_fit_no_optimize_runs_no_loop_and_reports_valid_and_test(
+def test_cmd_fit_no_optimize_runs_no_loop_and_reports_test_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], model: str, make_result
 ) -> None:
-    """No-optimize benches its one v1 (valid + test), writes the curve, and never trains."""
+    """No-optimize benches its one v1 on test alone, never trains, and writes no training curve."""
     import acumen.cli as cli
 
     assert main(["init", "--dir", str(tmp_path)]) == 0
@@ -1669,8 +1669,7 @@ def test_cmd_fit_no_optimize_runs_no_loop_and_reports_valid_and_test(
     def fake_no_optimize(args, **_kwargs) -> None:
         ran.append(True)
         for arm in ("noskill", "skill_v1"):
-            for split in ("valid", "test"):
-                make_result(args.runs, RunKey(arm=arm, split=split, model=model, task_id="example_task", rep=1))
+            make_result(args.runs, RunKey(arm=arm, split="test", model=model, task_id="example_task", rep=1))
 
     def no_loop(*_a, **_k) -> None:
         raise AssertionError("no-optimize must never run a training epoch or the fit's test phase")
@@ -1687,8 +1686,41 @@ def test_cmd_fit_no_optimize_runs_no_loop_and_reports_valid_and_test(
     assert rc == 0 and ran == [True]
     assert "--patience ignored" in out
     assert "no-optimize complete" in out
-    assert "test  v1" in out and "valid noskill" in out
-    assert (tmp_path / "training.csv").is_file()
+    assert "test  v1" in out and "test  noskill" in out
+    assert "valid noskill" not in out and "valid v1" not in out
+    assert not (tmp_path / "training.csv").exists()
+    assert (tmp_path / "report.html").is_file()
+
+
+def test_run_no_optimize_benches_both_arms_on_test_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both benches (noskill, then v1) ask for the test split alone — never valid."""
+    import argparse
+
+    import acumen.cli as cli
+
+    requested: list[tuple[str | None, list[str]]] = []
+
+    def fake_build_arms(specs, **_kwargs):
+        requested.extend((skill, list(splits)) for skill, splits in specs)
+        return []
+
+    monkeypatch.setattr(cli, "_build_arms", fake_build_arms)
+    monkeypatch.setattr(cli, "_execute_arms", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli, "_infer_skill", lambda *_a, **_k: None)
+    args = argparse.Namespace(runs=tmp_path / "runs", skills=tmp_path / "skills")
+
+    cli._run_no_optimize(
+        args,
+        cfg=argparse.Namespace(meta_model="claude-opus-5"),
+        tasks=[],
+        target=None,
+        prices=None,
+        auth_modes={},
+        meta_auth="session",
+        mode="verbose",
+    )
+
+    assert requested == [(None, ["test"]), ("v1", ["test"])]
 
 
 def test_run_one_epoch_no_wiki_skips_the_wiki_and_passes_the_ablation(

@@ -117,6 +117,7 @@ from acumen.report import (
     loaded_only_rates,
     metrics_figure,
     render_report,
+    reported_split,
     resolve_palette,
     skill_tests,
     tradeoff_figure,
@@ -4844,6 +4845,31 @@ def test_render_report_shows_the_test_section_only_with_test_runs(
     rendered = render_report(load_results(runs_root), tmp_path)
     assert 'id="test"' in rendered
     assert 'href="#test"' in rendered  # the TOC entry
+
+
+def test_render_report_falls_back_to_test_when_no_valid_split_was_benched(
+    model: str, make_result, tmp_path: Path
+) -> None:
+    """A test-only tree (the no-optimize ablation) reports on test: the overview and the significance
+    tests use it, and neither the training curve nor a duplicate held-out section is drawn."""
+    runs = tmp_path / "runs"
+    for arm in ("noskill", "skill_v1"):
+        make_result(runs, RunKey(arm=arm, split="test", model=model, task_id="example_task", rep=1))
+    df = load_results(runs)
+
+    assert reported_split(df) == "test"
+    rendered = render_report(df, tmp_path)
+    assert "figures show the test split" in rendered
+    assert "Per-run means over the test split" in rendered
+    assert 'id="dominance"' in rendered and "No skill arm to compare" not in rendered
+    assert 'id="training"' not in rendered
+    assert 'id="test"' not in rendered
+
+
+def test_reported_split_is_valid_whenever_valid_runs_exist(runs_root: Path, model: str, make_result) -> None:
+    """A fit's tree keeps reporting valid even once its held-out test runs land."""
+    make_result(runs_root, RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=1))
+    assert reported_split(load_results(runs_root)) == "valid"
 
 
 def test_first_best_keeps_the_first_on_a_tie_and_skips_nan() -> None:

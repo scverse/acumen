@@ -1323,11 +1323,11 @@ def _run_no_optimize(
 ) -> None:
     """The no-optimize ablation: write v1 once from the source alone, bench it and noskill.
 
-    No train benches, no wiki, no loop. v1 is fixed before anything is measured, so it is benched
-    on test as well as valid: test is the split it is compared on against a fit's selected best,
-    and a single pre-specified evaluation is what test is for. Every step resumes.
+    No train benches, no wiki, no loop. v1 is fixed before anything is measured, so nothing is
+    selected or stopped on and a valid split would have no job: both arms are benched on test
+    alone, the split this arm is compared on against a fit's selected best. Every step resumes.
     """
-    splits: Sequence[Split] = ["valid", "test"]
+    splits: Sequence[Split] = ["test"]
 
     def bench(skill: str | None, *, label: str, verbose_banner: str) -> None:
         if mode == "verbose":
@@ -1351,7 +1351,7 @@ def _run_no_optimize(
             bar.finish()
 
     noskill = arm_name(None)
-    bench(None, label="bench baseline", verbose_banner=f"\n[1/3] benchmarking [{noskill}] on valid and test ...")
+    bench(None, label="bench baseline", verbose_banner=f"\n[1/3] benchmarking [{noskill}] on test ...")
     if skill_dir(args.skills, "v1").exists():
         resumed_msg = "v1 already exists — skipping the source-only skill (resumed run)"
         print(f"\n[2/3] {resumed_msg}" if mode == "verbose" else f"  {resumed_msg}", flush=True)
@@ -1369,7 +1369,7 @@ def _run_no_optimize(
             mode=mode,
             ablation="no-optimize",
         )
-    bench("v1", label="bench v1", verbose_banner="\n[3/3] benchmarking v1 on valid and test ...")
+    bench("v1", label="bench v1", verbose_banner="\n[3/3] benchmarking v1 on test ...")
 
 
 def _cmd_no_optimize(args: argparse.Namespace, cfg: Config, tasks: list[Task]) -> int:
@@ -1411,10 +1411,10 @@ def _cmd_no_optimize(args: argparse.Namespace, cfg: Config, tasks: list[Task]) -
         _invalid_bench_note()
         return 2
 
-    write_training_csv(build_training_rows(args.runs, cfg), args.out)
+    # No training.csv: with no train or valid split there is no training curve to write.
     results = load_results(args.runs, skip_invalid=True)
     print("\nno-optimize complete (compare test against a fit's held-out test):")
-    for split in ("valid", "test"):
+    for split in ("test",):
         for arm in (arm_name(None), arm_name("v1")):
             runs = results[(results["split"] == split) & (results["arm"] == arm)]
             success = float(runs["success"].mean()) if len(runs) else None
@@ -1423,7 +1423,6 @@ def _cmd_no_optimize(args: argparse.Namespace, cfg: Config, tasks: list[Task]) -
                 f"  {split:<5} {arm_label(arm):<8} success {_fmt_rate(success)}  "
                 f"cost/run {_fmt_cost(float(cost.mean()) if len(cost) else None)}  ({len(runs)} runs)"
             )
-    print(f"training curve → {args.out.resolve()}")
 
     # Same as fit: the report is a summary of what ran, so a failure must not fail the ablation.
     report_out = Path("report.html")
@@ -2328,7 +2327,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=ABLATIONS,
         default=None,
         help="run an ablation arm instead of a normal fit (one root = one run of one arm): "
-        "no-optimize writes v1 once from the package source and benches it on valid and test, no loop; "
+        "no-optimize writes v1 once from the package source and benches it and the baseline on test only, no loop; "
         "no-wiki runs the full fit with the improver denied the wiki (raw train runs only)",
     )
     fit.add_argument("--model", help="override config meta_model")
