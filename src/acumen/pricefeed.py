@@ -162,17 +162,21 @@ def parse_anthropic(markdown: str, *, today: date) -> dict[str, Rates]:
 def parse_openai(markdown: str) -> dict[str, Rates]:
     """Parse OpenAI's standard-tier table, short-context columns only."""
     rates: dict[str, Rates] = {}
+    # Each rate's accepted headers, first match wins. OpenAI split the single "cache writes" column
+    # into "30m write" and "12h write"; the 30-minute write is the default retention, so it is the
+    # rate a cache write is billed at. The old header still parses.
+    wanted = {
+        "input": ("short context input",),
+        "cached_input": ("short context cached input",),
+        "cache_write": ("short context cache writes", "short context 30m write"),
+        "output": ("short context output",),
+    }
     for header, rows in _tables(markdown):
         lowered = [cell.lower() for cell in header]
-        wanted = {
-            "input": "short context input",
-            "cached_input": "short context cached input",
-            "cache_write": "short context cache writes",
-            "output": "short context output",
-        }
-        if not all(any(c == want for c in lowered) for want in wanted.values()):
+        found = {name: next((h for h in headers if h in lowered), None) for name, headers in wanted.items()}
+        if any(h is None for h in found.values()):
             continue
-        columns = {name: lowered.index(want) for name, want in wanted.items()}
+        columns = {name: lowered.index(h) for name, h in found.items()}
         for row in rows:
             if len(row) <= max(columns.values()):
                 continue
