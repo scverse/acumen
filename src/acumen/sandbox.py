@@ -11,7 +11,8 @@ because a target downloads its own datasets and priors.
 
 A skill arm differs from the baseline in exactly one way: ``skills/v{n}/`` is
 copied into the selected provider's project skill directory, where the agent's own
-discovery finds it. Same prompt, same tools, same caps, same env otherwise.
+discovery finds it. Same prompt, same tools, same caps, same env otherwise — including the
+prepared data a task names (:mod:`acumen.data`), which is linked into every arm alike.
 
 That "exactly one way" also depends on the target itself carrying no skill. A package can ship
 first-party agent guidance inside itself, and an agent that greps the venv finds it whether or
@@ -31,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from acumen.agents import AgentProvider
+from acumen.data import link_data
 from acumen.env import AuthMode, Target, build_agent_env
 from acumen.procs import label_env, reap
 from acumen.skills import Skill, content_files
@@ -108,6 +110,7 @@ async def sandbox(
     skill: Skill | None = None,
     env_passthrough: Sequence[str] | None = None,
     provider: AgentProvider = "claude",
+    data: Sequence[tuple[str, Path]] = (),
 ) -> AsyncIterator[Sandbox]:
     """Create a fresh sandbox for one run and clean it up afterwards.
 
@@ -129,6 +132,10 @@ async def sandbox(
     env_passthrough
         Extra environment variable names to carry into the sandbox on top of the built-in
         allowlist (the operator's ``config.env_passthrough``).
+    data
+        Prepared data-cache entries to symlink into the sandbox root, as ``(name, source)``
+        pairs from :func:`acumen.data.data_sources`. Both arms get the same links, so they
+        stay identical apart from the skill.
 
     Yields
     ------
@@ -145,6 +152,7 @@ async def sandbox(
             path.mkdir(parents=True, exist_ok=True)
         if skill is not None:
             install_skill(root, skill, provider=provider)
+        link_data(root, data)
         # The marker is what lets the teardown below find whatever this agent leaves running.
         env = label_env(
             build_agent_env(

@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning][].
   since there is nothing to select or stop on. `no-wiki` runs the full fit with the improver denied
   the wiki. A report whose run tree has no `valid` split now draws its figures and significance
   tests on `test` instead.
+- Add a prepared data cache, so runs no longer download their datasets every time. `acumen
+  prepare` runs the `prepare/<name>.py` scripts in the target venv into `cache/`, skips the ones
+  that already succeeded and have not changed, and leaves the cache read-only.
+  - A task names the entries (files or directories) its runs start with under `data:` in
+    `tasks.yaml`. A split can name its own `data:` list, which replaces the task's list for that
+    split.
+  - Each entry is symlinked into the run's sandbox, the same in every arm, and into each
+    `acumen check` reproducer's working directory. The agent may read only the entries its split
+    names. The harness preamble adds one neutral line listing them, and tasks without data get
+    exactly the same prompt as before.
+  - `bench`, `epoch` and `fit` refuse to start if an entry is missing. `--data-cache` selects a
+    cache other than `cache/`.
 
 ### Changed
 

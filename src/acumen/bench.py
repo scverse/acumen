@@ -9,6 +9,7 @@ from pathlib import Path
 
 from acumen.agents import AgentProvider, provider_for_model
 from acumen.config import Config
+from acumen.data import DATA_DIRNAME
 from acumen.env import AuthMode, Target
 from acumen.paths import BENCH_SPLITS, SPLITS, RunKey, Split, arm_name, is_complete, run_dir
 from acumen.prices import PriceTable
@@ -164,6 +165,7 @@ async def run_matrix(
     on_start: Callable[[PlannedRun], None] | None = None,
     on_done: Callable[[RunOutcome], None] | None = None,
     env_passthrough: Sequence[str] | None = None,
+    data_root: Path = Path(DATA_DIRNAME),
 ) -> list[RunOutcome]:
     """Run planned runs concurrently, bounded by ``max_concurrency``.
 
@@ -221,6 +223,8 @@ async def run_matrix(
     env_passthrough
         Extra environment variable names each run carries into its sandbox on top of the
         built-in allowlist (the operator's ``config.env_passthrough``).
+    data_root
+        The prepared data cache each run's ``data:`` entries are linked from.
 
     Returns
     -------
@@ -271,6 +275,7 @@ async def run_matrix(
                 stderr=stderr,
                 env_passthrough=env_passthrough,
                 prices=prices,
+                data_root=data_root,
             )
             if on_done is not None:
                 on_done(outcome)

@@ -1707,7 +1707,7 @@ def test_run_no_optimize_benches_both_arms_on_test_only(tmp_path: Path, monkeypa
     monkeypatch.setattr(cli, "_build_arms", fake_build_arms)
     monkeypatch.setattr(cli, "_execute_arms", lambda *_a, **_k: None)
     monkeypatch.setattr(cli, "_infer_skill", lambda *_a, **_k: None)
-    args = argparse.Namespace(runs=tmp_path / "runs", skills=tmp_path / "skills")
+    args = argparse.Namespace(runs=tmp_path / "runs", skills=tmp_path / "skills", data_cache=tmp_path / "cache")
 
     cli._run_no_optimize(
         args,
@@ -1743,7 +1743,11 @@ def test_run_one_epoch_no_wiki_skips_the_wiki_and_passes_the_ablation(
     monkeypatch.setattr(cli, "update_regressions", forbidden)
     monkeypatch.setattr(cli, "_infer_skill", lambda *a, **k: calls.update(k))
     args = argparse.Namespace(
-        runs=tmp_path / "runs", skills=tmp_path / "skills", wiki=tmp_path / "wiki", ablation="no-wiki"
+        runs=tmp_path / "runs",
+        skills=tmp_path / "skills",
+        wiki=tmp_path / "wiki",
+        ablation="no-wiki",
+        data_cache=tmp_path / "cache",
     )
     monkeypatch.setattr(cli, "_valid_complete_fn", lambda *a: lambda version: False)
 

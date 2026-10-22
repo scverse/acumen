@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from acumen.data import DATA_DIRNAME, DataError, data_sources, link_data
 from acumen.grade import grade_run
 from acumen.paths import SPLITS, Split
 from acumen.tasks import Task
@@ -373,6 +374,73 @@ def _terminate(proc: subprocess.Popen) -> None:
         pass
 
 
+@dataclass(frozen=True)
+class ScriptProcess:
+    """How one operator script exited: its output, and whether the timeout killed it."""
+
+    returncode: int
+    stdout: str
+    stderr: str
+    timed_out: bool
+    seconds: float
+
+    @property
+    def error_tail(self) -> str | None:
+        """The end of the script's error output (or its stdout, if stderr is empty)."""
+        return _tail(self.stderr or self.stdout)
+
+
+def run_script(
+    script: Path,
+    *,
+    python: Path,
+    cwd: Path,
+    timeout: float,
+    args: Sequence[str] = (),
+    extra_env: dict[str, str] | None = None,
+) -> ScriptProcess:
+    """Run one of the operator's own scripts in the target venv, killing it on timeout.
+
+    Shared by the reproducers here and the data scripts of :mod:`acumen.prepare`. Raises
+    :class:`OSError` when the interpreter cannot be started at all.
+    """
+    started = time.monotonic()
+    # Absolute, because the script runs with cwd set elsewhere: a relative path such as
+    # ``tasks/bulk-train.py`` would otherwise be looked up inside that directory.
+    #
+    # Absolute but NOT resolved for the interpreter: a venv's ``bin/python`` is a symlink to the
+    # base interpreter, and Python finds its ``pyvenv.cfg`` (and therefore the venv's
+    # site-packages) from the path it was invoked by. Following the symlink would run the base
+    # interpreter instead, where the target package is not installed at all.
+    command = [str(python.absolute()), str(script.resolve()), *args]
+    # The operator's own script, run in the target venv at their request.
+    proc = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**script_env(python.parent), **(extra_env or {})},
+        # Its own session, so _terminate can reach whatever the script spawned.
+        start_new_session=True,
+    )
+    timed_out = False
+    with proc:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _terminate(proc)
+            stdout, stderr = proc.communicate()
+    return ScriptProcess(
+        returncode=proc.returncode,
+        stdout=stdout,
+        stderr=stderr,
+        timed_out=timed_out,
+        seconds=time.monotonic() - started,
+    )
+
+
 def run_reproducer(
     script: Path,
     *,
@@ -403,61 +471,33 @@ def run_reproducer(
     """
     work_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
-    # Absolute, because the script runs with cwd set to the work dir: a relative path such as
-    # ``tasks/bulk-train.py`` would otherwise be looked up inside that empty directory.
-    #
-    # Absolute but NOT resolved for the interpreter: a venv's ``bin/python`` is a symlink to the
-    # base interpreter, and Python finds its ``pyvenv.cfg`` (and therefore the venv's
-    # site-packages) from the path it was invoked by. Following the symlink would run the base
-    # interpreter instead, where the target package is not installed at all.
-    command = [str(python.absolute()), str(script.resolve())]
     try:
-        # The operator's own reproducer, run in the target venv at their request.
-        proc = subprocess.Popen(
-            command,
-            cwd=work_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=script_env(python.parent),
-            # Its own session, so _terminate can reach whatever the script spawned.
-            start_new_session=True,
-        )
+        proc = run_script(script, python=python, cwd=work_dir, timeout=timeout)
     except OSError as err:
         return ScriptRun(
             status="error", answer=None, seconds=time.monotonic() - started, error_tail=f"cannot run {script}: {err}"
         )
 
-    timed_out = False
-    with proc:
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _terminate(proc)
-            stdout, stderr = proc.communicate()
-    seconds = time.monotonic() - started
-
     grade = grade_run(work_dir, expected)
-    if timed_out:
-        return ScriptRun(status="timeout", answer=grade.answer, seconds=seconds, error_tail=_tail(stderr))
+    if proc.timed_out:
+        return ScriptRun(status="timeout", answer=grade.answer, seconds=proc.seconds, error_tail=_tail(proc.stderr))
     if proc.returncode != 0:
         # A broken pipeline is a failure even if answer.md happens to hold the right string:
         # whatever wrote it did not finish, so the answer is not evidence of anything.
         return ScriptRun(
             status="error",
             answer=grade.answer,
-            seconds=seconds,
+            seconds=proc.seconds,
             returncode=proc.returncode,
-            error_tail=_tail(stderr or stdout),
+            error_tail=proc.error_tail,
         )
     status = _GRADE_STATUS[grade.reason]
     return ScriptRun(
         status=status,
         answer=grade.answer,
-        seconds=seconds,
+        seconds=proc.seconds,
         returncode=proc.returncode,
-        error_tail=None if status == "ok" else _tail(stderr),
+        error_tail=None if status == "ok" else _tail(proc.stderr),
     )
 
 
@@ -469,8 +509,13 @@ def check_task_split(
     python: Path,
     work_dir: Path,
     timeout: float = DEFAULT_TIMEOUT,
+    data_root: Path = Path(DATA_DIRNAME),
 ) -> CheckResult:
-    """Check one split of one task: locate its reproducer, run it, and grade what it wrote."""
+    """Check one split of one task: locate its reproducer, run it, and grade what it wrote.
+
+    The split's ``data:`` entries are linked into ``work_dir`` first, exactly as a benchmark
+    sandbox gets them, so the reproducer reads the same inputs from the same relative paths.
+    """
     expected = task.split(split).answer.strip()
     if not task.needs_script:
         return CheckResult(
@@ -481,6 +526,21 @@ def check_task_split(
         return CheckResult(
             task_id=task.id, split=split, status="missing", script=script, answer=None, expected=expected, seconds=0.0
         )
+    try:
+        sources = data_sources(task.data_for(split), data_root)
+    except DataError as err:
+        return CheckResult(
+            task_id=task.id,
+            split=split,
+            status="error",
+            script=script,
+            answer=None,
+            expected=expected,
+            seconds=0.0,
+            error_tail=str(err),
+        )
+    work_dir.mkdir(parents=True, exist_ok=True)
+    link_data(work_dir, sources)
     run = run_reproducer(script, python=python, expected=expected, work_dir=work_dir, timeout=timeout)
     return CheckResult(
         task_id=task.id,
@@ -505,6 +565,7 @@ def check_tasks(
     jobs: int = DEFAULT_JOBS,
     work_root: Path | None = None,
     on_done: Callable[[CheckResult], None] | None = None,
+    data_root: Path = Path(DATA_DIRNAME),
 ) -> list[CheckResult]:
     """Check every task and split, running the reproducers that exist.
 
@@ -529,6 +590,8 @@ def check_tasks(
     on_done
         Called with each result as it completes, so a caller can stream progress. Results are
         returned in task order regardless of completion order.
+    data_root
+        The prepared data cache each split's ``data:`` entries are linked from.
 
     Returns
     -------
@@ -553,6 +616,7 @@ def check_tasks(
             python=python,
             work_dir=holder / f"{task.id}-{split}",
             timeout=timeout,
+            data_root=data_root,
         )
         if on_done is not None:
             on_done(result)

@@ -95,9 +95,14 @@ def _task_to_dict(task: Task) -> dict[str, object]:
     # since `needs_script: true` on every task is noise and its absence already means that.
     if not task.needs_script:
         entry["needs_script"] = False
-    entry["train"] = {"prompt": task.train.prompt, "answer": task.train.answer}
-    entry["valid"] = {"prompt": task.valid.prompt, "answer": task.valid.answer}
-    entry["test"] = {"prompt": task.test.prompt, "answer": task.test.answer}
+    if task.data:
+        entry["data"] = list(task.data)
+    for name in ("train", "valid", "test"):
+        half = task.split(name)
+        split_entry: dict[str, object] = {"prompt": half.prompt, "answer": half.answer}
+        if half.data is not None:
+            split_entry["data"] = list(half.data)
+        entry[name] = split_entry
     if task.max_turns is not None:
         entry["max_turns"] = task.max_turns
     if task.max_usd is not None:

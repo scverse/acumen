@@ -8,7 +8,7 @@ from typing import Any
 
 import yaml
 
-from acumen.paths import Split, is_safe_component
+from acumen.paths import ANSWER_FILE, SCRIPT_FILE, Split, is_safe_component
 
 
 class TaskError(ValueError):
@@ -21,6 +21,9 @@ class TaskSplit:
 
     prompt: str
     answer: str
+    #: Entries of the prepared data cache to link into this split's sandbox. ``None`` inherits
+    #: the task-level list; any list, even an empty one, replaces it.
+    data: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,9 @@ class Task:
     #: that needs none (a licence, a species name, a fact from the docs) sets this ``False``.
     #: Task-level, not per-split: every split of one task is the same analysis.
     needs_script: bool = True
+    #: Entries of the prepared data cache (see :mod:`acumen.data`) linked into every split's
+    #: sandbox, unless the split names its own.
+    data: tuple[str, ...] = ()
 
     def split(self, split: Split) -> TaskSplit:
         """Return the ``train``, ``valid`` or ``test`` half of this task."""
@@ -47,6 +53,11 @@ class Task:
             raise TaskError(f"no such split: {split!r}")
         return halves[split]
 
+    def data_for(self, split: Split) -> tuple[str, ...]:
+        """Return the data-cache entries one split's runs see: its own list, else the task's."""
+        own = self.split(split).data
+        return self.data if own is None else own
+
 
 def _require_str(value: Any, where: str) -> str:
     if not isinstance(value, str) or not value.strip():
@@ -54,17 +65,51 @@ def _require_str(value: Any, where: str) -> str:
     return value
 
 
+#: Names a data entry may not take at the sandbox root, because the run itself writes there.
+_RESERVED_DATA = frozenset({ANSWER_FILE, SCRIPT_FILE})
+
+
+def _parse_data(raw: Any, where: str) -> tuple[str, ...]:
+    """Validate a ``data:`` list of relative paths into the prepared data cache."""
+    if not isinstance(raw, list):
+        raise TaskError(f"{where} must be a list of paths inside the data cache, got {type(raw).__name__}")
+    entries: list[str] = []
+    for i, item in enumerate(raw):
+        entry = _require_str(item, f"{where}[{i}]").strip().rstrip("/")
+        parts = entry.split("/")
+        # Each component must be plain: no absolute path, no '..' climbing out of the cache, and
+        # no hidden first component, which could land on the sandbox's own .claude/ or .agents/.
+        if entry.startswith("/") or not all(is_safe_component(part) for part in parts):
+            raise TaskError(f"{where}[{i}] {item!r} must be a relative path inside the data cache, with no '..'")
+        if parts[0].startswith(".") or entry in _RESERVED_DATA:
+            raise TaskError(f"{where}[{i}] {item!r} would collide with a file the run writes in its sandbox")
+        if entry in entries:
+            raise TaskError(f"{where} lists {entry!r} twice")
+        # Each entry becomes one symlink, so one inside another would be linked *through* the
+        # outer link, into the shared cache itself. Name the directory alone.
+        nested = next(
+            (other for other in entries if f"{other}/".startswith(f"{entry}/") or f"{entry}/".startswith(f"{other}/")),
+            None,
+        )
+        if nested is not None:
+            raise TaskError(f"{where} lists {entry!r} and {nested!r}, one inside the other — name only the outer one")
+        entries.append(entry)
+    return tuple(entries)
+
+
 def _parse_split(raw: Any, where: str) -> TaskSplit:
     if not isinstance(raw, dict):
         raise TaskError(f"{where} must be a mapping with 'prompt' and 'answer', got {type(raw).__name__}")
-    unknown = set(raw) - {"prompt", "answer"}
+    unknown = set(raw) - {"prompt", "answer", "data"}
     if unknown:
         raise TaskError(f"{where} has unknown keys: {sorted(unknown)}")
     for key in ("prompt", "answer"):
         if key not in raw:
             raise TaskError(f"{where} is missing '{key}'")
     return TaskSplit(
-        prompt=_require_str(raw["prompt"], f"{where}.prompt"), answer=_require_str(raw["answer"], f"{where}.answer")
+        prompt=_require_str(raw["prompt"], f"{where}.prompt"),
+        answer=_require_str(raw["answer"], f"{where}.answer"),
+        data=_parse_data(raw["data"], f"{where}.data") if "data" in raw else None,
     )
 
 
@@ -72,7 +117,7 @@ def _parse_task(raw: Any, index: int) -> Task:
     where = f"tasks[{index}]"
     if not isinstance(raw, dict):
         raise TaskError(f"{where} must be a mapping, got {type(raw).__name__}")
-    unknown = set(raw) - {"id", "train", "valid", "test", "max_turns", "max_usd", "model", "needs_script"}
+    unknown = set(raw) - {"id", "train", "valid", "test", "max_turns", "max_usd", "model", "needs_script", "data"}
     if unknown:
         raise TaskError(f"{where} has unknown keys: {sorted(unknown)}")
     if "id" not in raw:
@@ -109,6 +154,7 @@ def _parse_task(raw: Any, index: int) -> Task:
         max_usd=max_usd,
         model=model,
         needs_script=needs_script,
+        data=_parse_data(raw["data"], f"{where}.data") if "data" in raw else (),
     )
 
 

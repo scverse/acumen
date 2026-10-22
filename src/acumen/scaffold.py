@@ -76,6 +76,10 @@ TASKS_TEMPLATE = """\
 # those scripts for you. A task that needs no code to answer sets `needs_script: false`.
 #
 # Optional per-task overrides: `max_turns`, `max_usd`, `model`.
+#
+# A task that starts from a dataset can name prepared entries under `data: [file.h5ad, dir/]`
+# (task level, or per split to replace it). They are built once by the `prepare/<name>.py`
+# scripts with `acumen prepare` and symlinked into each run's working directory.
 
 tasks:
   - id: example_task
