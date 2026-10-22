@@ -2904,6 +2904,30 @@ def test_price_feed_reads_standard_short_context_and_ignores_the_other_tiers() -
     assert rates["gpt-5.5"] == Rates(input=5.0, cached_input=0.5, cache_write=6.25, output=30.0)
 
 
+#: The October 2026 layout: "cache writes" split into 30m/12h columns, and the columns reordered.
+_OPENAI_MD_SPLIT_WRITES = """
+### Standard pricing data
+
+| Model | Short context input | Short context output | Short context cached input | Short context 30m write | Short context 12h write | Long context input | Long context output | Long context cached input | Long context 30m write | Long context 12h write |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| gpt-6-astra | $10.00 | $50.00 | $1.00 | $12.50 | $25.00 | $20.00 | $75.00 | $2.00 | $25.00 | $50.00 |
+| gpt-5.5 (<272K context length) | $5.00 | $30.00 | $0.50 | - | - | $10.00 | $45.00 | $1.00 | - | - |
+
+### Batch pricing data
+
+| Model | Short context input | Short context output | Short context cached input | Short context 30m write | Short context 12h write | Long context input | Long context output | Long context cached input | Long context 30m write | Long context 12h write |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| gpt-6-astra | $5.00 | $25.00 | $0.50 | $6.25 | $12.50 | $10.00 | $37.50 | $1.00 | $12.50 | $25.00 |
+"""
+
+
+def test_price_feed_reads_the_split_30m_and_12h_cache_write_layout() -> None:
+    """The 30m write is the default-retention rate; the 12h column and batch tier are not it."""
+    rates = parse_openai(_OPENAI_MD_SPLIT_WRITES)
+    assert rates["gpt-6-astra"] == Rates(input=10.0, cached_input=1.0, cache_write=12.5, output=50.0)
+    assert rates["gpt-5.5"] == Rates(input=5.0, cached_input=0.5, cache_write=6.25, output=30.0)
+
+
 def test_price_feed_reports_a_changed_cache_rate_not_just_input_and_output() -> None:
     """On a cached workload the cache rate is most of the bill, so a diff must surface it."""
     current = {"claude-opus-5": Rates(input=5.0, cached_input=0.5, cache_write=6.25, output=25.0)}
