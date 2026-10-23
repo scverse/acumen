@@ -130,7 +130,17 @@ def test_claude_science_rejects_a_bad_org_uuid(
 def test_env_var_overrides_the_framework_root(
     install: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    codex_home = tmp_path / "custom-codex"
-    monkeypatch.setenv("CODEX_HOME", str(codex_home))
-    assert install.main(["--agent", "codex"]) == 0
-    assert _installed_ok(codex_home / "skills" / SKILL_NAME)
+    claude_home = tmp_path / "custom-claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    assert install.main(["--agent", "claude"]) == 0
+    assert _installed_ok(claude_home / "skills" / SKILL_NAME)
+
+
+def test_codex_installs_to_the_shared_agents_dir(
+    install: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Codex discovers user skills in ~/.agents/skills, not under CODEX_HOME.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "custom-codex"))
+    dest = install.resolve_dest("codex", None)
+    assert dest == install.resolve_dest("agents", None)
+    assert dest == tmp_path / "home" / ".agents" / "skills" / SKILL_NAME
