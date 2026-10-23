@@ -320,7 +320,13 @@ async def ship_skill(
         if result is None:
             raise ShipError("the shipping agent produced no result message")
         if result.is_error:
-            raise ShipError(f"the shipping agent errored: {result.subtype} {result.errors or ''}".strip())
+            detail = result.error_detail()
+            if auth_mode == "session" and "usage credits" in detail.lower():
+                detail += (
+                    f" (the subscription cannot run {selected_model}; retry with --auth api "
+                    "or --model <a model your plan covers>)"
+                )
+            raise ShipError(f"the shipping agent errored: {detail}")
 
         return ShipResult(
             skill=skill,

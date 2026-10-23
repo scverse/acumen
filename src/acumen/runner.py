@@ -66,6 +66,7 @@ _PROVIDER_EXHAUSTION_MARKERS = (
     "no credits remaining",
     "credits are exhausted",
     "purchase more credits",
+    "usage credits are required",
     "payment required",
     "spending limit",
     "spend limit",
@@ -458,6 +459,7 @@ async def run_once(
             block_repo=target.source if target.is_remote else None,
             block_pkg=target.pkg_name,
         )
+        cli_version = agent_version(provider, options.env.get("PATH"))
         try:
             result = await run_agent(prompt, options=options)
         except Exception as err:  # noqa: BLE001 - a crashed agent is a recorded failure, not a crashed pass
@@ -565,7 +567,7 @@ async def run_once(
         "skill_name": skill.name if skill else None,
         # Evidence, not configuration: did the agent actually invoke the Skill tool?
         "skill_loaded": skill_loaded,
-        "sdk_version": agent_version(provider),
+        "cli_version": cli_version,
         "session_id": result.session_id if result else None,
         "stop_reason": result.stop_reason if result else None,
         "subtype": result.subtype if result else None,

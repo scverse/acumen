@@ -456,7 +456,7 @@ async def improve_skill(
         if result is None:
             raise ImproveError("the improving agent produced no result message")
         if result.is_error:
-            raise ImproveError(f"the improving agent errored: {result.subtype} {result.errors or ''}".strip())
+            raise ImproveError(f"the improving agent errored: {result.error_detail()}")
 
         _validate_staged(staging, cfg.skill_name)
 

@@ -217,6 +217,9 @@ class LiveLog:
                 "cost_usd": round(message.total_cost_usd or 0.0, 4),
                 "duration_s": round((message.duration_ms or 0) / 1000, 2),
                 "session_id": message.session_id,
+                # The CLI can put the only statement of why a run failed here (see
+                # ``AgentResult.error_detail``), so keep it on error results.
+                **({"result": message.result} if message.is_error and message.result else {}),
             }
         return None
 

@@ -40,6 +40,19 @@ and this project adheres to [Semantic Versioning][].
   alike and adding a harness is one mapper, not a new renderer. Each run also writes a portable
   `trajectory.json` beside its `.html`. Claude transcripts are now rendered in-house too, so
   `claude-code-log` is dropped from the `claude` extra.
+- Run Claude agents with the `claude` CLI on `PATH` instead of the copy bundled in the
+  `claude-agent-sdk` wheel, which lags the user's install and rejects newer models. The bundled
+  CLI remains the fallback when none is on `PATH`.
+- Record the driving CLI's version as `cli_version` in each `result.json` (Claude Code or Codex),
+  replacing `sdk_version`, which for Claude runs held the SDK package version instead.
+
+### Fixed
+
+- Agent failures now report the provider's reason. The Claude CLI can fail a run with
+  `subtype="success"` and the reason only in its result text (e.g. "Usage credits are required for
+  this model."), so `ship`, `review`, `improve`, `wiki` and `tasks` errored with a bare
+  "errored: success". `ship` on session auth also suggests `--auth api` or `--model` when the
+  subscription can't run the model, and bench classes this case as provider exhaustion.
 
 ## [0.0.1dev]
 

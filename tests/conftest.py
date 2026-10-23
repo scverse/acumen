@@ -126,7 +126,7 @@ def write_result(runs_root: Path, key: RunKey, **overrides) -> Path:
         "skill_hash": None,
         "skill_name": None,
         "skill_loaded": key.arm != "noskill",
-        "sdk_version": "0.2.120",
+        "cli_version": "2.1.120",
     }
     payload.update(overrides)
     (directory / RESULT_FILE).write_text(json.dumps(payload, indent=2) + "\n")
