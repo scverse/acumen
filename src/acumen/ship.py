@@ -244,7 +244,8 @@ async def ship_skill(
     skill = load_skill(skills_root, version, expect_name=cfg.skill_name)
 
     # Pre-flight, before the costly real-env agent: refuse to clobber an existing installer.
-    if installer_exists(target.src_dir) and not force:
+    reship = installer_exists(target.src_dir)
+    if reship and not force:
         raise ShipError(
             f"{target.pkg_name} already ships a skills installer — pass force=True to ship anyway. "
             "Shipping over an existing installer risks overwriting a maintainer's own setup."
@@ -268,6 +269,7 @@ async def ship_skill(
             checkout=target.src_dir,
             skill_src=skill_src,
             mode=mode,
+            reship=reship,
         )
         options = AgentOptions(
             # The agent edits the checkout in place, so its cwd IS the checkout.

@@ -1020,12 +1020,12 @@ prevent, and it fails silently. Before you deliver anything, prove the data ship
 # Scope limits
 
 - Bundle EXACTLY ONE skill — version {version}, copied verbatim. Nothing else.
-- Do NOT write any test file. (Deliberate scope decision.)
+- Do NOT write any NEW test file. (Deliberate scope decision.){reship_scope}
 - Update the README / docs to mention the `<dist-name>-install-skills` command ONLY if there is a
   natural spot for it (e.g. an existing install or usage section). Keep it to a sentence, noting
   the `--agent {{claude,codex,agents,claude-science}}` (or `--dest`) choice. If there is no natural
   spot, skip it — do not invent a section.
-
+{reship}
 # Deliver
 
 {delivery}
@@ -1040,6 +1040,44 @@ When you are done, report what you changed: the import package dir you found, th
 the console-script name, the packaging change you made, the result of the fresh-venv build-verify,
 and {delivery_report}.
 """
+
+
+#: Spliced into :data:`SHIP_PROMPT` when the target already ships an installer (``--force``).
+#: Replacing it verbatim is still the job; this is about not orphaning what depended on the old
+#: one — an earlier ``acumen ship`` may have left tests written against an API the template no
+#: longer has, and the build-verify gate never runs them.
+SHIP_RESHIP = """
+# Replacing an existing installer
+
+This package ALREADY ships a skills installer — from an earlier `acumen ship` or the maintainer's
+own setup — and you are replacing it. Replace it in full, and leave nothing that depended on it
+broken:
+
+1. BEFORE you overwrite anything, read the existing `_skills/install.py` and the console-script
+   entry in `pyproject.toml`, and note every public and private name the old installer defines.
+2. Overwrite `_skills/install.py` with the canonical template, verbatim, as above. Make
+   `_skills/data/` an exact copy of `{skill_src}`: delete any file the new version does not have,
+   so no stale reference ships. Keep exactly ONE `<dist-name>-install-skills` entry point; fix
+   the existing entry if its name or target differs rather than adding a second one.
+3. Search the whole repository (tests, docs, CI config, other modules) for anything that uses
+   the old installer: its module path, the names you noted in step 1, the console-script name.
+   Update each to the template's API (`source_dir`, `resolve_dest`, `main`, the `--agent` /
+   `--dest` / `--force` / `--check` / `--print-path` flags). Where an existing test covers
+   behaviour the template deliberately dropped (e.g. a default install destination), delete that
+   test, but port the rest. NEVER edit the template to make an old test pass.
+4. Run every test file you touched, plus any other test that imports `_skills`, with the
+   package's own test setup, in a FRESH editable venv of the checkout with its test
+   dependencies (e.g. `uv venv` then `uv pip install -e '.[test]'`, or whatever the project
+   uses). Not the `python` already on your PATH: that environment has the shipped skill scrubbed
+   out and is not an editable install. They must pass, and nothing may error at collection,
+   before you deliver.
+"""
+
+#: The scope-limit carve-out paired with :data:`SHIP_RESHIP`.
+SHIP_RESHIP_SCOPE = (
+    "\n  Updating EXISTING tests that the replaced installer would break is required, not optional —"
+    "\n  see `Replacing an existing installer` below."
+)
 
 
 SHIP_DELIVERY_GITHUB = """\
@@ -1331,6 +1369,7 @@ def ship_prompt(
     checkout: Path,
     skill_src: Path,
     mode: str,
+    reship: bool = False,
 ) -> str:
     """Build the prompt for the shipping agent.
 
@@ -1357,6 +1396,9 @@ def ship_prompt(
         ``meta.json``), to be copied verbatim into ``_skills/data/``.
     mode
         ``"github"`` (deliver as a PR) or ``"local"`` (edit the working tree directly).
+    reship
+        Whether the target already ships an installer being replaced. Adds the instructions to
+        update whatever depended on the old one (notably its tests) and to run those tests.
 
     Returns
     -------
@@ -1369,6 +1411,11 @@ def ship_prompt(
     else:
         delivery = SHIP_DELIVERY_LOCAL.format(checkout=checkout)
         delivery_report = "confirmation that the working tree now carries the change"
+    if reship:
+        delivery_report = (
+            "what depended on the old installer and how you updated it, the result of running "
+            f"those tests, and {delivery_report}"
+        )
     return SHIP_PROMPT.format(
         package=package,
         version=version,
@@ -1377,6 +1424,8 @@ def ship_prompt(
         delivery=delivery,
         delivery_report=delivery_report,
         install_template=install_template,
+        reship=SHIP_RESHIP.format(skill_src=skill_src) if reship else "",
+        reship_scope=SHIP_RESHIP_SCOPE if reship else "",
     )
 
 
