@@ -825,6 +825,39 @@ def test_claude_options_write_run_local_settings_file(tmp_path: Path) -> None:
     assert settings == _claude_settings(options)
 
 
+def test_claude_options_run_the_claude_on_path_not_the_bundled_cli(tmp_path: Path) -> None:
+    # The SDK's bundled CLI lags the user's install and rejects newer models.
+    pytest.importorskip("claude_agent_sdk")
+    from acumen.agents import _claude_options
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    cli = bin_dir / "claude"
+    cli.write_text("#!/bin/sh\n")
+    cli.chmod(0o755)
+    env = {"PATH": str(bin_dir), "CLAUDE_CONFIG_DIR": str(tmp_path / "claude-config")}
+
+    assert _claude_options(AgentOptions(cwd=tmp_path, env=env, model="claude-opus-5-5")).cli_path == cli
+    no_cli = {**env, "PATH": str(tmp_path / "empty")}
+    bundled = _claude_options(AgentOptions(cwd=tmp_path, env=no_cli, model="claude-opus-5-5")).cli_path
+    assert bundled is None or Path(bundled).parent.name == "_bundled"
+
+
+def test_agent_version_reports_the_cli_on_the_run_path(tmp_path: Path) -> None:
+    from acumen.env import agent_version
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, output in (("claude", "2.1.309 (Claude Code)"), ("codex", "codex-cli 0.159.2")):
+        cli = bin_dir / name
+        cli.write_text(f"#!/bin/sh\necho '{output}'\n")
+        cli.chmod(0o755)
+
+    assert agent_version("claude", str(bin_dir)) == "2.1.309"
+    assert agent_version("codex", str(bin_dir)) == "0.159.2"
+    assert agent_version("codex", str(tmp_path / "empty")) == "unknown"
+
+
 def _claude_result(**kwargs: object) -> object:
     from claude_agent_sdk import ResultMessage
 
@@ -1431,6 +1464,7 @@ def test_codex_cap_subtypes_map_onto_the_same_reasons_as_claude(subtype: str, re
         "insufficient_quota: exceeded your current quota",
         "Your credit balance is too low to access the Anthropic API",
         "HTTP 402 payment required; purchase more credits",
+        "Usage credits are required for this model.",
     ],
 )
 def test_provider_quota_and_credit_exhaustion_is_infrastructure_invalid(detail: str) -> None:
@@ -1447,6 +1481,27 @@ def test_provider_quota_and_credit_exhaustion_is_infrastructure_invalid(detail: 
         usage={},
     )
     assert _provider_exhaustion_error(result) is not None
+
+
+def test_error_detail_surfaces_the_reason_hidden_behind_a_success_subtype() -> None:
+    # The Claude CLI rejects a model the subscription does not cover with is_error=True,
+    # subtype="success", no errors, and the reason only in ``result``.
+    result = AgentResult(
+        provider="claude",
+        is_error=True,
+        subtype="success",
+        errors=None,
+        session_id=None,
+        result="Usage credits are required for this model.",
+        num_turns=1,
+        total_cost_usd=0.0,
+        duration_ms=1,
+        usage={},
+    )
+    assert result.error_detail() == "Usage credits are required for this model."
+    capped = replace(result, subtype="error_max_turns", result="", errors=["Reached maximum number of turns (40)"])
+    assert capped.error_detail() == "error_max_turns; Reached maximum number of turns (40)"
+    assert replace(result, result="").error_detail() == "success"
 
 
 def test_transient_rate_limit_and_acumen_caps_are_not_provider_exhaustion() -> None:
@@ -1539,7 +1594,7 @@ def test_provider_exhaustion_result_is_diagnostic_not_complete(tmp_path: Path, m
     monkeypatch.setattr("acumen.runner.sandbox", fake_sandbox)
     monkeypatch.setattr("acumen.runner.run_agent", exhausted)
     monkeypatch.setattr("acumen.runner._collect_artifacts", lambda *_args: None)
-    monkeypatch.setattr("acumen.runner.agent_version", lambda _provider: "test")
+    monkeypatch.setattr("acumen.runner.agent_version", lambda _provider, _path=None: "test")
     directory = tmp_path / "run"
     outcome = asyncio.run(
         run_once(
@@ -1595,7 +1650,7 @@ def test_connection_error_result_is_diagnostic_not_complete(tmp_path: Path, monk
     monkeypatch.setattr("acumen.runner.sandbox", fake_sandbox)
     monkeypatch.setattr("acumen.runner.run_agent", dropped)
     monkeypatch.setattr("acumen.runner._collect_artifacts", lambda *_args: None)
-    monkeypatch.setattr("acumen.runner.agent_version", lambda _provider: "test")
+    monkeypatch.setattr("acumen.runner.agent_version", lambda _provider, _path=None: "test")
     directory = tmp_path / "run"
     outcome = asyncio.run(
         run_once(
@@ -1663,7 +1718,7 @@ def _run_once_with(
     monkeypatch.setattr("acumen.runner.run_agent", fake_run_agent)
     monkeypatch.setattr("acumen.runner._collect_artifacts", collect)
     monkeypatch.setattr("acumen.runner.render_trajectory", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr("acumen.runner.agent_version", lambda _provider: "test")
+    monkeypatch.setattr("acumen.runner.agent_version", lambda _provider, _path=None: "test")
 
     model = "gpt-5.6-sol" if result.provider == "codex" else "claude-opus-5"
     run_dir = tmp_path / "run"
@@ -2560,7 +2615,7 @@ def test_benchmark_persists_unavailable_cost_as_null(tmp_path: Path, monkeypatch
     monkeypatch.setattr("acumen.runner.run_agent", fake_run_agent)
     monkeypatch.setattr("acumen.runner._collect_artifacts", collect)
     monkeypatch.setattr("acumen.runner.render_trajectory", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr("acumen.runner.agent_version", lambda _provider: "test")
+    monkeypatch.setattr("acumen.runner.agent_version", lambda _provider, _path=None: "test")
 
     run_dir = tmp_path / "run"
     outcome = asyncio.run(
@@ -2639,7 +2694,7 @@ def test_benchmark_persists_inferred_cost_and_records_the_claude_sdk_figure(
     monkeypatch.setattr("acumen.runner.sandbox", fake_sandbox)
     monkeypatch.setattr("acumen.runner.run_agent", fake_run_agent)
     monkeypatch.setattr("acumen.runner._collect_artifacts", collect)
-    monkeypatch.setattr("acumen.runner.agent_version", lambda _provider: "test")
+    monkeypatch.setattr("acumen.runner.agent_version", lambda _provider, _path=None: "test")
 
     run_dir = tmp_path / "run"
     asyncio.run(

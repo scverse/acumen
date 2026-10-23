@@ -16,6 +16,7 @@ Two jobs:
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -28,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from acumen.agents import AgentProvider
+from acumen.agents import AgentProvider, claude_cli_path
 from acumen.config import Config
 from acumen.paths import slugify
 from acumen.scrub import scrub_venv
@@ -337,7 +338,7 @@ def prepare_target(cfg: Config, cache_root: Path, *, refresh: bool = False) -> T
 
 
 def claude_cli_dir() -> Path | None:
-    """Return the directory holding the ``claude`` CLI, which the SDK shells out to."""
+    """Return the directory holding the ``claude`` CLI, which ``agents`` passes to the SDK as ``cli_path``."""
     found = shutil.which("claude")
     return Path(found).parent if found else None
 
@@ -759,29 +760,23 @@ def _default_cache_root() -> Path:
 DEFAULT_CACHE_ROOT = _default_cache_root()
 
 
-def sdk_version() -> str:
-    """Return the installed ``claude-agent-sdk`` version, for the run fingerprint.
+@functools.cache
+def agent_version(provider: AgentProvider, path: str | None = None) -> str:
+    """Return the version of the CLI that drives a run, for the run fingerprint.
 
-    ``"unknown"`` on a Codex-only install, where the SDK is deliberately absent — the
-    fingerprint records what drove the run, and nothing Claude drove can be recorded here.
+    ``path`` is the run's ``PATH``, so the binary probed is the one the agent actually
+    executes. Cached: the answer cannot change within a process, and a pass asks once per run.
+    ``"unknown"`` when the CLI is missing or will not report a version.
     """
-    from importlib.metadata import PackageNotFoundError, version
-
-    try:
-        return version("claude-agent-sdk")
-    except PackageNotFoundError:
+    cli = claude_cli_path(path) if provider == "claude" else shutil.which("codex", path=path)
+    if cli is None:
         return "unknown"
-
-
-def agent_version(provider: AgentProvider) -> str:
-    """Return the installed provider runtime version for run fingerprints."""
-    if provider == "claude":
-        return sdk_version()
     try:
-        output = _run(["codex", "--version"])
-    except EnvError:
+        output = _run([str(cli), "--version"])
+    except (EnvError, OSError):
         return "unknown"
-    return output.removeprefix("codex-cli ").strip()
+    # ``2.1.309 (Claude Code)`` / ``codex-cli 0.159.2``
+    return output.removesuffix("(Claude Code)").removeprefix("codex-cli ").strip() or "unknown"
 
 
 def python_version() -> str:

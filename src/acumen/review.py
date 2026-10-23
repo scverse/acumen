@@ -436,7 +436,7 @@ async def review_tasks(
         if result is None:
             raise ReviewError("the review agent produced no result message")
         if result.is_error:
-            raise ReviewError(f"the review agent errored: {result.subtype} {result.errors or ''}".strip())
+            raise ReviewError(f"the review agent errored: {result.error_detail()}")
 
         verdicts, warnings = _load_verdicts(staged, reviewed)
         return ReviewResult(

@@ -598,7 +598,7 @@ async def _update_one_task(
         if result is None:
             raise WikiError(f"the wiki agent for {task.id} produced no result message")
         if result.is_error:
-            raise WikiError(f"the wiki agent for {task.id} errored: {result.subtype} {result.errors or ''}".strip())
+            raise WikiError(f"the wiki agent for {task.id} errored: {result.error_detail()}")
 
         new_obs = obs_path.read_text() if obs_path.is_file() else ""
         new_hyp = hyp_path.read_text() if hyp_path.is_file() else ""

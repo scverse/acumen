@@ -66,6 +66,23 @@ def claude_sdk_available() -> bool:
     return importlib.util.find_spec("claude_agent_sdk") is not None
 
 
+def claude_cli_path(path: str | None = None) -> Path | None:
+    """Return the ``claude`` binary a Claude run executes, searching ``path`` (default ``PATH``).
+
+    The single answer :func:`_claude_options` and the run fingerprint both use: the CLI on ``PATH`` when there is one, else the copy
+    bundled in the ``claude-agent-sdk`` wheel, which the SDK falls back to on its own.
+    """
+    found = shutil.which("claude", path=path)
+    if found:
+        return Path(found)
+    try:
+        import claude_agent_sdk
+    except ImportError:
+        return None
+    bundled = Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
+    return bundled if bundled.is_file() else None
+
+
 def check_agent_cli(provider: AgentProvider) -> None:
     """Fail before target preparation when the selected backend is not installed.
 
@@ -100,6 +117,20 @@ class AgentResult:
     #: The prompt the run was given. Codex's ``exec --json`` stream never echoes it, so carrying
     #: it here is the only way the rendered transcript can show what the agent was asked to do.
     prompt: str = ""
+
+    def error_detail(self) -> str:
+        """Describe a failed run from every field the provider may have put the reason in.
+
+        The Claude CLI can report ``is_error`` with ``subtype="success"``, no ``errors``, and
+        the real reason (e.g. "Usage credits are required for this model.") only in
+        ``result``, so the subtype alone is not enough. A ``"success"`` subtype is dropped
+        whenever another field says more.
+        """
+        parts = [self.subtype, self.result, *(self.errors or [])]
+        detail = list(dict.fromkeys(str(part).strip() for part in parts if part and str(part).strip()))
+        if len(detail) > 1 and detail[0].lower() == "success":
+            detail = detail[1:]
+        return "; ".join(detail) or "unknown error"
 
 
 @dataclass(frozen=True)
@@ -306,6 +337,10 @@ def _claude_options(options: AgentOptions) -> ClaudeAgentOptions:
         # from being inherited by the run.
         settings=str(settings_path),
         system_prompt={"type": "preset", "preset": "claude_code"},
+        # The SDK prefers the CLI bundled in its wheel over the one on PATH, and that copy lags
+        # the user's install: it rejects newer models with ``unrecognized_model``. Run the
+        # user's own ``claude`` when there is one, else the bundled CLI.
+        cli_path=claude_cli_path(options.env.get("PATH")),
         hooks=_claude_hooks(options),
         stderr=options.stderr,
     )

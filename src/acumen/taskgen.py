@@ -346,7 +346,7 @@ async def generate_tasks(
         if result is None:
             raise TaskGenError("the task-generation agent produced no result message")
         if result.is_error:
-            raise TaskGenError(f"the task-generation agent errored: {result.subtype} {result.errors or ''}".strip())
+            raise TaskGenError(f"the task-generation agent errored: {result.error_detail()}")
 
         generated = _validate_generated(staged)
 
