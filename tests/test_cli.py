@@ -28,6 +28,7 @@ from acumen.pricefeed import PriceFeedError
 from acumen.prices import Rates
 from acumen.review import ReviewError, ReviewResult, ReviewVerdict
 from acumen.runner import RunOutcome
+from acumen.skills import write_meta
 from acumen.tasks import load_tasks
 
 
@@ -1627,3 +1628,181 @@ def test_check_writes_its_review_log_where_it_was_told_to(
     assert len(logs) == 1, "the review phase writes exactly one live log"
     assert set(Path.cwd().iterdir()) == before, "the command wrote into the cwd"
     capsys.readouterr()
+
+
+# --- fit --ablation ------------------------------------------------------------------
+
+
+def _fit_argv(root: Path, *extra: str) -> list[str]:
+    paths = {"--config": "config.yaml", "--tasks": "tasks.yaml", "--runs": "runs", "--skills": "skills"}
+    argv = ["fit", *extra]
+    for flag, name in paths.items():
+        argv += [flag, str(root / name)]
+    return argv + ["--wiki", str(root / "wiki"), "--out", str(root / "training.csv")]
+
+
+def _write_v1(root: Path, *, ablation: str | None) -> None:
+    directory = root / "skills" / "v1"
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_text("---\nname: target\ndescription: d\n---\nbody\n")
+    write_meta(directory, parent=None, rationale="v1", ablation=ablation)
+
+
+def test_fit_parser_ablation_flag() -> None:
+    parser = build_parser()
+    assert parser.parse_args(["fit"]).ablation is None
+    assert parser.parse_args(["fit", "--ablation", "no-optimize"]).ablation == "no-optimize"
+    assert parser.parse_args(["fit", "--ablation", "no-wiki"]).ablation == "no-wiki"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["fit", "--ablation", "no-skill"])
+
+
+def test_cmd_fit_no_optimize_runs_no_loop_and_reports_test_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], model: str, make_result
+) -> None:
+    """No-optimize benches its one v1 on test alone, never trains, and writes no training curve."""
+    import acumen.cli as cli
+
+    assert main(["init", "--dir", str(tmp_path)]) == 0
+    ran: list[bool] = []
+
+    def fake_no_optimize(args, **_kwargs) -> None:
+        ran.append(True)
+        for arm in ("noskill", "skill_v1"):
+            make_result(args.runs, RunKey(arm=arm, split="test", model=model, task_id="example_task", rep=1))
+
+    def no_loop(*_a, **_k) -> None:
+        raise AssertionError("no-optimize must never run a training epoch or the fit's test phase")
+
+    monkeypatch.setattr(cli, "_prepare_pass", lambda cfg, args: ({}, "session", None, None))
+    monkeypatch.setattr(cli, "_run_no_optimize", fake_no_optimize)
+    monkeypatch.setattr(cli, "_run_one_epoch", no_loop)
+    monkeypatch.setattr(cli, "_run_test_phase", no_loop)
+    monkeypatch.chdir(tmp_path)
+
+    rc = main(_fit_argv(tmp_path, "--ablation", "no-optimize", "--patience", "5"))
+
+    out = capsys.readouterr().out
+    assert rc == 0 and ran == [True]
+    assert "--patience ignored" in out
+    assert "no-optimize complete" in out
+    assert "test  v1" in out and "test  noskill" in out
+    assert "valid noskill" not in out and "valid v1" not in out
+    assert not (tmp_path / "training.csv").exists()
+    assert (tmp_path / "report.html").is_file()
+
+
+def test_run_no_optimize_benches_both_arms_on_test_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both benches (noskill, then v1) ask for the test split alone — never valid."""
+    import argparse
+
+    import acumen.cli as cli
+
+    requested: list[tuple[str | None, list[str]]] = []
+
+    def fake_build_arms(specs, **_kwargs):
+        requested.extend((skill, list(splits)) for skill, splits in specs)
+        return []
+
+    monkeypatch.setattr(cli, "_build_arms", fake_build_arms)
+    monkeypatch.setattr(cli, "_execute_arms", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli, "_infer_skill", lambda *_a, **_k: None)
+    args = argparse.Namespace(runs=tmp_path / "runs", skills=tmp_path / "skills")
+
+    cli._run_no_optimize(
+        args,
+        cfg=argparse.Namespace(meta_model="claude-opus-5"),
+        tasks=[],
+        target=None,
+        prices=None,
+        auth_modes={},
+        meta_auth="session",
+        mode="verbose",
+    )
+
+    assert requested == [(None, ["test"]), ("v1", ["test"])]
+
+
+def test_run_one_epoch_no_wiki_skips_the_wiki_and_passes_the_ablation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no-wiki epoch benches and improves as usual but never builds a wiki or regressions."""
+    import argparse
+    import types
+
+    import acumen.cli as cli
+
+    calls: dict[str, object] = {}
+
+    def forbidden(*_a, **_k):
+        raise AssertionError("no-wiki must not touch the wiki")
+
+    monkeypatch.setattr(cli, "_build_arms", lambda *a, **k: [])
+    monkeypatch.setattr(cli, "_execute_arms", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_run_wiki", forbidden)
+    monkeypatch.setattr(cli, "update_regressions", forbidden)
+    monkeypatch.setattr(cli, "_infer_skill", lambda *a, **k: calls.update(k))
+    args = argparse.Namespace(
+        runs=tmp_path / "runs", skills=tmp_path / "skills", wiki=tmp_path / "wiki", ablation="no-wiki"
+    )
+    monkeypatch.setattr(cli, "_valid_complete_fn", lambda *a: lambda version: False)
+
+    plan = cli._run_one_epoch(
+        args,
+        cfg=types.SimpleNamespace(meta_model="claude-opus-5"),
+        tasks=[],
+        target=None,
+        prices=None,
+        auth_modes={},
+        meta_auth="session",
+        mode="verbose",
+    )
+
+    assert plan.new_version == "v1"
+    assert calls["ablation"] == "no-wiki" and calls["parent_version"] is None
+    assert not (tmp_path / "wiki").exists()
+
+
+@pytest.mark.parametrize(
+    ("root_arm", "requested"),
+    [(None, "no-optimize"), (None, "no-wiki"), ("no-optimize", None), ("no-wiki", None), ("no-wiki", "no-optimize")],
+)
+def test_cmd_fit_refuses_a_root_holding_another_arm(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], root_arm: str | None, requested: str | None
+) -> None:
+    """One root is one run of one arm: continuing it under a different arm is refused."""
+    assert main(["init", "--dir", str(tmp_path)]) == 0
+    _write_v1(tmp_path, ablation=root_arm)
+
+    extra = ("--ablation", requested) if requested else ()
+    assert main(_fit_argv(tmp_path, *extra)) == 2
+    assert "one root is one run of one arm" in capsys.readouterr().err
+
+
+def test_cmd_fit_no_wiki_resumes_its_own_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A no-wiki root accepts `--ablation no-wiki` again and runs the normal fit path."""
+    import acumen.cli as cli
+
+    assert main(["init", "--dir", str(tmp_path)]) == 0
+    _write_v1(tmp_path, ablation="no-wiki")
+    prepared: list[bool] = []
+
+    def stop_after_guard(cfg, args):
+        prepared.append(True)
+        raise PriceFeedError("stop here")
+
+    monkeypatch.setattr(cli, "_prepare_pass", stop_after_guard)
+
+    assert main(_fit_argv(tmp_path, "--ablation", "no-wiki")) == 2
+    assert prepared == [True], "the guard let the matching arm through to the fit"
+
+
+def test_epoch_refuses_an_ablation_root(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["init", "--dir", str(tmp_path)]) == 0
+    _write_v1(tmp_path, ablation="no-wiki")
+
+    argv = _fit_argv(tmp_path)
+    argv[0] = "epoch"
+    argv = argv[: argv.index("--out")]  # epoch writes no training curve
+    assert main(argv) == 2
+    assert "one root is one run of one arm" in capsys.readouterr().err

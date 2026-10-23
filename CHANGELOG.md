@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning][].
 
 ## [0.0.2dev]
 
+### Added
+
+- Add `acumen fit --ablation {no-optimize,no-wiki}` for running ablation arms. `no-optimize`
+  writes v1 once from the package source alone and benches it and the baseline on `test` only,
+  since there is nothing to select or stop on. `no-wiki` runs the full fit with the improver denied
+  the wiki. A report whose run tree has no `valid` split now draws its figures and significance
+  tests on `test` instead.
+
 ### Changed
 
 - Install shipped skills for `--agent codex` into `~/.agents/skills`, where Codex discovers user

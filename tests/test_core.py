@@ -75,7 +75,7 @@ from acumen.env import (
 )
 from acumen.grade import INVALID_REASONS, grade_answer, grade_run
 from acumen.guard import SYSTEM_ROOTS, find_escape
-from acumen.improve import find_valid_access
+from acumen.improve import ImproveError, find_valid_access, improve_skill
 from acumen.logs import LiveLog
 from acumen.paths import RunKey, arm_name, is_complete, parse_run_dir, run_dir
 from acumen.pricefeed import PriceFeedError, diff_rates, fetch_table, parse_anthropic, parse_openai
@@ -91,7 +91,7 @@ from acumen.prices import (
     resolve_cost,
 )
 from acumen.procs import label_env, reap, supported, survivors
-from acumen.prompts import feedback_block, improve_prompt, wiki_prompt
+from acumen.prompts import _SKILL_CRAFT, feedback_block, improve_prompt, wiki_prompt
 from acumen.report import (
     _ALL_MODELS_COLOR,
     ReportError,
@@ -117,6 +117,7 @@ from acumen.report import (
     loaded_only_rates,
     metrics_figure,
     render_report,
+    reported_split,
     resolve_palette,
     skill_tests,
     tradeoff_figure,
@@ -3029,6 +3030,19 @@ def test_write_meta_persists_feedback_but_omits_it_when_absent(tmp_path: Path) -
     assert read_meta(directory).feedback == "emphasise pseudobulk"
 
 
+def test_write_meta_records_an_ablation_but_omits_it_for_a_normal_fit(tmp_path: Path) -> None:
+    directory = tmp_path / "v1"
+    directory.mkdir()
+    (directory / "SKILL.md").write_text("---\nname: target\ndescription: d\n---\nbody\n")
+
+    write_meta(directory, parent=None, rationale="created v1")
+    assert "ablation" not in (directory / "meta.json").read_text()
+    assert read_meta(directory).ablation is None
+
+    write_meta(directory, parent=None, rationale="created v1", ablation="no-optimize")
+    assert read_meta(directory).ablation == "no-optimize"
+
+
 # --- improve evidence ------------------------------------------------------------------
 
 
@@ -3256,6 +3270,56 @@ def test_improve_prompt_create_mode_writes_frontmatter_from_scratch() -> None:
     assert "FIRST agent skill" in prompt
     assert "name: p" in prompt
     assert "noskill" in prompt
+
+
+def _create_prompt(**overrides) -> str:
+    kwargs = {
+        "package": "p",
+        "version": "1",
+        "src": Path("/s"),
+        "python": Path("/py"),
+        "skill_dir": Path("/skill"),
+        "wiki_dir": Path("/wiki"),
+        "transcripts_dir": Path("/tr"),
+        "rationale_path": Path("/r.md"),
+        "skill_name": "p",
+        "new_version": "v1",
+        "parent_version": None,
+    }
+    return improve_prompt(**(kwargs | overrides))
+
+
+def test_improve_prompt_no_optimize_drops_the_evidence_and_nothing_else() -> None:
+    """The no-optimize ablation must differ from create mode only in what the agent reads."""
+    create = _create_prompt()
+    source_only = _create_prompt(ablation="no-optimize")
+
+    assert "/wiki" not in source_only and "/tr" not in source_only
+    assert "wiki" not in source_only.lower() and "transcript" not in source_only.lower()
+    # Same task framing, frontmatter rules, craft and closing — the controlled part of the ablation.
+    for shared in ("FIRST agent skill", "name: p", "/s", "/py", "When you are done"):
+        assert shared in create and shared in source_only
+    assert _SKILL_CRAFT in create and _SKILL_CRAFT in source_only
+
+
+def test_improve_prompt_no_optimize_refuses_a_parent() -> None:
+    with pytest.raises(ValueError, match="first skill"):
+        _create_prompt(ablation="no-optimize", parent_version="v1")
+
+
+@pytest.mark.parametrize("parent", [None, "v1"])
+def test_improve_prompt_no_wiki_withholds_every_wiki_artifact(parent: str | None) -> None:
+    """No-wiki keeps the craft and the loaded/body rule but names no wiki artifact at all."""
+    no_wiki = _create_prompt(parent_version=parent, ablation="no-wiki")
+
+    for absent in ("wiki", "discriminators", "REGRESSIONS", "[gap:", "hypothesis", "observations"):
+        assert absent not in no_wiki, absent
+    assert "/tr" in no_wiki and "INDEX.md" in no_wiki
+    assert _SKILL_CRAFT in no_wiki
+    for shared in ("`p`", "/s", "/py", "BLOCKED", "When you are done"):
+        assert shared in no_wiki
+    if parent is not None:
+        assert "The skill never loaded" in no_wiki and "EDIT THESE FILES IN PLACE" in no_wiki
 
 
 def test_wiki_prompt_demands_brevity_and_the_entry_format() -> None:
@@ -4783,6 +4847,31 @@ def test_render_report_shows_the_test_section_only_with_test_runs(
     assert 'href="#test"' in rendered  # the TOC entry
 
 
+def test_render_report_falls_back_to_test_when_no_valid_split_was_benched(
+    model: str, make_result, tmp_path: Path
+) -> None:
+    """A test-only tree (the no-optimize ablation) reports on test: the overview and the significance
+    tests use it, and neither the training curve nor a duplicate held-out section is drawn."""
+    runs = tmp_path / "runs"
+    for arm in ("noskill", "skill_v1"):
+        make_result(runs, RunKey(arm=arm, split="test", model=model, task_id="example_task", rep=1))
+    df = load_results(runs)
+
+    assert reported_split(df) == "test"
+    rendered = render_report(df, tmp_path)
+    assert "figures show the test split" in rendered
+    assert "Per-run means over the test split" in rendered
+    assert 'id="dominance"' in rendered and "No skill arm to compare" not in rendered
+    assert 'id="training"' not in rendered
+    assert 'id="test"' not in rendered
+
+
+def test_reported_split_is_valid_whenever_valid_runs_exist(runs_root: Path, model: str, make_result) -> None:
+    """A fit's tree keeps reporting valid even once its held-out test runs land."""
+    make_result(runs_root, RunKey(arm="noskill", split="test", model=model, task_id="example_task", rep=1))
+    assert reported_split(load_results(runs_root)) == "valid"
+
+
 def test_first_best_keeps_the_first_on_a_tie_and_skips_nan() -> None:
     """One rule picks the best version for both fit and the report: strict max, first on a tie."""
     assert first_best([("v1", 0.5), ("v2", 0.7), ("v3", 0.7)]) == "v2"
@@ -5675,3 +5764,94 @@ def test_write_training_csv_roundtrips_header_and_per_model_columns(tmp_path: Pa
         for prefix in ("train_success", "valid_success", "train_cost", "valid_cost"):
             assert f"{prefix}__{model}" in header
     assert lines[1].startswith("1,v1,noskill,")
+
+
+# --- fit ablations ----------------------------------------------------------------------
+
+
+def test_improve_skill_no_optimize_creates_v1_without_train_runs_or_wiki(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ablation needs no evidence: no train runs, nothing staged but the filtered source."""
+    seen: dict[str, object] = {}
+
+    async def fake_run_agent(prompt, *, options, on_event=None):
+        seen["prompt"] = prompt
+        seen["staged"] = sorted(path.name for path in options.cwd.iterdir())
+        staging = options.cwd / "v1"
+        (staging / "SKILL.md").write_text("---\nname: target-demo\ndescription: d\n---\nbody\n")
+        (options.cwd / "rationale.md").write_text("from the source")
+        return _agent_result()
+
+    monkeypatch.setattr("acumen.improve.run_agent", fake_run_agent)
+    monkeypatch.setattr("acumen.improve.build_agent_env", lambda **_kwargs: {})
+    skills = tmp_path / "skills"
+    common = {
+        "cfg": parse_config({"repo": "/tmp/target-demo", "meta_model": "claude-opus-5"}),
+        "target": _review_target(tmp_path),
+        "skills_root": skills,
+        "runs_root": tmp_path / "runs",  # absent: no train runs at all
+        "wiki_root": tmp_path / "wiki",
+        "tasks": [_task("bulk")],
+        "prices": _REVIEW_PRICES,
+        "ablation": "no-optimize",
+    }
+
+    result = asyncio.run(improve_skill(**common))
+
+    assert result.skill.version == "v1" and result.parent is None
+    assert seen["staged"] == ["v1"], "only the staging dir — no wiki, no transcripts"
+    assert "wiki" not in str(seen["prompt"]).lower()
+    assert read_meta(skills / "v1").ablation == "no-optimize"
+    # One root = one ablation: a second source-only v1 is refused rather than written as v2.
+    with pytest.raises(ImproveError, match="no version yet"):
+        asyncio.run(improve_skill(**common))
+
+
+def test_improve_skill_no_wiki_edits_the_parent_from_raw_runs_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_result
+) -> None:
+    """No-wiki improves the parent in place from its train runs + INDEX.md, never the wiki."""
+    seen: dict[str, object] = {}
+
+    async def fake_run_agent(prompt, *, options, on_event=None):
+        seen["prompt"] = prompt
+        seen["staged"] = sorted(path.name for path in options.cwd.iterdir())
+        seen["parent_body"] = (options.cwd / "v2" / "SKILL.md").read_text()
+        seen["index"] = (options.cwd / "transcripts" / "bulk" / "INDEX.md").read_text()
+        seen["deny"] = options.deny_paths
+        (options.cwd / "rationale.md").write_text("from the runs")
+        return _agent_result()
+
+    monkeypatch.setattr("acumen.improve.run_agent", fake_run_agent)
+    monkeypatch.setattr("acumen.improve.build_agent_env", lambda **_kwargs: {})
+    skills = tmp_path / "skills"
+    (skills / "v1").mkdir(parents=True)
+    (skills / "v1" / "SKILL.md").write_text("---\nname: target-demo\ndescription: d\n---\nparent body\n")
+    write_meta(skills / "v1", parent=None, rationale="v1", ablation="no-wiki")
+    runs = tmp_path / "runs"
+    make_result(runs, RunKey(arm="skill_v1", split="train", model="m", task_id="bulk", rep=1), success=False)
+    wiki = tmp_path / "wiki" / "bulk"
+    wiki.mkdir(parents=True)
+    (wiki / "observations.md").write_text("- [v1][m]: must never reach the no-wiki improver\n")
+
+    result = asyncio.run(
+        improve_skill(
+            cfg=parse_config({"repo": "/tmp/target-demo", "meta_model": "claude-opus-5"}),
+            target=_review_target(tmp_path),
+            skills_root=skills,
+            runs_root=runs,
+            wiki_root=tmp_path / "wiki",
+            tasks=[_task("bulk")],
+            prices=_REVIEW_PRICES,
+            ablation="no-wiki",
+        )
+    )
+
+    assert result.skill.version == "v2" and result.parent == "v1"
+    assert seen["staged"] == ["transcripts", "v2"], "no wiki/ staged"
+    assert "parent body" in seen["parent_body"], "the parent skill is pre-filled to edit"
+    assert "**FAIL**" in seen["index"], "outcome labels reach the improver"
+    assert "knowledge wiki" not in str(seen["prompt"]).lower()
+    assert (tmp_path / "wiki").resolve() in seen["deny"]
+    assert read_meta(skills / "v2").ablation == "no-wiki"

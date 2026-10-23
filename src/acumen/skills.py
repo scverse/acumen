@@ -45,6 +45,8 @@ class SkillMeta:
     hash: str
     #: Maintainer ``--feedback`` that shaped this version, or ``None`` if none was given.
     feedback: str | None = None
+    #: Which ablation produced this version (e.g. ``"no-wiki"``), or ``None`` for a normal fit.
+    ablation: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the ``meta.json`` payload.
@@ -60,6 +62,8 @@ class SkillMeta:
         }
         if self.feedback:
             payload["feedback"] = self.feedback
+        if self.ablation:
+            payload["ablation"] = self.ablation
         return payload
 
 
@@ -275,16 +279,25 @@ def read_meta(directory: Path) -> SkillMeta | None:
         rationale=str(raw.get("rationale", "")),
         hash=str(raw.get("hash", "")),
         feedback=str(feedback) if feedback else None,
+        ablation=str(raw["ablation"]) if raw.get("ablation") else None,
     )
 
 
-def write_meta(directory: Path, *, parent: str | None, rationale: str, feedback: str | None = None) -> SkillMeta:
+def write_meta(
+    directory: Path,
+    *,
+    parent: str | None,
+    rationale: str,
+    feedback: str | None = None,
+    ablation: str | None = None,
+) -> SkillMeta:
     """Write ``meta.json`` for a skill version, hashing its content as it stands.
 
     Call this only once the skill's content files are final — the hash is computed here.
 
     ``feedback`` records the maintainer ``--feedback`` that shaped this version, for the
-    report's skill-versions provenance; it is omitted from ``meta.json`` when empty.
+    report's skill-versions provenance; it is omitted from ``meta.json`` when empty. ``ablation``
+    marks a version produced by an ablation run rather than a normal fit, likewise omitted.
     """
     text = (feedback or "").strip()
     meta = SkillMeta(
@@ -293,6 +306,7 @@ def write_meta(directory: Path, *, parent: str | None, rationale: str, feedback:
         rationale=rationale.strip(),
         hash=skill_hash(directory),
         feedback=text or None,
+        ablation=ablation,
     )
     (directory / META_FILE).write_text(json.dumps(meta.to_dict(), indent=2) + "\n")
     return meta
