@@ -91,7 +91,7 @@ from acumen.prices import (
     resolve_cost,
 )
 from acumen.procs import label_env, reap, supported, survivors
-from acumen.prompts import _SKILL_CRAFT, feedback_block, improve_prompt, wiki_prompt
+from acumen.prompts import _SKILL_CRAFT, feedback_block, improve_prompt, ship_prompt, wiki_prompt
 from acumen.report import (
     _ALL_MODELS_COLOR,
     ReportError,
@@ -3375,6 +3375,42 @@ def test_improve_prompt_no_wiki_withholds_every_wiki_artifact(parent: str | None
         assert shared in no_wiki
     if parent is not None:
         assert "The skill never loaded" in no_wiki and "EDIT THESE FILES IN PLACE" in no_wiki
+
+
+def _ship(reship: bool) -> str:
+    return ship_prompt(
+        package="p",
+        skill_name="p",
+        version="v2",
+        checkout=Path("/co"),
+        skill_src=Path("/staged"),
+        mode="github",
+        reship=reship,
+    )
+
+
+def test_ship_prompt_fresh_install_has_no_reship_section() -> None:
+    """A first ship keeps the no-tests scope and says nothing about replacing an installer."""
+    prompt = _ship(reship=False)
+
+    assert "Do NOT write any NEW test file" in prompt
+    assert "Replacing an existing installer" not in prompt
+
+
+def test_ship_prompt_reship_updates_and_runs_the_old_installers_tests() -> None:
+    """Replacing an installer must not orphan tests written against the old one's API."""
+    prompt = _ship(reship=True)
+
+    assert "# Replacing an existing installer" in prompt
+    # The scope limit points at the carve-out instead of forbidding the test edits.
+    assert "Updating EXISTING tests" in prompt
+    assert "NEVER edit the template to make an old test pass" in prompt
+    # The tests run in a fresh editable venv, not the scrubbed non-editable target env.
+    assert "FRESH editable venv" in prompt
+    assert "/staged" in prompt.split("# Replacing an existing installer")[1]
+    # It sits before delivery, so it is done before the PR, and the report covers it.
+    assert prompt.index("# Replacing an existing installer") < prompt.index("# Deliver")
+    assert "the result of running those tests" in prompt
 
 
 def test_wiki_prompt_demands_brevity_and_the_entry_format() -> None:

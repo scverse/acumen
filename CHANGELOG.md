@@ -53,6 +53,11 @@ and this project adheres to [Semantic Versioning][].
   this model."), so `ship`, `review`, `improve`, `wiki` and `tasks` errored with a bare
   "errored: success". `ship` on session auth also suggests `--auth api` or `--model` when the
   subscription can't run the model, and bench classes this case as provider exhaustion.
+- `acumen ship --force` over a package that already ships an installer no longer orphans the old
+  installer's tests. The ship prompt now tells the agent to find everything that used the old
+  `_skills/install.py` (tests, docs, CI), port it to the template's API, and run those tests in a
+  fresh editable venv before delivering. A re-ship of decoupler had left
+  `tests/test_install_skills.py` importing names the new template no longer defines.
 
 ## [0.0.1dev]
 
