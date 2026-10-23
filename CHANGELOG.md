@@ -58,6 +58,11 @@ and this project adheres to [Semantic Versioning][].
   `_skills/install.py` (tests, docs, CI), port it to the template's API, and run those tests in a
   fresh editable venv before delivering. A re-ship of decoupler had left
   `tests/test_install_skills.py` importing names the new template no longer defines.
+- `acumen ship` runs its agent with the operator's real `HOME` again, so `gh`, git and ssh find
+  their credentials and the pull request can be pushed and opened. Since the Codex support landed,
+  `HOME` and `XDG_*` pointed at a throwaway directory, and the agent stopped at
+  `could not read Username for 'https://github.com'`. Only the agent CLI's config dir is still
+  isolated.
 
 ## [0.0.1dev]
 
