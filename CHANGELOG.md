@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning][].
 
 ### Changed
 
+- Install shipped skills for `--agent codex` into `~/.agents/skills`, where Codex discovers user
+  skills, instead of `~/.codex/skills` (`$CODEX_HOME/skills`), which current Codex no longer
+  reads. `--agent codex` and `--agent agents` now resolve to the same directory.
 - Test success rate and cost separately in the report's significance tables. Each version gets a
   one-sided p per axis, with a Benjamini–Hochberg FDR q computed within each axis across the
   versions. This replaces the joint dominance p (the max of the two) and its Holm correction, so

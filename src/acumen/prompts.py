@@ -758,7 +758,7 @@ verbatim — no per-framework conversion.
 Frameworks (``--agent``):
 
 - ``claude``          -> ``~/.claude/skills`` (honours ``CLAUDE_CONFIG_DIR``)
-- ``codex``           -> ``~/.codex/skills`` (honours ``CODEX_HOME``)
+- ``codex``           -> ``~/.agents/skills`` (where Codex discovers user skills; same as ``agents``)
 - ``agents``          -> ``~/.agents/skills``
 - ``claude-science``  -> the active org's skills dir, resolved from
   ``~/.claude-science/active-org.json``
@@ -784,7 +784,7 @@ SKILL_NAME = "__SKILL_NAME__"
 #: Framework -> (env var that overrides the config root, default config root). The skills
 #: directory is ``<root>/skills``. ``claude-science`` is resolved separately.
 _AGENT_ROOTS = {
-    "codex": ("CODEX_HOME", "~/.codex"),
+    "codex": (None, "~/.agents"),
     "claude": ("CLAUDE_CONFIG_DIR", "~/.claude"),
     "agents": (None, "~/.agents"),
 }
