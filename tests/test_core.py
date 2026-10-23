@@ -3654,6 +3654,35 @@ def test_session_mode_neutralizes_the_api_key_under_the_sdk_env_merge(
         assert merged["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-token"
 
 
+def test_ship_env_keeps_the_real_home_for_gh_and_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shipper must see the operator's ``HOME``/``XDG_*``, or ``gh`` and git lose their login.
+
+    Only the agent CLI's own config dir is isolated; a throwaway ``HOME`` hid
+    ``~/.config/gh/hosts.yml`` and ``~/.gitconfig`` and the push failed for want of a username.
+    """
+    _clear_auth(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token")
+    monkeypatch.setenv("HOME", str(tmp_path / "real-home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "real-home" / ".config"))
+    target = Target(
+        source="/pkg",
+        ref="main",
+        src_dir=tmp_path / "src",
+        venv_dir=tmp_path / "venv",
+        commit="abc123",
+        pkg_name="pkg",
+        pkg_version="1.0",
+    )
+    config_dir = tmp_path / "cfg"
+    config_dir.mkdir()
+
+    env = _ship_env(target, "api", config_dir=config_dir)
+
+    assert env["HOME"] == str(tmp_path / "real-home")
+    assert env["XDG_CONFIG_HOME"] == str(tmp_path / "real-home" / ".config")
+    assert env["CLAUDE_CONFIG_DIR"] == str(config_dir)
+
+
 def test_scrubbed_env_blanks_ambient_vars_under_the_sdk_env_merge(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
