@@ -35,6 +35,9 @@ from acumen.env import AuthMode, Target, build_agent_env
 from acumen.procs import label_env, reap
 from acumen.skills import Skill, content_files
 
+#: Claude Code discovers project skills only under ``.claude/skills``; Codex uses the shared
+#: ``.agents/skills``. Once Claude Code reads ``.agents/skills`` too, unify both here (and in the
+#: skill-load check in :func:`acumen.runner._skill_fired`).
 SKILLS_SUBDIRS = {
     "claude": Path(".claude") / "skills",
     "codex": Path(".agents") / "skills",
