@@ -53,6 +53,11 @@ and this project adheres to [Semantic Versioning][].
   this model."), so `ship`, `review`, `improve`, `wiki` and `tasks` errored with a bare
   "errored: success". `ship` on session auth also suggests `--auth api` or `--model` when the
   subscription can't run the model, and bench classes this case as provider exhaustion.
+- `acumen ship` runs its agent with the operator's real `HOME` again, so `gh`, git and ssh find
+  their credentials and the pull request can be pushed and opened. Since the Codex support landed,
+  `HOME` and `XDG_*` pointed at a throwaway directory, and the agent stopped at
+  `could not read Username for 'https://github.com'`. Only the agent CLI's config dir is still
+  isolated.
 
 ## [0.0.1dev]
 

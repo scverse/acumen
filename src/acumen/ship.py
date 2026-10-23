@@ -15,8 +15,9 @@ stages for it is a clean copy of the skill content (``SKILL.md`` + ``references/
 
 The shipper retains the user's git/``gh`` environment and public network because it builds,
 installs, pushes, and opens a PR, but it still runs inside the same fail-closed filesystem
-sandbox as every other agent. Its writable roots are the target checkout and a temporary home;
-the staged skill and target environment are read-only. The **build-verify** the agent performs
+sandbox as every other agent. Its writable roots are the target checkout, the operator's real
+``HOME`` (where ``gh``, git and ssh keep their credentials) and a run-local agent config dir; the
+staged skill and target environment are read-only. The **build-verify** the agent performs
 remains the correctness gate:
 build the wheel in a fresh venv, install it, run the entry point, confirm ``SKILL.md`` ships from
 the installed location — the only thing that catches a mis-wired backend shipping a wheel with no
@@ -138,10 +139,9 @@ def _ship_env(
     auth_mode: AuthMode,
     provider: AgentProvider = "claude",
     *,
-    home: Path | None = None,
     config_dir: Path | None = None,
 ) -> dict[str, str]:
-    """Build the shipper environment, optionally rooted in a temporary home.
+    """Build the shipper environment, optionally with an isolated agent config dir.
 
     Unlike the benchmark and meta-agents this is NOT scrubbed — the agent needs real
     git/``gh`` credentials, network, and ``uv``. The target venv's ``bin`` is prepended so
@@ -160,6 +160,12 @@ def _ship_env(
     ``os.environ`` (``{**os.environ, **options.env}``), so a key we merely drop from the dict
     falls back through from the inherited environment and the run bills the wrong credential. An
     explicit empty value overrides the inherited one, which the CLI reads as unset.
+
+    ``config_dir`` isolates only the agent CLI's own config (``CLAUDE_CONFIG_DIR`` /
+    ``CODEX_HOME``, seeded with the login token), so the operator's CLAUDE.md, skills and
+    memories stay out of the run. ``HOME`` and ``XDG_*`` are left alone: ``gh`` reads its login
+    from ``$XDG_CONFIG_HOME/gh``, git its identity and credential helper from ``~/.gitconfig``,
+    and ssh its keys from ``~/.ssh``, and a pull request needs all three.
     """
     env = dict(os.environ)
     if provider == "claude":
@@ -181,13 +187,6 @@ def _ship_env(
     if existing:
         parts.append(existing)
     env["PATH"] = os.pathsep.join(parts)
-    if home is not None:
-        env.update(
-            HOME=str(home),
-            TMPDIR=str(home / "tmp"),
-            XDG_CONFIG_HOME=str(home / ".config"),
-            XDG_CACHE_HOME=str(home / ".cache"),
-        )
     if config_dir is not None:
         env["CLAUDE_CONFIG_DIR"] = str(config_dir)
         env["CODEX_HOME"] = str(config_dir)
@@ -259,10 +258,8 @@ async def ship_skill(
         selected_model = model or cfg.meta_model
         table = prices if prices is not None else PriceTable(overrides=cfg.prices)
         provider = provider_for_model(selected_model)
-        home = holder / "home"
-        config_dir = home / (".claude" if provider == "claude" else ".codex")
-        for path in (home, config_dir, home / "tmp", home / ".config", home / ".cache"):
-            path.mkdir(parents=True, exist_ok=True)
+        config_dir = holder / (".claude" if provider == "claude" else ".codex")
+        config_dir.mkdir(parents=True, exist_ok=True)
 
         prompt = ship_prompt(
             package=target.pkg_name,
@@ -279,7 +276,7 @@ async def ship_skill(
             # holder so the teardown below can find whatever the agent leaves running; the
             # holder path appears nowhere else in this agent's environment.
             env=label_env(
-                _ship_env(target, auth_mode, provider, home=home, config_dir=config_dir),
+                _ship_env(target, auth_mode, provider, config_dir=config_dir),
                 holder,
             ),
             model=selected_model,
