@@ -94,41 +94,15 @@ root holds one run of one arm, so use a fresh root for each run. Compare arms on
 
 ## Preloaded data
 
-Every run starts in an empty directory, so a task whose first step is to download a dataset
-spends that download in every run, and fails whenever the download does. To avoid this, build
-the data once and have runs start with it:
+To spare every run from downloading its dataset, write one script per dataset in `prepare/` that
+writes into its working directory, then run `acumen prepare` to build them into `cache/`. Tasks
+name what they start with, and each entry is linked read-only into the run's working directory:
 
-1. Write a script per dataset in `prepare/`, e.g. `prepare/pbmc3k.py`. It runs in the target venv
-   with the data cache as its working directory (also passed as `argv[1]` and
-   `$ACUMEN_DATA_CACHE`). It may write any files or directories there.
-2. Run `acumen prepare`. It runs the scripts in filename order into `cache/` and skips any that
-   already succeeded and have not changed since (`--force` re-runs them, `--only NAME` picks
-   one). It then leaves the cache read-only.
-3. Name the entries a task starts with in `tasks.yaml`:
-
-   ```yaml
-   - id: ulm-pbmc
-     data: [collectri.csv]   # every split gets these...
-     train:
-       prompt: ...
-       answer: ...
-       data: [pbmc3k.h5ad]   # ...plus any a split adds
-     test:
-       prompt: ...
-       answer: ...
-       data: [covid5k.h5ad]
-   ```
-
-   List an entry at the task level when every split uses it, and at the split level when only
-   that split does. Naming one entry at both levels is an error.
-
-Each entry is symlinked into the run's working directory at the same relative path. The harness
-preamble adds one neutral line listing the names, without saying what they are for, so the agent
-looks there before downloading. Both arms get the same links and the same line, and
-`acumen check` runs each reproducer with the links too. `bench`, `epoch` and `fit` refuse to start if an entry is missing.
-`--data-cache` points them at a cache other than `cache/`. A task that tests the download itself
-simply names no data. To delete the cache, first make it writable again with
-`chmod -R u+w cache`.
+```yaml
+- id: ulm-pbmc
+  data: [collectri.csv]   # every split
+  train: {prompt: ..., answer: ..., data: [pbmc3k.h5ad]}   # added for this split
+```
 
 ## Shipping
 
