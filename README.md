@@ -92,18 +92,6 @@ root holds one run of one arm, so use a fresh root for each run. Compare arms on
   the parent skill, the parent's raw train runs (each task with an `INDEX.md` of pass/fail and
   load per run), and the source.
 
-## Preloaded data
-
-To spare every run from downloading its dataset, write one script per dataset in `prepare/` that
-writes into its working directory, then run `acumen prepare` to build them into `cache/`. Tasks
-name what they start with, and each entry is linked read-only into the run's working directory:
-
-```yaml
-- id: ulm-pbmc
-  data: [collectri.csv]   # every split
-  train: {prompt: ..., answer: ..., data: [pbmc3k.h5ad]}   # added for this split
-```
-
 ## Shipping
 
 `acumen ship` gives your package a `<dist>-install-skills` command so its users can install the
