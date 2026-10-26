@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TextIO
 
 from acumen.agents import AgentOptions, AgentResult, provider_for_model, run_agent
+from acumen.data import DATA_DIRNAME, data_sources
 from acumen.env import AuthMode, Target, agent_version
 from acumen.grade import INVALID_REASONS, Grade, Reason, grade_run
 from acumen.paths import (
@@ -373,6 +374,7 @@ async def run_once(
     stderr: Callable[[str], None] | None = None,
     env_passthrough: Sequence[str] | None = None,
     prices: PriceTable | None = None,
+    data_root: Path = Path(DATA_DIRNAME),
 ) -> RunOutcome:
     """Execute one benchmark run end to end and write its ``result.json``.
 
@@ -411,6 +413,9 @@ async def run_once(
     env_passthrough
         Extra environment variable names to carry into the sandbox on top of the built-in
         allowlist (the operator's ``config.env_passthrough``).
+    data_root
+        The prepared data cache the split's ``data:`` entries are linked from. Only read when
+        the split names any.
 
     Returns
     -------
@@ -424,6 +429,7 @@ async def run_once(
         )
     run_dir.mkdir(parents=True, exist_ok=True)
     split = task.split(key.split)
+    data = data_sources(task.data_for(key.split), data_root)
 
     provider = provider_for_model(model)
     result: AgentResult | None = None
@@ -437,19 +443,23 @@ async def run_once(
         skill=skill,
         env_passthrough=env_passthrough,
         provider=provider,
+        data=data,
     ) as box:
         prompt = benchmark_prompt(
             split.prompt,
             sandbox=box.root,
             python=target.python,
             package=target.pkg_name,
+            data=[name for name, _ in data],
         )
         options = _build_options(
             box=box,
             model=model,
             max_turns=max_turns,
             max_usd=max_usd,
-            read_dirs=(target.venv_dir,),
+            # Each linked entry's real path, not the whole cache: a split reads only the data it
+            # names, so a train run cannot wander into the inputs of a held-out split.
+            read_dirs=(target.venv_dir, *(source for _, source in data)),
             prices=prices,
             stderr=stderr,
             # Deny fetching the target's own source (git clone, gh, curl, git+ install): the

@@ -37,6 +37,7 @@ acumen init                 # scaffold config.yaml + tasks.yaml
 # edit config.yaml: point `repo` at your package (a GitHub URL or local path)
 
 acumen tasks                # mine the package for real tasks + ground-truth reproducers
+acumen prepare              # optional: build the datasets tasks start from into cache/
 acumen check                # verify each task's answer reproduces before you spend
 
 acumen fit                  # optimize the skill epoch by epoch until validation plateaus, then test

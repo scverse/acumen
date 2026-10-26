@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning][].
   since there is nothing to select or stop on. `no-wiki` runs the full fit with the improver denied
   the wiki. A report whose run tree has no `valid` split now draws its figures and significance
   tests on `test` instead.
+- Add `acumen prepare`, which builds datasets once into `cache/` from `prepare/<name>.py`
+  scripts, and a `data:` key in `tasks.yaml` that links those entries into each run.
 
 ### Changed
 

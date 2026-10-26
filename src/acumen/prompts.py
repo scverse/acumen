@@ -8,6 +8,7 @@ answer-format noise is the highest risk in the project.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 
@@ -65,7 +66,7 @@ not read by a human.
   download, fetch, or `pip install`/`pip download` its source repository or source
   distribution (for example from GitHub or PyPI).
 - You have web access for general reference. Use it if it helps.
-
+{data}
 # What you must leave behind
 
 - `answer.md` — your final answer, and NOTHING else. This file is REQUIRED. It is
@@ -1429,7 +1430,20 @@ def ship_prompt(
     )
 
 
-def benchmark_prompt(task_prompt: str, *, sandbox: Path, python: Path, package: str) -> str:
+def _data_line(data: Sequence[str]) -> str:
+    """The preamble bullet naming the prepared data linked into the sandbox, or nothing.
+
+    Neutral on purpose: it says the files are there, not what they are for, so the task still
+    tests whether the agent connects "the bundled pbmc3k dataset" to ``pbmc3k.h5ad``. Without it
+    an agent goes straight to the package's download call and never looks.
+    """
+    if not data:
+        return ""
+    listed = ", ".join(f"`{name}`" for name in data)
+    return f"- Already in your working directory (read-only; leave them in place): {listed}.\n"
+
+
+def benchmark_prompt(task_prompt: str, *, sandbox: Path, python: Path, package: str, data: Sequence[str] = ()) -> str:
     """Build the full prompt for one benchmark run.
 
     Parameters
@@ -1442,9 +1456,14 @@ def benchmark_prompt(task_prompt: str, *, sandbox: Path, python: Path, package: 
         The interpreter with the target package installed.
     package
         The target package name, named so the agent doesn't hunt for it.
+    data
+        The split's prepared data-cache entries, linked into ``sandbox``. Empty leaves the
+        preamble exactly as it is without them.
 
     Returns
     -------
     The harness preamble with the task embedded.
     """
-    return HARNESS_PREAMBLE.format(sandbox=sandbox, python=python, package=package, task=task_prompt.strip())
+    return HARNESS_PREAMBLE.format(
+        sandbox=sandbox, python=python, package=package, data=_data_line(data), task=task_prompt.strip()
+    )

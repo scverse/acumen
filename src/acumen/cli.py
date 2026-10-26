@@ -33,12 +33,16 @@ from acumen.check import (
     summarize_checks,
 )
 from acumen.config import AUTH_CHOICES, Config, ConfigError, load_config
+from acumen.data import DATA_DIRNAME, DataError, all_splits, missing_data, require_data
 from acumen.env import DEFAULT_CACHE_ROOT, AuthMode, EnvError, prepare_target, resolve_auth_mode
 from acumen.epoch import EpochPlan, completed_epochs, resolve_epoch
 from acumen.grade import INVALID_REASONS
 from acumen.improve import ABLATIONS, ImproveError, improve_skill
 from acumen.logs import LiveLog
 from acumen.paths import BENCH_SPLITS, SPLITS, Split, arm_name
+from acumen.prepare import CACHE_ENV, PREPARE_DIRNAME, PrepareError, PrepareResult, prepare_scripts, run_prepare
+from acumen.prepare import DEFAULT_TIMEOUT as PREPARE_TIMEOUT
+from acumen.prepare import FAILED as PREPARE_FAILED
 from acumen.pricefeed import (
     PRICE_SOURCES,
     PRICE_TIER,
@@ -86,6 +90,7 @@ def _add_bench_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     parser.add_argument("--keep-sandboxes", action="store_true", help="leave run sandboxes on disk")
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
+    _add_data_cache_arg(parser)
     parser.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree")
     parser.add_argument(
         "--dry-run",
@@ -93,6 +98,20 @@ def _add_bench_args(parser: argparse.ArgumentParser) -> None:
         help="print the matrix and exit without running agents, over the same arms the real pass would cover",
     )
     _add_auth_arg(parser, default=None)
+
+
+def _add_data_cache_arg(parser: argparse.ArgumentParser) -> None:
+    """Add ``--data-cache``: where ``acumen prepare`` builds the data that tasks name under ``data:``.
+
+    Not ``--cache``, which every command already uses for the target checkout and venv.
+    """
+    parser.add_argument(
+        "--data-cache",
+        type=Path,
+        default=Path(DATA_DIRNAME),
+        dest="data_cache",
+        help=f"prepared data cache that tasks' 'data:' entries are linked from (default: {DATA_DIRNAME}/)",
+    )
 
 
 def _add_log_args(parser: argparse.ArgumentParser) -> None:
@@ -693,6 +712,7 @@ def _execute_arms(
     auth_modes: dict[AgentProvider, AuthMode],
     prices: PriceTable,
     keep_sandboxes: bool,
+    data_root: Path,
     progress: _Progress | _PhaseBar | None = None,
     quiet: bool = False,
 ) -> list[RunOutcome]:
@@ -729,6 +749,7 @@ def _execute_arms(
                 on_done=progress.on_done,
                 env_passthrough=cfg.env_passthrough,
                 prices=prices,
+                data_root=data_root,
             )
         )
         collected.extend(outcomes)
@@ -769,6 +790,7 @@ def _run_test_phase(
     auth_modes: dict[AgentProvider, AuthMode],
     prices: PriceTable,
     mode: str,
+    data_root: Path,
 ) -> None:
     """Bench the held-out test split once, on the best kept version and the baseline.
 
@@ -797,6 +819,7 @@ def _run_test_phase(
         auth_modes=auth_modes,
         prices=prices,
         keep_sandboxes=False,
+        data_root=data_root,
         progress=bar,
         quiet=mode != "verbose",
     )
@@ -829,6 +852,8 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     todo = [item for arm in arms for item in arm.todo]
     if not todo:
         return 0
+    # Before auth, prices or the target: a run without its inputs is not worth preparing for.
+    require_data(((item.task, item.key.split) for item in todo), args.data_cache)
 
     # One resolved mode per provider in the matrix, so a mixed pass bills each side correctly.
     auth_modes = _resolve_bench_auth({item.model for item in todo}, _effective_auth(args.auth, cfg.bench_auth))
@@ -862,6 +887,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
             auth_modes=auth_modes,
             prices=prices,
             keep_sandboxes=args.keep_sandboxes,
+            data_root=args.data_cache,
             progress=progress,
         )
     except BenchmarkInvalidError as err:
@@ -1196,6 +1222,7 @@ def _run_one_epoch(
             auth_modes=auth_modes,
             prices=prices,
             keep_sandboxes=False,
+            data_root=args.data_cache,
             progress=bar,
             quiet=mode != "verbose",
         )
@@ -1346,6 +1373,7 @@ def _run_no_optimize(
             keep_sandboxes=False,
             progress=bar,
             quiet=mode != "verbose",
+            data_root=args.data_cache,
         )
         if bar is not None:
             bar.finish()
@@ -1446,6 +1474,7 @@ def _cmd_epoch(args: argparse.Namespace) -> int:
         cfg = replace(cfg, n_replicates=args.replicates)
     if args.model:
         cfg = replace(cfg, meta_model=args.model)
+    require_data(all_splits(tasks, BENCH_SPLITS), args.data_cache)
 
     try:
         auth_modes, meta_auth, prices, target = _prepare_pass(cfg, args)
@@ -1499,6 +1528,9 @@ def _cmd_fit(args: argparse.Namespace) -> int:
         cfg = replace(cfg, meta_model=args.model)
     if _refuse_mismatched_root(args.skills, args.ablation):
         return 2
+    # Every split, not just this pass's: a fit ends on the held-out test bench, and finding its
+    # data missing there would waste every epoch before it.
+    require_data(all_splits(tasks), args.data_cache)
     if args.ablation == "no-optimize":
         return _cmd_no_optimize(args, cfg, tasks)
     if args.ablation:
@@ -1625,6 +1657,7 @@ def _cmd_fit(args: argparse.Namespace) -> int:
                 auth_modes=auth_modes,
                 prices=prices,
                 mode=mode,
+                data_root=args.data_cache,
             )
         except BenchmarkInvalidError as err:
             print(f"\nerror: {err}", file=sys.stderr)
@@ -1738,6 +1771,24 @@ def _clip(text: str, width: int) -> str:
     return flat if len(flat) <= width else flat[: width - 1] + "…"
 
 
+#: How many lines of a failed script's traceback print under its row.
+_ERROR_LINES = 15
+
+
+def _error_line(tail: str | None) -> str:
+    """The line that names the error: a traceback's last line is the exception itself."""
+    lines = [line for line in (tail or "").splitlines() if line.strip()]
+    return lines[-1].strip() if lines else ""
+
+
+def _error_block(result: CheckResult) -> str:
+    """The end of a failed script's error output, indented to sit under its row."""
+    if result.status != "error" or not result.error_tail:
+        return ""
+    lines = result.error_tail.splitlines()[-_ERROR_LINES:]
+    return "".join(f"\n      {line}" for line in lines) + "\n"
+
+
 def _check_detail(result: CheckResult, timeout: float) -> str:
     """The rightmost column: what this status means for this split, in one line."""
     if result.status == "ok":
@@ -1750,7 +1801,7 @@ def _check_detail(result: CheckResult, timeout: float) -> str:
         return "ran clean but wrote no answer.md"
     if result.status == "error":
         code = f"exit {result.returncode}" if result.returncode is not None else "failed to start"
-        return f"{code}: {_clip(result.error_tail or '', 60)}"
+        return f"{code}: {_clip(_error_line(result.error_tail), 80)}"
     if result.status == "timeout":
         return f"killed after {_fmt_secs(timeout)}"
     if result.status == "missing":
@@ -1879,7 +1930,8 @@ def _cmd_check(args: argparse.Namespace) -> int:
     # Rows print as each reproducer finishes, since a real analysis takes minutes and a silent
     # terminal for half an hour is not progress.
     def on_done(result: CheckResult) -> None:
-        print(_check_row(result, task_width=task_width, timeout=args.timeout), flush=True)
+        # One print, so a traceback stays in one piece when several reproducers finish at once.
+        print(_check_row(result, task_width=task_width, timeout=args.timeout) + _error_block(result), flush=True)
 
     work_root = Path(tempfile.mkdtemp(prefix="acumen-check-")) if args.keep else None
     results = check_tasks(
@@ -1891,6 +1943,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
         jobs=args.jobs,
         work_root=work_root,
         on_done=on_done,
+        data_root=args.data_cache,
     )
     if work_root is not None:
         print(f"\nworking directories kept at {work_root}")
@@ -2036,6 +2089,58 @@ def _cmd_check(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     return 1
+
+
+def _prepare_row(result: PrepareResult, *, width: int) -> str:
+    """One status line of ``acumen prepare``, with the error tail indented below a failure."""
+    took = "" if result.status == "skipped" else f"  {_fmt_secs(result.seconds)}"
+    line = f"  {result.name:<{width}}  {result.status}{took}"
+    if result.status == "skipped":
+        line += "  (already prepared; --force to re-run)"
+    if result.error_tail:
+        line += "\n" + "\n".join(f"      {row}" for row in result.error_tail.splitlines())
+    return line
+
+
+def _cmd_prepare(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    tasks = load_tasks(args.tasks) if args.tasks.exists() else None
+    scripts = prepare_scripts(args.scripts, args.only)
+    if not scripts:
+        print(f"no prepare scripts in {args.scripts}/ — add one <name>.py per dataset to build")
+        return 0
+
+    print(f"preparing target {cfg.repo}@{cfg.ref} ...", flush=True)
+    target = prepare_target(cfg, args.cache, refresh=args.refresh_target)
+    print(f"target ready: {target.fingerprint} @ {target.commit[:8]} (venv {target.venv_dir})")
+    print(f"data cache:   {args.data_cache}")
+    print(f"\nrunning {len(scripts)} prepare script(s), up to {args.jobs} at a time:")
+
+    width = max(len(script.stem) for script in scripts)
+    results = run_prepare(
+        scripts,
+        python=target.python,
+        cache=args.data_cache,
+        force=args.force,
+        timeout=args.timeout,
+        jobs=args.jobs,
+        on_done=lambda result: print(_prepare_row(result, width=width), flush=True),
+    )
+    failed = [result for result in results if result.status in PREPARE_FAILED]
+
+    if tasks is not None:
+        missing = missing_data(all_splits(tasks), args.data_cache)
+        if missing:
+            print(
+                f"\nwarning: tasks name data no script produced: {', '.join(missing)} "
+                f"(expected under {args.data_cache}/)",
+                file=sys.stderr,
+            )
+    if failed:
+        print(f"\n{len(failed)} of {len(results)} prepare script(s) failed", file=sys.stderr)
+        return 1
+    print(f"\ndata cache ready at {args.data_cache.resolve()} (read-only)")
+    return 0
 
 
 def _cmd_ship(args: argparse.Namespace) -> int:
@@ -2285,6 +2390,7 @@ def build_parser() -> argparse.ArgumentParser:
     epoch.add_argument("--max-concurrency", type=int, help="override config max_concurrency")
     epoch.add_argument("--replicates", type=int, help="override config n_replicates")
     epoch.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
+    _add_data_cache_arg(epoch)
     epoch.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     epoch.add_argument("--verbose", action="store_true", help="use the full scrolling logs instead of progress bars")
     _add_role_auth_args(epoch)
@@ -2334,6 +2440,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--max-concurrency", type=int, help="override config max_concurrency")
     fit.add_argument("--replicates", type=int, help="override config n_replicates")
     fit.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
+    _add_data_cache_arg(fit)
     fit.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     fit.add_argument("--verbose", action="store_true", help="use the full scrolling logs instead of progress bars")
     _add_role_auth_args(fit)
@@ -2391,6 +2498,7 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--keep", action="store_true", help="leave each script's working directory on disk")
     check.add_argument("--json", type=Path, default=None, help="also write the results and summary here as JSON")
     check.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
+    _add_data_cache_arg(check)
     check.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     check.add_argument(
         "--no-review",
@@ -2403,6 +2511,39 @@ def build_parser() -> argparse.ArgumentParser:
     _add_auth_arg(check)
     _add_log_args(check)
     check.set_defaults(func=_cmd_check)
+
+    prepare = sub.add_parser(
+        "prepare",
+        help="build the data cache that tasks start from, by running the prepare/ scripts",
+        description=f"Run every {PREPARE_DIRNAME}/<name>.py in the target venv with the data cache "
+        f"({DATA_DIRNAME}/ by default) as its working directory and argv[1] (also ${CACHE_ENV}). Each "
+        "script writes whatever files or directories it likes there; a task then names the ones its "
+        "runs should start with under 'data:' in tasks.yaml (task level, or per split to replace "
+        "it), and each run finds them symlinked into its working directory. A script that already "
+        "succeeded is skipped until it changes or --force is given. The cache is left read-only.",
+    )
+    prepare.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
+    prepare.add_argument(
+        "--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml (to report missing data)"
+    )
+    prepare.add_argument(
+        "--scripts", type=Path, default=Path(PREPARE_DIRNAME), help="directory holding the prepare scripts"
+    )
+    _add_data_cache_arg(prepare)
+    prepare.add_argument(
+        "--only", metavar="NAME", action="append", help="run only this script, by filename stem (repeatable)"
+    )
+    prepare.add_argument("--force", action="store_true", help="re-run scripts that already succeeded")
+    prepare.add_argument(
+        "--timeout",
+        type=float,
+        default=PREPARE_TIMEOUT,
+        help=f"seconds one script may run (default: {PREPARE_TIMEOUT:g})",
+    )
+    prepare.add_argument("--jobs", type=int, default=1, help="scripts to run at once (default: 1, in filename order)")
+    prepare.add_argument("--cache", type=Path, default=DEFAULT_CACHE_ROOT, help="target cache root")
+    prepare.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
+    prepare.set_defaults(func=_cmd_prepare)
 
     ship = sub.add_parser("ship", help="make a benchmarked skill installable into the target package")
     ship.add_argument(
@@ -2460,6 +2601,8 @@ def main(argv: list[str] | None = None) -> int:
         return int(args.func(args))
     except (
         CheckError,
+        DataError,
+        PrepareError,
         ConfigError,
         TaskError,
         EnvError,
