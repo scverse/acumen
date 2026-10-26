@@ -70,7 +70,7 @@ code to answer sets `needs_script: false` and is reported as `skipped`.
 ```
 
 The second is agentic: reproducing the answer proves the code and the answer agree, not that the
-*prompt* asks for what they produce. One agent reads every split's prompt, recorded answer and
+_prompt_ asks for what they produce. One agent reads every split's prompt, recorded answer and
 reproducer together and returns `ok` or `mismatch`, with one line naming the contradiction and one
 naming the fix. `--no-review` skips it.
 
