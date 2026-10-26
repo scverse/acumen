@@ -9,6 +9,7 @@ single token is spent.
 from __future__ import annotations
 
 import csv
+import dataclasses
 import json
 import os
 import sys
@@ -20,7 +21,8 @@ import pytest
 
 from acumen.agents import AgentError
 from acumen.bench import BenchmarkInvalidError
-from acumen.cli import _agent_prices, _print_run_summary, _Progress, build_parser, main
+from acumen.check import _TAIL_CHARS, CheckResult, _tail
+from acumen.cli import _agent_prices, _check_row, _error_block, _print_run_summary, _Progress, build_parser, main
 from acumen.config import load_config
 from acumen.env import Target
 from acumen.paths import RunKey
@@ -1810,3 +1812,38 @@ def test_epoch_refuses_an_ablation_root(tmp_path: Path, capsys: pytest.CaptureFi
     argv = argv[: argv.index("--out")]  # epoch writes no training curve
     assert main(argv) == 2
     assert "one root is one run of one arm" in capsys.readouterr().err
+
+
+def test_check_row_names_the_exception_and_prints_the_traceback_under_it() -> None:
+    tail = (
+        "Traceback (most recent call last):\n"
+        '  File "bulk-train.py", line 21, in <module>\n'
+        "    net = pd.read_csv('collectri.csv')\n"
+        "          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+        "FileNotFoundError: [Errno 2] No such file or directory: 'collectri.csv'"
+    )
+    result = CheckResult(
+        task_id="bulk",
+        split="train",
+        status="error",
+        script=Path("tasks/bulk-train.py"),
+        answer=None,
+        expected="A",
+        seconds=1.0,
+        returncode=1,
+        error_tail=tail,
+    )
+
+    row = _check_row(result, task_width=4, timeout=60)
+    assert row.endswith("exit 1: FileNotFoundError: [Errno 2] No such file or directory: 'collectri.csv'")
+    block = _error_block(result)
+    assert block.splitlines()[1:] == [f"      {line}" for line in tail.splitlines()]
+    assert _error_block(dataclasses.replace(result, status="ok")) == ""
+
+
+def test_error_tail_starts_on_a_line_boundary() -> None:
+    text = "x" * 50 + "\n" + "\n".join(f"line {i}" for i in range(_TAIL_CHARS // 4))
+    tail = _tail(text)
+    assert tail is not None and len(tail) <= _TAIL_CHARS
+    assert tail.splitlines()[0].startswith("line ")
+    assert tail.endswith(f"line {_TAIL_CHARS // 4 - 1}")

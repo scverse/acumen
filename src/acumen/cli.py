@@ -1771,6 +1771,24 @@ def _clip(text: str, width: int) -> str:
     return flat if len(flat) <= width else flat[: width - 1] + "…"
 
 
+#: How many lines of a failed script's traceback print under its row.
+_ERROR_LINES = 15
+
+
+def _error_line(tail: str | None) -> str:
+    """The line that names the error: a traceback's last line is the exception itself."""
+    lines = [line for line in (tail or "").splitlines() if line.strip()]
+    return lines[-1].strip() if lines else ""
+
+
+def _error_block(result: CheckResult) -> str:
+    """The end of a failed script's error output, indented to sit under its row."""
+    if result.status != "error" or not result.error_tail:
+        return ""
+    lines = result.error_tail.splitlines()[-_ERROR_LINES:]
+    return "".join(f"\n      {line}" for line in lines) + "\n"
+
+
 def _check_detail(result: CheckResult, timeout: float) -> str:
     """The rightmost column: what this status means for this split, in one line."""
     if result.status == "ok":
@@ -1783,7 +1801,7 @@ def _check_detail(result: CheckResult, timeout: float) -> str:
         return "ran clean but wrote no answer.md"
     if result.status == "error":
         code = f"exit {result.returncode}" if result.returncode is not None else "failed to start"
-        return f"{code}: {_clip(result.error_tail or '', 60)}"
+        return f"{code}: {_clip(_error_line(result.error_tail), 80)}"
     if result.status == "timeout":
         return f"killed after {_fmt_secs(timeout)}"
     if result.status == "missing":
@@ -1912,7 +1930,8 @@ def _cmd_check(args: argparse.Namespace) -> int:
     # Rows print as each reproducer finishes, since a real analysis takes minutes and a silent
     # terminal for half an hour is not progress.
     def on_done(result: CheckResult) -> None:
-        print(_check_row(result, task_width=task_width, timeout=args.timeout), flush=True)
+        # One print, so a traceback stays in one piece when several reproducers finish at once.
+        print(_check_row(result, task_width=task_width, timeout=args.timeout) + _error_block(result), flush=True)
 
     work_root = Path(tempfile.mkdtemp(prefix="acumen-check-")) if args.keep else None
     results = check_tasks(

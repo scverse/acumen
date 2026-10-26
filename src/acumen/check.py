@@ -77,8 +77,8 @@ _GRADE_STATUS: dict[str, CheckStatus] = {
     "no_answer_file": "no_answer",
 }
 
-#: How much of a failed script's error output to keep for its report line.
-_TAIL_CHARS = 400
+#: How much of a failed script's error output to keep: enough for the end of a traceback.
+_TAIL_CHARS = 2000
 
 #: Seconds the one-off import probe may take.
 _PROBE_TIMEOUT = 120
@@ -248,7 +248,11 @@ def _pct(part: int, whole: int) -> float | None:
 def _tail(text: str | None) -> str | None:
     """Return the end of a script's output, or ``None`` if it produced none."""
     stripped = (text or "").strip()
-    return stripped[-_TAIL_CHARS:].strip() or None
+    if len(stripped) > _TAIL_CHARS:
+        # Start at a line boundary, so the tail does not open on half a traceback frame.
+        cut = stripped[-_TAIL_CHARS:]
+        stripped = cut.partition("\n")[2] or cut
+    return stripped.strip() or None
 
 
 def script_env(bin_dir: Path) -> dict[str, str]:
