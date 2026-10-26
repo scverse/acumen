@@ -21,8 +21,7 @@ and this project adheres to [Semantic Versioning][].
   prepare` runs the `prepare/<name>.py` scripts in the target venv into `cache/`, skips the ones
   that already succeeded and have not changed, and leaves the cache read-only.
   - A task names the entries (files or directories) its runs start with under `data:` in
-    `tasks.yaml`. A split can name its own `data:` list, which replaces the task's list for that
-    split.
+    `tasks.yaml`. A split's own `data:` list adds to the task's list for that split.
   - Each entry is symlinked into the run's sandbox, the same in every arm, and into each
     `acumen check` reproducer's working directory. The agent may read only the entries its split
     names. The harness preamble adds one neutral line listing them, and tasks without data get

@@ -108,13 +108,19 @@ the data once and have runs start with it:
 
    ```yaml
    - id: ulm-pbmc
-     data: [pbmc3k.h5ad, collectri.csv]   # every split gets these...
-     train: {prompt: ..., answer: ...}
+     data: [collectri.csv]   # every split gets these...
+     train:
+       prompt: ...
+       answer: ...
+       data: [pbmc3k.h5ad]   # ...plus any a split adds
      test:
        prompt: ...
        answer: ...
-       data: [covid5k.h5ad, collectri.csv] # ...unless a split names its own list
+       data: [covid5k.h5ad]
    ```
+
+   List an entry at the task level when every split uses it, and at the split level when only
+   that split does. Naming one entry at both levels is an error.
 
 Each entry is symlinked into the run's working directory at the same relative path. The harness
 preamble adds one neutral line listing the names, without saying what they are for, so the agent

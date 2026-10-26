@@ -21,9 +21,9 @@ class TaskSplit:
 
     prompt: str
     answer: str
-    #: Entries of the prepared data cache to link into this split's sandbox. ``None`` inherits
-    #: the task-level list; any list, even an empty one, replaces it.
-    data: tuple[str, ...] | None = None
+    #: Entries of the prepared data cache to link into this split's sandbox, on top of the
+    #: task-level list.
+    data: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -43,7 +43,7 @@ class Task:
     #: Task-level, not per-split: every split of one task is the same analysis.
     needs_script: bool = True
     #: Entries of the prepared data cache (see :mod:`acumen.data`) linked into every split's
-    #: sandbox, unless the split names its own.
+    #: sandbox, alongside any the split adds.
     data: tuple[str, ...] = ()
 
     def split(self, split: Split) -> TaskSplit:
@@ -54,9 +54,8 @@ class Task:
         return halves[split]
 
     def data_for(self, split: Split) -> tuple[str, ...]:
-        """Return the data-cache entries one split's runs see: its own list, else the task's."""
-        own = self.split(split).data
-        return self.data if own is None else own
+        """Return the data-cache entries one split's runs see: the task's, then its own."""
+        return self.data + self.split(split).data
 
 
 def _require_str(value: Any, where: str) -> str:
@@ -69,11 +68,15 @@ def _require_str(value: Any, where: str) -> str:
 _RESERVED_DATA = frozenset({ANSWER_FILE, SCRIPT_FILE})
 
 
-def _parse_data(raw: Any, where: str) -> tuple[str, ...]:
-    """Validate a ``data:`` list of relative paths into the prepared data cache."""
+def _parse_data(raw: Any, where: str, inherited: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """Validate a ``data:`` list of relative paths into the prepared data cache.
+
+    ``inherited`` is the task-level list a split's entries are added to, checked against them so
+    the split's runs never get one entry twice or one inside another.
+    """
     if not isinstance(raw, list):
         raise TaskError(f"{where} must be a list of paths inside the data cache, got {type(raw).__name__}")
-    entries: list[str] = []
+    entries: list[str] = list(inherited)
     for i, item in enumerate(raw):
         entry = _require_str(item, f"{where}[{i}]").strip().rstrip("/")
         parts = entry.split("/")
@@ -84,7 +87,8 @@ def _parse_data(raw: Any, where: str) -> tuple[str, ...]:
         if parts[0].startswith(".") or entry in _RESERVED_DATA:
             raise TaskError(f"{where}[{i}] {item!r} would collide with a file the run writes in its sandbox")
         if entry in entries:
-            raise TaskError(f"{where} lists {entry!r} twice")
+            also = " (the task's data: already has it)" if entry in inherited else ""
+            raise TaskError(f"{where} lists {entry!r} twice{also}")
         # Each entry becomes one symlink, so one inside another would be linked *through* the
         # outer link, into the shared cache itself. Name the directory alone.
         nested = next(
@@ -94,10 +98,10 @@ def _parse_data(raw: Any, where: str) -> tuple[str, ...]:
         if nested is not None:
             raise TaskError(f"{where} lists {entry!r} and {nested!r}, one inside the other — name only the outer one")
         entries.append(entry)
-    return tuple(entries)
+    return tuple(entries[len(inherited) :])
 
 
-def _parse_split(raw: Any, where: str) -> TaskSplit:
+def _parse_split(raw: Any, where: str, inherited: tuple[str, ...] = ()) -> TaskSplit:
     if not isinstance(raw, dict):
         raise TaskError(f"{where} must be a mapping with 'prompt' and 'answer', got {type(raw).__name__}")
     unknown = set(raw) - {"prompt", "answer", "data"}
@@ -109,7 +113,7 @@ def _parse_split(raw: Any, where: str) -> TaskSplit:
     return TaskSplit(
         prompt=_require_str(raw["prompt"], f"{where}.prompt"),
         answer=_require_str(raw["answer"], f"{where}.answer"),
-        data=_parse_data(raw["data"], f"{where}.data") if "data" in raw else None,
+        data=_parse_data(raw["data"], f"{where}.data", inherited) if "data" in raw else (),
     )
 
 
@@ -145,16 +149,17 @@ def _parse_task(raw: Any, index: int) -> Task:
     # did not write, and this key decides whether a missing reproducer is a gap or expected.
     if not isinstance(needs_script, bool):
         raise TaskError(f"{where}.needs_script must be true or false, got {needs_script!r}")
+    data = _parse_data(raw["data"], f"{where}.data") if "data" in raw else ()
     return Task(
         id=task_id,
-        train=_parse_split(raw["train"], f"{where}.train"),
-        valid=_parse_split(raw["valid"], f"{where}.valid"),
-        test=_parse_split(raw["test"], f"{where}.test"),
+        train=_parse_split(raw["train"], f"{where}.train", data),
+        valid=_parse_split(raw["valid"], f"{where}.valid", data),
+        test=_parse_split(raw["test"], f"{where}.test", data),
         max_turns=max_turns,
         max_usd=max_usd,
         model=model,
         needs_script=needs_script,
-        data=_parse_data(raw["data"], f"{where}.data") if "data" in raw else (),
+        data=data,
     )
 
 

@@ -75,12 +75,12 @@ def _writable(path: Path) -> bool:
 # --- tasks.yaml ------------------------------------------------------------------------
 
 
-def test_split_data_inherits_the_task_list_unless_it_names_its_own() -> None:
+def test_split_data_adds_to_the_task_list() -> None:
     (task,) = parse_tasks(
         {
             "tasks": [
                 _entry(
-                    data=["pbmc.h5ad", "atlas/"],
+                    data=["net.csv", "atlas/"],
                     test={"prompt": "p", "answer": "c", "data": ["covid.h5ad"]},
                     valid={"prompt": "p", "answer": "b", "data": []},
                 )
@@ -88,10 +88,21 @@ def test_split_data_inherits_the_task_list_unless_it_names_its_own() -> None:
         }
     )
 
-    assert task.data_for("train") == ("pbmc.h5ad", "atlas")  # inherited; a trailing slash is dropped
-    assert task.data_for("test") == ("covid.h5ad",)  # replaced, not merged
-    assert task.data_for("valid") == ()  # an empty list opts the split out
+    assert task.data_for("train") == ("net.csv", "atlas")  # inherited; a trailing slash is dropped
+    assert task.data_for("test") == ("net.csv", "atlas", "covid.h5ad")  # merged, task's first
+    assert task.data_for("valid") == ("net.csv", "atlas")  # an empty list adds nothing
     assert parse_tasks({"tasks": [_entry()]})[0].data_for("train") == ()
+
+
+@pytest.mark.parametrize(
+    ("split_data", "match"),
+    [(["net.csv"], "twice \\(the task's data: already has it\\)"), (["atlas/cells.txt"], "one inside the other")],
+)
+def test_split_data_may_not_repeat_the_task_list(split_data, match: str) -> None:
+    with pytest.raises(TaskError, match=match):
+        parse_tasks(
+            {"tasks": [_entry(data=["net.csv", "atlas"], train={"prompt": "p", "answer": "a", "data": split_data})]}
+        )
 
 
 @pytest.mark.parametrize(
@@ -240,11 +251,14 @@ def test_run_once_links_the_split_data_and_allows_reading_it(tmp_path: Path, mon
         )
     )
 
-    assert seen["data"] == [("atlas", (cache / "atlas").resolve())]
-    assert seen["read_dirs"] == (target.venv_dir, (cache / "atlas").resolve())
-    # The split's own list is named (not the task's), and only as being there.
-    assert "- Already in your working directory (read-only; leave them in place): `atlas`.\n" in seen["prompt"]
-    assert "pbmc.h5ad" not in seen["prompt"]
+    pbmc, atlas = (cache / "pbmc.h5ad").resolve(), (cache / "atlas").resolve()
+    assert seen["data"] == [("pbmc.h5ad", pbmc), ("atlas", atlas)]
+    assert seen["read_dirs"] == (target.venv_dir, pbmc, atlas)
+    # The task's entries and the split's own are named together, and only as being there.
+    assert (
+        "- Already in your working directory (read-only; leave them in place): `pbmc.h5ad`, `atlas`.\n"
+        in seen["prompt"]
+    )
 
 
 def test_a_prompt_without_data_is_unchanged() -> None:

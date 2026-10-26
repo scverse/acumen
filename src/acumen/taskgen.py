@@ -100,7 +100,7 @@ def _task_to_dict(task: Task) -> dict[str, object]:
     for name in ("train", "valid", "test"):
         half = task.split(name)
         split_entry: dict[str, object] = {"prompt": half.prompt, "answer": half.answer}
-        if half.data is not None:
+        if half.data:
             split_entry["data"] = list(half.data)
         entry[name] = split_entry
     if task.max_turns is not None:
