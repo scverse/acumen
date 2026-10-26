@@ -191,7 +191,7 @@ and this project adheres to [Semantic Versioning][].
 
 - Close a Claude run's session when the run is over, and record the result that run produced. A
   terminal result was not the end of a session: a Bash command the agent left running keeps the
-  CLI alive, and when it finishes the CLI queues the notification as a *new* prompt and re-enters
+  CLI alive, and when it finishes the CLI queues the notification as a _new_ prompt and re-enters
   the model. The old loop kept assigning whatever result arrived last, so one measured run of
   1117 seconds over 41 turns that hit its cap was recorded as a 4-second, two-turn success, with
   inferred cost 96% low and the answer graded `no_answer_file`. The re-entry was also past the

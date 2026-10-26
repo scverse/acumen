@@ -24,11 +24,11 @@ no-skill baseline, so the gains carry over to new inputs instead of memorizing a
 Python 3.12+ is required. Install the backend you actually run — both are optional, and either
 alone is a complete install:
 
-| you run | install | also needs |
-|---|---|---|
-| Claude only | `pip install acumen[claude]` | an Anthropic key or a `claude` login |
-| Codex only | `pip install acumen` | the `codex` CLI on `PATH`, plus a Codex login or key |
-| both | `pip install acumen[all]` | both of the above |
+| you run     | install                      | also needs                                           |
+| ----------- | ---------------------------- | ---------------------------------------------------- |
+| Claude only | `pip install acumen[claude]` | an Anthropic key or a `claude` login                 |
+| Codex only  | `pip install acumen`         | the `codex` CLI on `PATH`, plus a Codex login or key |
+| both        | `pip install acumen[all]`    | both of the above                                    |
 
 ## Quickstart
 
@@ -49,11 +49,11 @@ acumen ship --skill v2      # ship the best version into your package
 
 Every task in `tasks.yaml` comes in three splits:
 
-| split | used for |
-|---|---|
-| `train` | the only results the improver sees; the skill is learned from these |
+| split   | used for                                                              |
+| ------- | --------------------------------------------------------------------- |
+| `train` | the only results the improver sees; the skill is learned from these   |
 | `valid` | scores each new version; picks the best one and drives early stopping |
-| `test` | benched once, at the end, for the best version only |
+| `test`  | benched once, at the end, for the best version only                   |
 
 `acumen fit` repeats one **epoch** at a time. An epoch has four steps:
 
