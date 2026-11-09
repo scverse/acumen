@@ -2,104 +2,87 @@
   <img src="docs/_static/images/banner.svg" alt="acumen" width="360">
 </p>
 
-<p align="center"><b>Build, benchmark, and optimize agentic skills for your Python package.</b></p>
+<!-- docs-start -->
+
+<p align="center"><b>Build, benchmark, and optimize agentic skills for Python packages.</b></p>
 
 [![Tests][badge-tests]][tests]
 [![Documentation][badge-docs]][documentation]
 
+[![Issues][badge-issues]][issue tracker]
+[![Coverage][badge-coverage]][codecoverage]
+[![Stars][badge-stars]](https://github.com/scverse/acumen/stargazers)
+
+[![PyPI][badge-pypi]][pypi]
+[![Downloads month][badge-mdown]][down]
+[![Downloads all][badge-adown]][down]
+
 [badge-tests]: https://img.shields.io/github/actions/workflow/status/scverse/acumen/test.yaml?branch=main
-[badge-docs]: https://app.readthedocs.org/projects/acumen/badge/
+[badge-docs]: https://img.shields.io/readthedocs/acumen
+[badge-issues]: https://img.shields.io/github/issues/scverse/acumen
+[badge-coverage]: https://codecov.io/gh/scverse/acumen/branch/main/graph/badge.svg
+[badge-pypi]: https://img.shields.io/pypi/v/acumen.svg
+[badge-mdown]: https://static.pepy.tech/badge/acumen/month
+[badge-adown]: https://static.pepy.tech/badge/acumen
+[badge-stars]: https://img.shields.io/github/stars/scverse/acumen?style=flat&logo=github&color=yellow
 
-An agentic skill is a short, plain-text set of instructions that helps a coding agent use a tool
-correctly. Most Python packages ship none — maintainers have no easy way to write one, or to tell
-whether it actually helps. acumen closes that loop: point it at a package and a few tasks, and
-`acumen fit` optimizes a skill the way you would train a model. Each **epoch** benchmarks the
-current skill, distils what went right and wrong into a knowledge wiki, rewrites the skill, and
-scores the new version on a validation split. Training stops once validation stops improving, and
-the best version gets one final score on an untouched test split. Every score sits next to a
-no-skill baseline, so the gains carry over to new inputs instead of memorizing answers.
+`acumen` is a python package to build, benchmark and optimize agentic skills for any Python package.
+An agentic skill is a short set of plain-text instructions that helps a coding agent use a package correctly.
+Given a package and a few tasks, `acumen` trains a skill in the same way one would train a model.
+In every epoch, coding agents attempt the training tasks, and `acumen` learns from the errors they make to rewrite the skill.
+Each new version is scored on held-out validation tasks, training stops once validation no longer improves, and the best version is evaluated one last time on an untouched test set.
+With the final skill, coding agents are more successful at solving tasks that require using the Python package than they are without the skill.
 
-## Installation
+[//]: # "numfocus-fiscal-sponsor-attribution"
 
-Python 3.12+ is required. Install the backend you actually run — both are optional, and either
-alone is a complete install:
+`acumen` is part of the scverse® project ([website](https://scverse.org), [governance](https://scverse.org/about/roles)) and is fiscally sponsored by [NumFOCUS](https://numfocus.org/).
+If you like scverse® and want to support our mission, please consider making a tax-deductible [donation](https://numfocus.org/donate-to-scverse) to help the project pay for developer time, professional services, travel, workshops, and a variety of other needs.
 
-| you run     | install                      | also needs                                           |
-| ----------- | ---------------------------- | ---------------------------------------------------- |
-| Claude only | `pip install acumen[claude]` | an Anthropic key or a `claude` login                 |
-| Codex only  | `pip install acumen`         | the `codex` CLI on `PATH`, plus a Codex login or key |
-| both        | `pip install acumen[all]`    | both of the above                                    |
-
-## Quickstart
-
-```bash
-acumen init                 # scaffold config.yaml + tasks.yaml
-# edit config.yaml: point `repo` at your package (a GitHub URL or local path)
-
-acumen tasks                # mine the package for real tasks + ground-truth reproducers
-acumen prepare              # optional: build the datasets tasks start from into cache/
-acumen check                # verify each task's answer reproduces before you spend
-
-acumen fit                  # optimize the skill epoch by epoch until validation plateaus, then test
-                            # the best version; writes training.csv and report.html
-
-acumen ship --skill v2      # ship the best version into your package
-```
-
-## The optimization loop
-
-Every task in `tasks.yaml` comes in three splits:
-
-| split   | used for                                                              |
-| ------- | --------------------------------------------------------------------- |
-| `train` | the only results the improver sees; the skill is learned from these   |
-| `valid` | scores each new version; picks the best one and drives early stopping |
-| `test`  | benched once, at the end, for the best version only                   |
-
-`acumen fit` repeats one **epoch** at a time. An epoch has four steps:
-
-1. **bench** the current skill on `train` (the first epoch benches the no-skill baseline instead,
-   and also on `valid`, so there is a baseline to compare against);
-2. **wiki**: record what happened per task in `wiki/`;
-3. **improve**: create or rewrite the skill from that wiki, giving `skills/v1`, `v2`, …;
-4. **validate**: bench the new version on `valid`.
-
-After each epoch, fit prints a progress line and updates the training curve in `training.csv`. It
-stops when any of these happens:
-
-- `--patience` epochs (default 2) pass without validation mean success rising by more than
-  `--min-delta` (default 0.05, i.e. 5 percentage points) over the last improvement;
-- `--max-epochs` is reached (default 10);
-- validation reaches 100%.
-
-Pass `--epochs N` to run exactly N epochs with no early stopping. Afterwards fit benches the best
-version on `test` and writes `report.html`. Run `acumen report` to rebuild the report later.
-
-Fit can be resumed. Re-run `acumen fit` and it continues from the last finished epoch.
-`--epochs`/`--max-epochs` set the total number of epochs, not how many more to run.
-
-Each stage also runs on its own: `acumen bench`, `acumen wiki`, and `acumen improve`.
-
-`acumen fit --ablation` runs one of two ablation arms in place of a normal fit. One project
-root holds one run of one arm, so use a fresh root for each run. Compare arms on `test`.
-
-- `--ablation no-optimize` asks what happens without optimization. It writes `v1` once from the
-  package source alone, with no train benches, no wiki and no loop. It then benches that `v1` and
-  the no-skill baseline on `test` only. There is nothing to select or stop on, so `valid` is
-  skipped and the report shows the `test` split.
-- `--ablation no-wiki` asks what happens without the wiki. It runs the full fit loop, but the
-  improver never gets a wiki: no observations, hypotheses, discriminators or regressions. It gets
-  the parent skill, the parent's raw train runs (each task with an `INDEX.md` of pass/fail and
-  load per run), and the source.
-
-## Shipping
-
-`acumen ship` gives your package a `<dist>-install-skills` command so its users can install the
-skill into whichever agent they use (`--agent {claude,codex,agents,claude-science}`, or `--dest`).
+<div align="center">
+<a href="https://numfocus.org/project/scverse">
+  <img
+    src="https://raw.githubusercontent.com/numfocus/templates/master/images/numfocus-logo.png"
+    width="200"
+  >
+</a>
+</div>
 
 ## Getting started
 
-Please refer to the [documentation][], in particular the [API documentation][].
+Please refer to the [documentation][],
+in particular, the [Getting started][getting started] tutorial and the [API documentation][].
+
+## Installation
+
+You need to have Python 3.12 or newer installed on your system.
+If you don't have Python installed, we recommend installing [uv][].
+
+`acumen` runs its agents with Claude, Codex, or both, and you only need to install the backend you use.
+There are several alternative options to install `acumen`:
+
+1. Install the latest stable release from [PyPI][pypi] to run Claude models (requires an Anthropic API key or a `claude` login):
+
+```bash
+pip install acumen[claude]
+```
+
+2. Install the latest stable release from [PyPI][pypi] to run Codex models (requires the `codex` CLI on your `PATH` and a Codex login or API key):
+
+```bash
+pip install acumen
+```
+
+3. Install the latest stable release from [PyPI][pypi] to run both:
+
+```bash
+pip install acumen[all]
+```
+
+4. Install the latest development version:
+
+```bash
+pip install "acumen[all] @ git+https://github.com/scverse/acumen.git@main"
+```
 
 ## Release notes
 
@@ -107,7 +90,7 @@ See the [changelog][].
 
 ## Contact
 
-For questions and help requests, reach out on the [scverse discourse][].
+For questions and help requests, you can reach out in the [scverse discourse][].
 If you found a bug, please use the [issue tracker][].
 
 ## Citation
@@ -116,8 +99,13 @@ If you found a bug, please use the [issue tracker][].
 
 [uv]: https://github.com/astral-sh/uv
 [scverse discourse]: https://discourse.scverse.org/
+[scverse]: https://scverse.org/
 [issue tracker]: https://github.com/scverse/acumen/issues
 [tests]: https://github.com/scverse/acumen/actions/workflows/test.yaml
-[documentation]: https://acumen.readthedocs.io
+[documentation]: https://acumen.readthedocs.io/
+[getting started]: https://acumen.readthedocs.io/page/getting_started.html
 [changelog]: https://acumen.readthedocs.io/page/changelog.html
-[api documentation]: https://acumen.readthedocs.io/page/api.html
+[api documentation]: https://acumen.readthedocs.io/page/api/index.html
+[pypi]: https://pypi.org/project/acumen
+[down]: https://pepy.tech/project/acumen
+[codecoverage]: https://codecov.io/gh/scverse/acumen

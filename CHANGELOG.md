@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning][].
 
 ### Changed
 
+- Restructure the docs. The README follows the scverse layout and is the landing page, a new
+  Getting started tutorial walks through a decoupler project, and the API section now has one page
+  per `acumen` subcommand, generated from the CLI's parser, in place of the Python API listing.
 - Install shipped skills for `--agent codex` into `~/.agents/skills`, where Codex discovers user
   skills, instead of `~/.codex/skills` (`$CODEX_HOME/skills`), which current Codex no longer
   reads. `--agent codex` and `--agent agents` now resolve to the same directory.

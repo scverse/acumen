@@ -2,3 +2,19 @@
 div.cell_output table.dataframe {
     font-size: 0.8em;
 }
+
+/* The landing page's H1 exists for the page title only; the banner stands in for it visually. */
+section#acumen > h1 {
+    display: none;
+}
+
+/* The banner handles dark mode itself; don't let the theme dim the sidebar copy. */
+html[data-theme="dark"] .navbar-brand img {
+    filter: none;
+}
+
+/* Terminal output keeps its real line length: shrink it to fit, and wrap whatever is still too long. */
+div.highlight-console pre {
+    font-size: 0.72em;
+    white-space: pre-wrap;
+}

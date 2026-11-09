@@ -5,6 +5,7 @@
 # https://www.sphinx-doc.org/page/usage/configuration.html
 
 # -- Path setup --------------------------------------------------------------
+import os
 import shutil
 import sys
 from datetime import datetime
@@ -15,6 +16,10 @@ from sphinxcontrib import katex
 
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE / "extensions"))
+
+# The CLI reference renders argparse defaults; show the target cache as a generic path,
+# not the one of whoever builds the docs.
+os.environ["XDG_CACHE_HOME"] = "~/.cache"
 
 
 # -- Project information -----------------------------------------------------
@@ -36,6 +41,7 @@ bibtex_bibfiles = ["references.bib"]
 templates_path = ["_templates"]
 nitpicky = True  # Warn about broken links
 needs_sphinx = "4.0"
+smartquotes_action = "qe"  # keep `--flag` in argparse text from turning into an en dash
 
 html_context = {
     "display_github": True,  # Integrate GitHub
@@ -119,6 +125,10 @@ html_static_path = ["_static"]
 html_css_files = ["css/custom.css"]
 
 html_title = project
+html_logo = "_static/images/banner.svg"
+html_favicon = "_static/images/logo.svg"
+# Social cards (sphinxext-opengraph) default to html_logo, which they cannot read as SVG.
+ogp_social_cards = {"image": "_static/images/logo.png"}
 
 html_theme_options = {
     "repository_url": repository_url,
