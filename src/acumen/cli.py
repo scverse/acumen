@@ -2448,7 +2448,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_log_args(fit)
     fit.set_defaults(func=_cmd_fit)
 
-    tasks_cmd = sub.add_parser("tasks", help="autonomously generate a tasks.yaml from the target package")
+    tasks_cmd = sub.add_parser(
+        "tasks",
+        help="autonomously generate a tasks.yaml from the target package",
+        description="An agent explores the target package and writes a tasks.yaml of real tasks, each "
+        f"with a train/valid/test split and a reproducer script per split in {SCRIPTS_DIRNAME}/, ready "
+        "for `acumen check`. Review and edit what it proposes before benchmarking.",
+    )
     tasks_cmd.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
     tasks_cmd.add_argument("--out", type=Path, default=Path("tasks.yaml"), help="tasks.yaml to write")
     tasks_cmd.add_argument(
@@ -2518,8 +2524,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=f"Run every {PREPARE_DIRNAME}/<name>.py in the target venv with the data cache "
         f"({DATA_DIRNAME}/ by default) as its working directory and argv[1] (also ${CACHE_ENV}). Each "
         "script writes whatever files or directories it likes there; a task then names the ones its "
-        "runs should start with under 'data:' in tasks.yaml (task level, or per split to replace "
-        "it), and each run finds them symlinked into its working directory. A script that already "
+        "runs should start with under 'data:' in tasks.yaml (task level, plus any a split adds), "
+        "and each run finds them symlinked into its working directory. A script that already "
         "succeeded is skipped until it changes or --force is given. The cache is left read-only.",
     )
     prepare.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml")
@@ -2545,7 +2551,15 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--refresh-target", action="store_true", help="rebuild the target checkout and venv")
     prepare.set_defaults(func=_cmd_prepare)
 
-    ship = sub.add_parser("ship", help="make a benchmarked skill installable into the target package")
+    ship = sub.add_parser(
+        "ship",
+        help="make a benchmarked skill installable into the target package",
+        description="An agent wires one skill version into the target package as a "
+        "`<dist>-install-skills` console script, which installs the skill into the agent a user names "
+        "(--agent {claude,codex,agents,claude-science}, or --dest). It build-verifies the wheel; for a "
+        "GitHub repo the change arrives as a pull request, for a local path it is written to the "
+        "working tree.",
+    )
     ship.add_argument(
         "--skill", dest="version", metavar="VERSION", required=True, help="skill version to ship, e.g. v2"
     )
@@ -2561,7 +2575,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_log_args(ship)
     ship.set_defaults(func=_cmd_ship)
 
-    report = sub.add_parser("report", help="aggregate the run tree into a self-contained report.html")
+    report = sub.add_parser(
+        "report",
+        help="aggregate the run tree into a self-contained report.html",
+        description="Aggregate every graded run under runs/ into a self-contained report.html "
+        "(success and cost per version, model and split, with significance tests against the "
+        "baseline) and a flat report.csv for reanalysis. `acumen fit` writes it too; re-run this "
+        "to rebuild it.",
+    )
     report.add_argument("--runs", type=Path, default=Path("runs"), help="root of the run tree")
     report.add_argument("--tasks", type=Path, default=Path("tasks.yaml"), help="path to tasks.yaml (for task text)")
     report.add_argument("--skills", type=Path, default=Path("skills"), help="root of the skill tree (rationale/diff)")
@@ -2574,14 +2595,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report.set_defaults(func=_cmd_report)
 
-    prices = sub.add_parser("prices", help="show the token rates cost is computed from, or re-check them")
+    prices = sub.add_parser(
+        "prices",
+        help="show the token rates cost is computed from, or re-check them",
+        description="Show the per-model token rates that run cost is computed from. --refresh "
+        "fetches the providers' pricing pages and reports any pinned rate that differs; changes are "
+        "never applied automatically.",
+    )
     prices.add_argument("--config", type=Path, default=Path("config.yaml"), help="path to config.yaml (for overrides)")
     prices.add_argument("--refresh", action="store_true", help="fetch the providers' pricing pages and diff them")
     prices.add_argument("--all", action="store_true", help="with --refresh, report every model, not just yours")
     prices.add_argument("--out", type=Path, default=None, help="with --refresh, write the 'prices:' block here")
     prices.set_defaults(func=_cmd_prices)
 
-    init = sub.add_parser("init", help="scaffold a starter config.yaml and tasks.yaml")
+    init = sub.add_parser(
+        "init",
+        help="scaffold a starter config.yaml and tasks.yaml",
+        description="Write a heavily commented starter config.yaml and tasks.yaml into the project "
+        "directory, with placeholders to fill in. Existing files are left alone unless --force is given.",
+    )
     init.add_argument("--dir", type=Path, default=Path("."), dest="directory", help="directory to scaffold into")
     init.add_argument("--force", action="store_true", help="overwrite existing config.yaml / tasks.yaml")
     init.set_defaults(func=_cmd_init)
