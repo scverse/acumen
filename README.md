@@ -18,7 +18,7 @@
 [![Downloads all][badge-adown]][down]
 
 [badge-tests]: https://img.shields.io/github/actions/workflow/status/scverse/acumen/test.yaml?branch=main
-[badge-docs]: https://img.shields.io/readthedocs/acumen
+[badge-docs]: https://img.shields.io/readthedocs/acumen-skills
 [badge-issues]: https://img.shields.io/github/issues/scverse/acumen
 [badge-coverage]: https://codecov.io/gh/scverse/acumen/branch/main/graph/badge.svg
 [badge-pypi]: https://img.shields.io/pypi/v/acumen.svg
@@ -102,10 +102,10 @@ If you found a bug, please use the [issue tracker][].
 [scverse]: https://scverse.org/
 [issue tracker]: https://github.com/scverse/acumen/issues
 [tests]: https://github.com/scverse/acumen/actions/workflows/test.yaml
-[documentation]: https://acumen.readthedocs.io/
-[getting started]: https://acumen.readthedocs.io/page/getting_started.html
-[changelog]: https://acumen.readthedocs.io/page/changelog.html
-[api documentation]: https://acumen.readthedocs.io/page/api/index.html
+[documentation]: https://acumen-skills.readthedocs.io/
+[getting started]: https://acumen-skills.readthedocs.io/page/getting_started.html
+[changelog]: https://acumen-skills.readthedocs.io/page/changelog.html
+[api documentation]: https://acumen-skills.readthedocs.io/page/api/index.html
 [pypi]: https://pypi.org/project/acumen
 [down]: https://pepy.tech/project/acumen
 [codecoverage]: https://codecov.io/gh/scverse/acumen

@@ -41,7 +41,7 @@ optional-dependencies.claude = [
   "claude-agent-sdk>=0.2.126",
 ]
 # https://docs.pypi.org/project_metadata/#project-urls
-urls.Documentation = "https://acumen.readthedocs.io/"
+urls.Documentation = "https://acumen-skills.readthedocs.io/"
 urls.Homepage = "https://github.com/scverse/acumen"
 urls.Source = "https://github.com/scverse/acumen"
 scripts.acumen = "acumen.cli:main"
