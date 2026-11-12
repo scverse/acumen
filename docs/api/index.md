@@ -27,7 +27,7 @@ fit
 
 ### Ship
 
-Make the best version installable for the package's users.
+Make the best version installable for the package’s users.
 
 ```{acumen-commands}
 ship
