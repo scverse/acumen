@@ -43,7 +43,7 @@ If you like scverse® and want to support our mission, please consider making a 
   <img
     src="https://raw.githubusercontent.com/numfocus/templates/master/images/numfocus-logo.png"
     width="200"
-  >
+>
 </a>
 </div>
 
@@ -55,7 +55,7 @@ in particular, the [Getting started][getting started] tutorial and the [API docu
 ## Installation
 
 You need to have Python 3.12 or newer installed on your system.
-If you don't have Python installed, we recommend installing [uv][].
+If you don’t have Python installed, we recommend installing [uv][].
 
 `acumen` runs its agents with Claude, Codex, or both, and you only need to install the backend you use.
 There are several alternative options to install `acumen`:

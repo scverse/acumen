@@ -77,7 +77,7 @@ meta_model: claude-fable-5-1
 These are the fields that matter most.
 
 - **`repo` and `ref`** point to the `main` branch of decoupler on GitHub. `acumen` clones this
-  branch and installs it into a throwaway virtual environment, the _target venv_. Every script and
+  branch and installs it into a throwaway virtual environment, the *target venv*. Every script and
   every agent runs inside this environment.
 - **`dependency_groups`** adds decoupler's `full` dependency group to the target venv. Some tasks
   need these optional dependencies and fail without them.
@@ -93,7 +93,7 @@ These are the fields that matter most.
 
 `acumen` builds the target venv the first time a command needs it and keeps it in
 `~/.cache/acumen`. The `--cache` option of each command changes this location. `acumen` does not
-pull new commits by itself. When decoupler's `main` branch changes and you want the new code, pass
+pull new commits by itself. When decoupler’s `main` branch changes and you want the new code, pass
 `--refresh-target` to the next command, for example `acumen prepare --refresh-target`. `acumen`
 then clones the repository again and rebuilds the venv. If `repo` is a local path, `acumen`
 rebuilds the venv by itself when the checked-out commit changes, so commit your changes first.
@@ -104,11 +104,11 @@ Changing `ref` or any of the install fields also creates a new venv.
 A task is a prompt together with the answer the agent should give. Every task has three splits,
 and they play the same roles as in machine learning.
 
-| split   | used for                                                      |
-| ------- | ------------------------------------------------------------- |
-| `train` | The improver learns the skill from the results on this split. |
-| `valid` | Each new version is scored here. This picks the best version. |
-| `test`  | The best version is benched here once, at the very end.       |
+  | split   | used for                                                      |
+  | ------- | ------------------------------------------------------------- |
+  | `train` | The improver learns the skill from the results on this split. |
+  | `valid` | Each new version is scored here. This picks the best version. |
+  | `test`  | The best version is benched here once, at the very end.       |
 
 The three splits test the same functionality, but each one changes something. A split can use
 other input data, other parameters, another postprocessing step or a different question. This
@@ -241,13 +241,14 @@ sets `hallmark.csv`.
       answer: b
 ```
 
-Not every task needs code. This task checks whether the agent knows which organisms decoupler's
+Not every task needs code. This task checks whether the agent knows which organisms decoupler’s
 orthology conversion supports. The multiple-choice format keeps the answer to a single letter. The
 options change order between splits, so the skill cannot simply learn a letter. The field
 `needs_script: false` tells `acumen check` that this task has no reproducer.
 
 Both tasks go under a top-level `tasks` key.
 
+<!-- panache-ignore-format-start -->
 :::{dropdown} The complete `tasks.yaml`
 
 ```yaml
@@ -337,6 +338,7 @@ tasks:
 ```
 
 :::
+<!-- panache-ignore-format-end -->
 
 ## Prepare the data
 
@@ -445,7 +447,6 @@ The `valid` and `test` reproducers only change the cell type, the sort direction
 pathways and the network.
 
 :::{dropdown} `tasks/scell-valid.py`
-
 ```python
 import anndata as ad
 import decoupler as dc
@@ -472,11 +473,9 @@ top = df[df.group == "Megakaryocytes"].sort_values("stat", ascending=True)
 with open("answer.md", "w") as f:
     f.write(";".join(top.head(3)["name"]))
 ```
-
 :::
 
 :::{dropdown} `tasks/scell-test.py`
-
 ```python
 import anndata as ad
 import decoupler as dc
@@ -503,7 +502,6 @@ top = df[df.group == "B cells"].sort_values("stat", ascending=False)
 with open("answer.md", "w") as f:
     f.write(";".join(top.head(5)["name"]))
 ```
-
 :::
 
 The `species` task has `needs_script: false`, so it has no reproducers. Now run `acumen check`.
