@@ -117,6 +117,9 @@ class AgentResult:
     #: The prompt the run was given. Codex's ``exec --json`` stream never echoes it, so carrying
     #: it here is the only way the rendered transcript can show what the agent was asked to do.
     prompt: str = ""
+    #: Ids of the background tasks still running when the agent ended its turn. Teardown stops
+    #: them before grading, so whatever they would have written (often ``answer.md``) is lost.
+    background_tasks: tuple[str, ...] = ()
 
     def error_detail(self) -> str:
         """Describe a failed run from every field the provider may have put the reason in.
@@ -469,6 +472,7 @@ async def _run_claude(
     result: ResultMessage | None = None
     noise: list[str] = []
     live: dict[str, None] = {}
+    left_running: tuple[str, ...] = ()
 
     def capture_stderr(line: str) -> None:
         noise.append(line)
@@ -487,6 +491,7 @@ async def _run_claude(
             _note_tasks(message, live, sdk)
             if isinstance(message, sdk.ResultMessage):
                 result = message
+                left_running = tuple(live)
     except Exception as err:
         # The CLI exits non-zero on purpose after reporting an ``is_error`` result — a turn
         # or budget cap, say — and the SDK surfaces that trailing ProcessError as an
@@ -497,7 +502,7 @@ async def _run_claude(
         # it. A result that is *not* an error means the stream broke after a clean finish,
         # which is a genuine failure and still raises.
         if result is not None and result.is_error:
-            return _from_claude(result)
+            return replace(_from_claude(result), background_tasks=left_running)
         # SDK connection/process exceptions can be generic while the actionable quota or
         # billing message was emitted only on stderr. Preserve it so the benchmark runner can
         # classify infrastructure exhaustion instead of blaming the agent.
@@ -518,7 +523,7 @@ async def _run_claude(
                 await client.disconnect()
     if result is None:
         raise AgentError("the Claude agent produced no result message")
-    return _from_claude(result)
+    return replace(_from_claude(result), background_tasks=left_running)
 
 
 def _codex_command(options: AgentOptions, prompt: str) -> list[str]:

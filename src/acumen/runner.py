@@ -524,6 +524,15 @@ async def run_once(
         else:
             success, reason = grade.success, grade.reason
 
+    left_running = len(result.background_tasks) if result else 0
+    stopped_background = None
+    if reason == "no_answer_file" and left_running:
+        stopped_background = (
+            f"the agent ended its turn with {left_running} background "
+            f"task{'s' if left_running != 1 else ''} still running; they were stopped before "
+            "writing answer.md. Long jobs must run in the foreground"
+        )
+
     usage = normalize_usage(result.usage if result else None, provider=provider)
     # Price the run from the table frozen into this result: that basis is shared by both
     # providers and reproducible from the rates recorded beside it, so it is the figure
@@ -582,7 +591,8 @@ async def run_once(
         "stop_reason": result.stop_reason if result else None,
         "subtype": result.subtype if result else None,
         "transcript_html": rendered,
-        "error": exhaustion or denial or error or (result.errors if result else None),
+        "background_tasks_at_end": left_running,
+        "error": exhaustion or denial or error or stopped_background or (result.errors if result else None),
     }
     (run_dir / RESULT_FILE).write_text(json.dumps(payload, indent=2) + "\n")
     return RunOutcome(key=key, success=success, reason=reason, payload=payload)

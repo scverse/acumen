@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning][].
 [keep a changelog]: https://keepachangelog.com/
 [semantic versioning]: https://semver.org/
 
+## [Unreleased]
+
+### Fixed
+
+- Fixed runs that lost their answer to a stopped background job being indistinguishable from runs that never tried. When a Claude agent ends its turn with background tasks still running and no `answer.md`, `result.json` now records `background_tasks_at_end` and says why in `error`, and `acumen fit` prints a warning. The benchmark prompt now also tells agents that background work is stopped when their turn ends
+
 ## [0.0.2]
 
 ### Added

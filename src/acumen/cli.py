@@ -332,6 +332,7 @@ class _Progress:
             f"  [{self.done}/{self.total} done, {self.passed} passed]",
             flush=True,
         )
+        _warn_stopped_background(outcome)
         if outcome.reason == "provider_exhausted":
             print(f"error: provider usage/credit exhausted: {p.get('error') or 'no provider detail'}", file=sys.stderr)
         elif outcome.reason == "sandbox_blocked":
@@ -340,6 +341,12 @@ class _Progress:
                 f"unrestricted, so this is a harness bug: {p.get('error') or 'no sandbox detail'}",
                 file=sys.stderr,
             )
+
+
+def _warn_stopped_background(outcome: RunOutcome) -> None:
+    """Say when a run lost its answer because the agent backgrounded the work and stopped."""
+    if outcome.reason == "no_answer_file" and outcome.payload.get("background_tasks_at_end"):
+        print(f"warning: {_key_label(outcome.key)}: {outcome.payload.get('error')}", file=sys.stderr, flush=True)
 
 
 def _fmt_tokens(value: int) -> str:
@@ -507,6 +514,7 @@ class _PhaseBar:
         elif outcome.reason == "sandbox_blocked":
             msg = f"agent sandbox refused an outbound host (harness bug): {detail or 'no sandbox detail'}"
         else:
+            _warn_stopped_background(outcome)
             return
         print(f"{chr(10) if self.mode == 'bars' else ''}error: {msg}", file=sys.stderr, flush=True)
 
