@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning][].
 [keep a changelog]: https://keepachangelog.com/
 [semantic versioning]: https://semver.org/
 
+## [Unreleased]
+
+### Fixed
+
+- Fixed `acumen check` reporting a healthy target as not importable when its wheel has no `top_level.txt`, as with hatchling-built packages. The import name now falls back to the top-level packages listed in `RECORD`
+- Increased the import probe's timeout from 120 to 600 seconds, so a first import of a heavy stack such as torch or jax is no longer reported as a failure. `import_probe` also takes a `timeout` argument
+
 ## [0.0.2]
 
 ### Added

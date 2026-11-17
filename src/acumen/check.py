@@ -80,8 +80,9 @@ _GRADE_STATUS: dict[str, CheckStatus] = {
 #: How much of a failed script's error output to keep: enough for the end of a traceback.
 _TAIL_CHARS = 2000
 
-#: Seconds the one-off import probe may take.
-_PROBE_TIMEOUT = 120
+#: Seconds the one-off import probe may take by default. A first import of a heavy stack
+#: (torch, jax, numba compiling on load) in a fresh venv can take several minutes.
+_PROBE_TIMEOUT = 600.0
 
 
 class CheckError(RuntimeError):
@@ -285,8 +286,9 @@ def script_env(bin_dir: Path) -> dict[str, str]:
 #: installed (it reads its metadata version), which is not the same as the package importing:
 #: a missing compiled extension or a broken transitive dependency only shows up on import. The
 #: import name can differ from the distribution name (``scikit-learn`` imports as ``sklearn``),
-#: so the module names come from the distribution's own metadata, with the normalised
-#: distribution name as a fallback for a package that ships no ``top_level.txt``.
+#: so the module names come from the distribution's own metadata: ``top_level.txt`` when it
+#: exists, otherwise the top-level packages listed in ``RECORD`` (build backends such as
+#: hatchling write no ``top_level.txt``), and finally the normalised distribution name.
 _PROBE_CODE = """\
 import importlib
 import importlib.metadata as md
@@ -299,6 +301,11 @@ try:
     candidates += (dist.read_text("top_level.txt") or "").split()
 except Exception:
     dist = None
+if dist is not None and not candidates:
+    candidates += sorted({
+        f.parts[0] for f in (dist.files or [])
+        if len(f.parts) == 2 and f.parts[1] == "__init__.py"
+    })
 candidates.append(dist_name.replace("-", "_"))
 
 errors = []
@@ -324,7 +331,7 @@ raise SystemExit(1)
 """
 
 
-def import_probe(python: Path, package: str) -> tuple[bool, str]:
+def import_probe(python: Path, package: str, *, timeout: float = _PROBE_TIMEOUT) -> tuple[bool, str]:
     """Check that the target package imports in its venv.
 
     The most common way for every task to fail at once is that the package did not install
@@ -338,6 +345,8 @@ def import_probe(python: Path, package: str) -> tuple[bool, str]:
     package
         The target's distribution name (``Target.pkg_name``); the import name is derived from
         its metadata.
+    timeout
+        Seconds the import may take before the probe gives up.
 
     Returns
     -------
@@ -350,13 +359,13 @@ def import_probe(python: Path, package: str) -> tuple[bool, str]:
             [str(python.absolute()), "-c", _PROBE_CODE, package],
             capture_output=True,
             text=True,
-            timeout=_PROBE_TIMEOUT,
+            timeout=timeout,
             env=script_env(python.parent),
         )
     except OSError as err:
         return False, f"cannot run {python}: {err}"
     except subprocess.TimeoutExpired:
-        return False, f"importing {package} timed out after {_PROBE_TIMEOUT}s"
+        return False, f"importing {package} timed out after {timeout:g}s"
     if proc.returncode != 0:
         return False, _tail(proc.stderr or proc.stdout) or f"exit {proc.returncode}"
     return True, proc.stdout.strip()
