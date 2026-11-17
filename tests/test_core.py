@@ -167,6 +167,7 @@ from acumen.trajectory import (
     Trajectory,
     from_claude_records,
     from_codex_events,
+    redact_home,
     render_trajectory,
     write_trajectory_json,
 )
@@ -2410,6 +2411,35 @@ def test_missing_backend_fails_before_any_work(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr("acumen.agents.shutil.which", lambda _: None)
     with pytest.raises(AgentError, match="codex is not on PATH"):
         check_agent_cli("codex")
+
+
+def test_shareable_logs_replace_the_operator_home_with_a_tilde(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Transcripts and logs get attached to issues and committed; the operator's home must not leak.
+
+    Every run's tool calls and results are full of absolute paths into the target venv
+    (`<home>/.cache/acumen/...`), which name the operator's account on that machine.
+    """
+    home = "/home/alice-operator"
+    monkeypatch.setenv("HOME", home)
+    venv = f"{home}/.cache/acumen/target-abc/venv/bin/python"
+    traj = Trajectory(
+        harness="claude",
+        prompt=f"Run Python with `{venv}`",
+        steps=(Step(index=1, source="agent", text=f"ran {venv} in {home}"),),
+    )
+
+    write_trajectory_json(traj, tmp_path / "trajectory.json")
+    render_trajectory(traj, tmp_path / "transcript.html")
+    monkeypatch.setattr("acumen.logs._sdk", lambda: None)
+    with LiveLog(tmp_path / "log.jsonl") as log:
+        log.append({"type": "item.completed", "item": {"type": "agent_message", "text": f"ran {venv}"}})
+
+    for name in ("trajectory.json", "transcript.html", "log.jsonl"):
+        text = (tmp_path / name).read_text()
+        assert home not in text, name
+        assert "~/.cache/acumen/target-abc/venv/bin/python" in text, name
+    # A path that merely starts with the same characters is someone else's.
+    assert redact_home(f"{home}2/x and {home}") == f"{home}2/x and ~"
 
 
 def test_live_log_records_codex_without_the_claude_sdk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

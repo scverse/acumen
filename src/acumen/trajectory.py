@@ -18,6 +18,7 @@ JSON, so a Codex-only install renders its own transcripts without the SDK instal
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
@@ -757,6 +758,25 @@ def _usage_html(usage: Metrics | None) -> str:
     return f"<table>{rows}</table>"
 
 
+def redact_home(text: str) -> str:
+    """Replace the operator's home directory with ``~`` in text bound for a shareable artifact.
+
+    Transcripts and logs are full of absolute paths into the target venv (``<home>/.cache/...``),
+    and they get attached to issues and committed alongside reports. The home path names the
+    operator's account on that machine and says nothing about the run. Only whole path
+    components match, so ``/home/al`` leaves ``/home/alice`` alone.
+    """
+    try:
+        home = Path.home()
+    except (KeyError, RuntimeError):  # no resolvable home: nothing to hide
+        return text
+    for root in dict.fromkeys((str(home), str(home.resolve()))):
+        if root in ("", "/", "\\"):
+            continue
+        text = re.sub(re.escape(root) + r"(?![\w.-])", "~", text)
+    return text
+
+
 def render_trajectory(traj: Trajectory, html: Path) -> bool:
     """Render any :class:`Trajectory` to a standalone HTML file — the one centralized renderer."""
     blocks: list[str] = []
@@ -778,12 +798,14 @@ def render_trajectory(traj: Trajectory, html: Path) -> bool:
     footer = _usage_html(traj.usage)
     html.parent.mkdir(parents=True, exist_ok=True)
     html.write_text(
-        "<!doctype html>\n"
-        '<html lang="en"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        f"<title>{escape(traj.harness)} transcript</title><style>{_CSS}</style></head><body>"
-        f'<h1>{escape(traj.harness)} transcript</h1><div class="meta">{meta}</div>{body}{footer}'
-        "</body></html>\n",
+        redact_home(
+            "<!doctype html>\n"
+            '<html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            f"<title>{escape(traj.harness)} transcript</title><style>{_CSS}</style></head><body>"
+            f'<h1>{escape(traj.harness)} transcript</h1><div class="meta">{meta}</div>{body}{footer}'
+            "</body></html>\n"
+        ),
         encoding="utf-8",
     )
     return html.is_file()
@@ -792,5 +814,5 @@ def render_trajectory(traj: Trajectory, html: Path) -> bool:
 def write_trajectory_json(traj: Trajectory, path: Path) -> bool:
     """Write the portable ``trajectory.json`` artifact for ``traj``."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(traj.to_dict(), indent=2, default=str) + "\n", encoding="utf-8")
+    path.write_text(redact_home(json.dumps(traj.to_dict(), indent=2, default=str)) + "\n", encoding="utf-8")
     return path.is_file()
