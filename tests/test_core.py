@@ -91,7 +91,7 @@ from acumen.prices import (
     resolve_cost,
 )
 from acumen.procs import label_env, reap, supported, survivors
-from acumen.prompts import _SKILL_CRAFT, feedback_block, improve_prompt, ship_prompt, wiki_prompt
+from acumen.prompts import _SKILL_CRAFT, HARNESS_PREAMBLE, feedback_block, improve_prompt, ship_prompt, wiki_prompt
 from acumen.report import (
     _ALL_MODELS_COLOR,
     ReportError,
@@ -1044,6 +1044,33 @@ def test_claude_records_the_first_result_not_a_re_entered_session(
     assert result.subtype == "error_max_turns"
 
 
+def test_claude_result_names_the_background_tasks_left_running_at_the_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run that ends its turn with a backgrounded job still going loses that job's output.
+
+    Teardown stops the job before grading, so a training run the agent backgrounded never writes
+    `answer.md` and the run is graded `no_answer_file` — indistinguishable from an agent that
+    never tried. The result must say which tasks were still live when the turn ended.
+    """
+    pytest.importorskip("claude_agent_sdk")
+
+    _patch_claude_client(
+        monkeypatch,
+        [_live_tasks("train1"), _claude_result(subtype="success", is_error=False, errors=None)],
+        after=[_live_tasks()],
+    )
+    left = asyncio.run(run_agent("go", options=_claude_agent_options(tmp_path)))
+    assert left.background_tasks == ("train1",)
+
+    _patch_claude_client(
+        monkeypatch,
+        [_live_tasks("t"), _live_tasks(), _claude_result(subtype="success", is_error=False, errors=None)],
+    )
+    clean = asyncio.run(run_agent("go", options=_claude_agent_options(tmp_path)))
+    assert clean.background_tasks == ()
+
+
 def test_claude_teardown_stops_background_tasks_and_closes_the_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1555,6 +1582,67 @@ def test_non_connection_errors_and_caps_are_not_connection_errors() -> None:
         usage={},
     )
     assert _connection_error(capped) is None
+
+
+def test_run_without_answer_and_live_background_tasks_says_why(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`no_answer_file` after a backgrounded job was stopped is recorded with the reason."""
+    box_root = tmp_path / "box"
+    box_root.mkdir()
+    box = Sandbox(
+        root=box_root,
+        home=tmp_path / "home",
+        config_dir=tmp_path / "cfg",
+        env={},
+        authenticated=True,
+        provider="claude",
+    )
+
+    @asynccontextmanager
+    async def fake_sandbox(*_args, **_kwargs):
+        yield box
+
+    async def backgrounded(*_args, **_kwargs) -> AgentResult:
+        return replace(_agent_result(), background_tasks=("train1", "train2"))
+
+    monkeypatch.setattr("acumen.runner.sandbox", fake_sandbox)
+    monkeypatch.setattr("acumen.runner.run_agent", backgrounded)
+    monkeypatch.setattr("acumen.runner._collect_artifacts", lambda *_args: None)
+    monkeypatch.setattr("acumen.runner.agent_version", lambda _provider, _path=None: "test")
+    directory = tmp_path / "run"
+    outcome = asyncio.run(
+        run_once(
+            key=RunKey(arm="noskill", split="valid", model="claude-opus-5", task_id="task", rep=1),
+            task=Task(
+                id="task",
+                train=TaskSplit("prompt", "OK"),
+                valid=TaskSplit("prompt", "OK"),
+                test=TaskSplit("prompt", "OK"),
+            ),
+            target=Target(
+                source="target",
+                ref="main",
+                src_dir=tmp_path / "src",
+                venv_dir=tmp_path / "venv",
+                commit="abc",
+                pkg_name="target",
+                pkg_version="1",
+            ),
+            run_dir=directory,
+            model="claude-opus-5",
+            max_turns=1,
+            max_usd=1.0,
+        )
+    )
+
+    persisted = json.loads((directory / "result.json").read_text())
+    assert outcome.reason == "no_answer_file"
+    assert persisted["background_tasks_at_end"] == 2
+    assert "2 background tasks still running" in persisted["error"]
+
+
+def test_harness_preamble_warns_that_background_work_is_stopped_at_the_end() -> None:
+    assert "background" in HARNESS_PREAMBLE
+    assert "stopped" in HARNESS_PREAMBLE
 
 
 def test_connection_error_is_invalid_reason() -> None:

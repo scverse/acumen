@@ -77,6 +77,10 @@ not read by a human.
 
 Do not leave behind any other files.
 
+Anything still running in the background when you end your turn is stopped, and nothing it
+would have written is kept. Run long jobs in the foreground and wait for them, and never end
+your turn before `answer.md` is written.
+
 # The format of answer.md — read this twice
 
 `answer.md` is compared to the expected answer by EXACT STRING MATCH, after stripping
