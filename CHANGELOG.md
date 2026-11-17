@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning][].
 [keep a changelog]: https://keepachangelog.com/
 [semantic versioning]: https://semver.org/
 
+## [Unreleased]
+
+### Fixed
+
+- Fixed transcripts and logs exposing the operator's home directory. The rendered `transcript.html`, `trajectory.json` and the live `logs/acumen-<command>-*.jsonl` now show it as `~`
+
 ## [0.0.2]
 
 ### Added

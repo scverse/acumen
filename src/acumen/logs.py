@@ -31,7 +31,13 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any, TextIO
 
 from acumen.agents import AgentResult
-from acumen.trajectory import from_claude_transcript, from_codex_events, render_trajectory, write_trajectory_json
+from acumen.trajectory import (
+    from_claude_transcript,
+    from_codex_events,
+    redact_home,
+    render_trajectory,
+    write_trajectory_json,
+)
 from acumen.transcript import locate_transcript
 
 if TYPE_CHECKING:
@@ -146,7 +152,7 @@ class LiveLog:
         if event is None:
             return
         record = {"ts": self._clock(), **event}
-        self._fh.write(json.dumps(record) + "\n")
+        self._fh.write(redact_home(json.dumps(record)) + "\n")
         self._fh.flush()
         self.n_events += 1
         if self.stream:
