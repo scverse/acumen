@@ -5386,6 +5386,37 @@ def test_import_probe_resolves_the_import_name_from_the_distribution() -> None:
     assert "No module named" in why
 
 
+def test_import_probe_finds_the_module_of_a_distribution_without_top_level_txt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wheels built by hatchling ship no `top_level.txt`, so the import name must come from RECORD.
+
+    Without it the probe falls back to the distribution name (`fancy_dist`), which is not the
+    package (`fancy`), and a healthy target is reported as broken before any task runs.
+    """
+    site = tmp_path / "site"
+    (site / "fancy").mkdir(parents=True)
+    (site / "fancy" / "__init__.py").write_text('__version__ = "1.2.3"\n')
+    info = site / "fancy_dist-1.2.3.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Metadata-Version: 2.1\nName: fancy-dist\nVersion: 1.2.3\n")
+    (info / "RECORD").write_text(
+        "fancy/__init__.py,,\nfancy_dist-1.2.3.dist-info/METADATA,,\nfancy_dist-1.2.3.dist-info/RECORD,,\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(site))
+
+    ok, detail = import_probe(Path(sys.executable), "fancy-dist")
+    assert ok, detail
+    assert detail == "fancy 1.2.3"
+
+
+def test_import_probe_timeout_is_configurable() -> None:
+    """A cold import of a heavy stack (torch, jax) can outlast the default; the caller decides."""
+    ok, detail = import_probe(Path(sys.executable), "pyyaml", timeout=0.001)
+    assert not ok
+    assert "timed out after" in detail
+
+
 def test_harvest_keeps_only_the_reproducers_the_tasks_declare(tmp_path: Path) -> None:
     """What the generator leaves behind is not automatically ground truth worth keeping."""
     staged = tmp_path / "staged"
